@@ -34,9 +34,8 @@ Zależności nie narzucają wersji CUDA z poprzedniego komputera; konfiguracja G
 ## Dane i modele
 
 Repozytorium zawiera kod, testy, dokumentację i konfigurację edytora. Nie zawiera bibliotek,
-modeli, zdjęć, datasetów, wyników, Workspace ani historii Git poprzedniego repozytorium.
+modeli, zdjęć, datasetów, wyników, Workspace.
 Pusty `Workspace/` wraz ze strukturą roboczą tworzy się automatycznie przy pierwszym uruchomieniu.
-Modele i materiały do pracy należy pobrać lub podłączyć w aplikacji; ich brak nie blokuje uruchomienia GUI.
 Ustawienia użytkownika aplikacja zapisuje w `~/.auto_annotation_tool/session.json`.
 Na komputerze z wcześniejszą instalacją są one współdzielone; ten plik nie jest częścią kopii.
 
@@ -56,16 +55,14 @@ python -m pytest tests/test_mobile_mt_final_hardening.py tests/test_mobile_mt_bl
 ```
 
 Testy związane z konwersją modeli mogą wymagać opcjonalnych pakietów eksportu.
-Dokumentacja funkcji i kontraktów znajduje się w `docs/`.
+
 
 ## Nowe repozytorium
 
 Katalog jest gotowy do inicjalizacji niezależnego repozytorium (`git init`).
-Nie ma ustawionego zdalnego repozytorium ani odziedziczonej historii.
 Dołączony `.gitignore` pomija środowiska Pythona, Workspace, modele i artefakty pracy.
 
-Kod źródłowy pochodzi z commita `8f4de4d14982e0953805cfbef215d982d0a76b78`. Przy przygotowaniu kopii zmieniono jedynie
-pliki zależności, `.gitignore` oraz dodano ten README i przenośną konfigurację VS Code.
+
 
 
 
