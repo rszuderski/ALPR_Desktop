@@ -1,0 +1,13 @@
+# Python 3.12, Windows x64 z Tcl/Tk. 
+# python -m pip install -r requirements.txt
+numpy
+opencv-python
+Pillow
+PyYAML
+torch>=2.5
+torchvision
+ultralytics>=8.4.19
+easyocr
+albumentations
+matplotlib
+psutil

@@ -1,0 +1,2 @@
+# Standardowa instalacja aplikacji; eksport mobilny jest opcjonalny.
+-r requirements-runtime.txt
