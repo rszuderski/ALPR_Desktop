@@ -56,14 +56,4 @@ python -m pytest tests/test_mobile_mt_final_hardening.py tests/test_mobile_mt_bl
 
 Testy związane z konwersją modeli mogą wymagać opcjonalnych pakietów eksportu.
 
-
-## Nowe repozytorium
-
-Katalog jest gotowy do inicjalizacji niezależnego repozytorium (`git init`).
-Dołączony `.gitignore` pomija środowiska Pythona, Workspace, modele i artefakty pracy.
-
-
-
-
-
 R.S.
