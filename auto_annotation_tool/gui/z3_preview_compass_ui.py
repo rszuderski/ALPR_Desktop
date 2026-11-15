@@ -728,9 +728,17 @@ def build_preview_legend_sections(host: "CharacterAnnotationTab"):
             "accent": "#2f80ed",
             "items": [
                 {"tokens": ["Q", "E"], "connector": "/", "modes": ["tap", "tap"], "label": "poprz./nast. tablica"},
-                {"tokens": ["F"], "modes": ["tap"], "label": "tablica do okna"},
                 {"tokens": ["Rolka"], "label": "zoom in / out"},
                 {"tokens": ["Enter"], "modes": ["tap"], "label": "pełny ekran / wyjście"},
+            ],
+        },
+        {
+            "title": "Decyzja tablicy",
+            "accent": "#8b5cf6",
+            "items": [
+                {"tokens": ["R"], "modes": ["tap"], "label": "OK / zatwierdź"},
+                {"tokens": ["T"], "modes": ["tap"], "label": "cofnij OK"},
+                {"tokens": ["F"], "modes": ["tap"], "label": "wyklucz / przywróć"},
             ],
         },
         {
@@ -739,6 +747,8 @@ def build_preview_legend_sections(host: "CharacterAnnotationTab"):
             "items": [
                 {"tokens": ["D", "LPM"], "connector": "→", "modes": ["tap", "tap"], "label": "nowy box klik-klik"},
                 {"tokens": ["S"], "modes": ["tap"], "label": "select / off"},
+                {"tokens": ["Spacja"], "modes": ["tap"], "label": "następny box"},
+                {"tokens": ["G"], "modes": ["hold"], "label": "grupowa geometria"},
                 {"tokens": ["LPM"], "modes": ["hold"], "label": "przesuń lub resize"},
                 {"tokens": ["PPM"], "modes": ["tap"], "label": "usuń aktywny"},
                 {"tokens": ["Ctrl+Z", "Ctrl+Y"], "connector": "/", "modes": ["tap", "tap"], "label": "historia"},
@@ -752,11 +762,10 @@ def build_preview_legend_sections(host: "CharacterAnnotationTab"):
                 {"tokens": ["LPM"], "modes": ["tap"], "label": "wybierz pole"},
                 {"tokens": ["←", "→"], "connector": "/", "modes": ["tap", "tap"], "label": "pole +/-"},
                 {"tokens": ["0-9/A-Z"], "modes": ["tap"], "label": "wpisz znak"},
-                {"tokens": ["Esc"], "modes": ["tap"], "label": "wyjdz z wpisywania"},
+                {"tokens": ["Esc"], "modes": ["tap"], "label": "wyjdź z wpisywania"},
             ],
         },
     ]
-
 
 def refresh_preview_controls_legend(host: "CharacterAnnotationTab"):
     place_preview_hint_overlay(host, refresh=True)

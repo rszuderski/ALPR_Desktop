@@ -1,0 +1,11 @@
+{
+  "plate_id": "plate-ann-fixture-gt-conflict",
+  "revision_heads": [
+    "rev-sha256-b38f07120c66b84453bf521c620a66e1b0b56ea6b16a002c9958be5aeb635661",
+    "rev-sha256-db6c3cd4ad480f2db97f75aef6c7a0dee98ede1f8f6168d8d9a37bd6479936de"
+  ],
+  "values": [
+    "ABC124",
+    "ABC125"
+  ]
+}

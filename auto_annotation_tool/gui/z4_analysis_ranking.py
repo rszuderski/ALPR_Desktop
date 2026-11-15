@@ -10,6 +10,7 @@ Pomost datasetowy pozostaje tylko na potrzeby kampanii.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import queue
 import re
@@ -40,7 +41,11 @@ from ..config import (
     logger,
 )
 from ..icons import IconManager
-from ..validators import validate_model_file, format_yolo_model_identity
+from ..validators import (
+    validate_model_file,
+    format_yolo_model_identity,
+    read_model_metadata_sidecar,
+)
 from ..training import YOLOPoseTrainer, TrainingHistory, TrainingStatus, DatasetCreator, DatasetSplitter
 from ..training.training_report import TrainingReportGenerator
 from ..ranking import ModelRanking, format_ranking_model_label, is_plate_pose_model_path
@@ -827,7 +832,7 @@ def _collect_project_ranking_model_candidates(self, target: str | None = None) -
         if project_root is not None:
             project_runs_dir = Path(project_root) / "5_training_runs"
             if project_runs_dir.exists():
-                histories.append(TrainingHistory(history_dir=project_runs_dir))
+                histories.append(TrainingHistory(history_dir=project_runs_dir, reconcile_on_load=False))
     except Exception:
         pass
 
@@ -843,6 +848,27 @@ def _collect_project_ranking_model_candidates(self, target: str | None = None) -
 
     candidates: list[Path] = []
     seen: set[str] = set()
+    seen_content: set[str] = set()
+    content_hash_cache: dict[str, str] = {}
+
+    def model_content_key(path: Path) -> str:
+        try:
+            path_key = str(path.resolve()).lower()
+        except Exception:
+            path_key = str(path).lower()
+        cached = content_hash_cache.get(path_key)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            value = digest.hexdigest()
+        except Exception:
+            value = f"path:{path_key}"
+        content_hash_cache[path_key] = value
+        return value
 
     def add_path(path_like) -> None:
         if not path_like:
@@ -863,6 +889,23 @@ def _collect_project_ranking_model_candidates(self, target: str | None = None) -
             return
         seen.add(key)
         candidates.append(resolved)
+
+    try:
+        project_root = CAMPAIGN.get_active_project_root_dir()
+        if project_root is not None:
+            trained_dir = Path(project_root) / "6_models" / "trained"
+            target_dir_name = {
+                "plate": "plates",
+                "char": "chars",
+                "vehicle": "vehicles",
+            }.get(normalized_target, "")
+            if target_dir_name:
+                project_models_dir = trained_dir / target_dir_name
+                if project_models_dir.exists() and project_models_dir.is_dir():
+                    for path in sorted(project_models_dir.rglob("*.pt")):
+                        add_path(path)
+    except Exception:
+        pass
 
     for history in histories:
         try:
@@ -927,7 +970,11 @@ def _collect_ranking_model_candidates(self, models_dir: Path, target: str | None
             key = str(path).lower()
         if key in seen:
             return
+        content_key = model_content_key(resolved)
+        if content_key in seen_content:
+            return
         seen.add(key)
+        seen_content.add(content_key)
         candidates.append(resolved)
 
     try:
@@ -952,12 +999,14 @@ def _get_ranking_scope(self) -> str:
             raw = str(scope_var.get() or "").strip()
     except Exception:
         raw = ""
-    if raw in {"Projekt", "Globalne", "Wszystkie"}:
+    if raw == "Wszystkie":
+        return "Globalne"
+    if raw in {"Projekt", "Globalne"}:
         return raw
     try:
-        return "Projekt" if CAMPAIGN.get_active_project_name() else "Wszystkie"
+        return "Projekt" if CAMPAIGN.get_active_project_name() else "Globalne"
     except Exception:
-        return "Wszystkie"
+        return "Globalne"
 
 
 def _format_ranking_scope_label(self, scope: str | None = None, target: str | None = None) -> str:
@@ -966,9 +1015,7 @@ def _format_ranking_scope_label(self, scope: str | None = None, target: str | No
     short_name = "MZ" if normalized_target == "char" else "MT"
     if selected_scope == "Projekt":
         return f"Projektowe {short_name}"
-    if selected_scope == "Globalne":
-        return f"Globalne {short_name}"
-    return f"Wszystkie {short_name}"
+    return f"Globalne {short_name}"
 
 
 def _ranking_model_candidate_scope(self, path_like, target: str | None = None) -> str:
@@ -1015,11 +1062,34 @@ def _collect_ranking_participant_candidates(
     if normalized_target not in {"plate", "char"}:
         normalized_target = "plate"
     selected_scope = scope or _get_ranking_scope(self)
-    if selected_scope not in {"Projekt", "Globalne", "Wszystkie"}:
-        selected_scope = "Wszystkie"
+    if selected_scope == "Wszystkie":
+        selected_scope = "Globalne"
+    if selected_scope not in {"Projekt", "Globalne"}:
+        selected_scope = "Globalne"
 
     candidates: list[Path] = []
     seen: set[str] = set()
+    seen_content: set[str] = set()
+    content_hash_cache: dict[str, str] = {}
+
+    def model_content_key(path: Path) -> str:
+        try:
+            path_key = str(path.resolve()).lower()
+        except Exception:
+            path_key = str(path).lower()
+        cached = content_hash_cache.get(path_key)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            value = digest.hexdigest()
+        except Exception:
+            value = f"path:{path_key}"
+        content_hash_cache[path_key] = value
+        return value
 
     def add_path(path_like, *, require_domain_name: bool = True, force_scope: str | None = None) -> None:
         if not path_like:
@@ -1036,7 +1106,7 @@ def _collect_ranking_participant_candidates(
             if normalized_target == "char" and not _is_char_detect_model_path(path):
                 return
         candidate_scope = force_scope or _ranking_model_candidate_scope(self, path, normalized_target)
-        if selected_scope in {"Projekt", "Globalne"} and candidate_scope != selected_scope:
+        if selected_scope == "Projekt" and candidate_scope != "Projekt":
             return
         try:
             resolved = path.resolve()
@@ -1046,24 +1116,138 @@ def _collect_ranking_participant_candidates(
             key = str(path).lower()
         if key in seen:
             return
+        content_key = model_content_key(resolved)
+        if content_key in seen_content:
+            return
         seen.add(key)
+        seen_content.add(content_key)
         candidates.append(resolved)
 
-    if selected_scope in {"Projekt", "Wszystkie"}:
+    if selected_scope in {"Projekt", "Globalne"}:
         for path in _collect_project_ranking_model_candidates(self, normalized_target):
             # Wyniki projektu często mają nazwę best.pt; domenę znamy z historii runu.
             add_path(path, require_domain_name=False, force_scope="Projekt")
 
-    if selected_scope in {"Globalne", "Wszystkie"} and models_dir is not None:
-        try:
-            root = Path(models_dir)
-            if root.exists() and root.is_dir():
-                for path in sorted(root.rglob("*.pt")):
-                    add_path(path, require_domain_name=True)
-        except Exception:
-            pass
+    if selected_scope in {"Projekt", "Globalne"}:
+        target_dir_name = {
+            "plate": "plates",
+            "char": "chars",
+            "vehicle": "vehicles",
+        }.get(normalized_target, "")
+        if target_dir_name:
+            try:
+                projects_root = Path(CONFIG.DIR_9_PROJECTS)
+                for project_root in sorted(projects_root.iterdir(), key=lambda item: item.name.lower()):
+                    project_models_dir = project_root / "6_models" / "trained" / target_dir_name
+                    if not project_models_dir.is_dir():
+                        continue
+                    for path in sorted(project_models_dir.rglob("*.pt")):
+                        add_path(path, require_domain_name=False, force_scope="Projekt")
+            except Exception:
+                pass
+        if selected_scope == "Globalne" and models_dir is not None:
+            try:
+                root = Path(models_dir)
+                if root.exists() and root.is_dir():
+                    for path in sorted(root.rglob("*.pt")):
+                        add_path(path, require_domain_name=True)
+            except Exception:
+                pass
 
     return candidates
+
+
+def _resolve_ranking_run_for_model_path(self, model_path: Path, target: str | None = None):
+    """Resolve copied ranking models back to the history that owns their metrics."""
+    try:
+        safe_path = Path(model_path).resolve()
+    except Exception:
+        safe_path = Path(model_path)
+    normalized_target = CONFIG.normalize_task_target(target or self._get_ranking_task_target())
+    cache_key = f"{normalized_target}:{_ranking_path_key(safe_path)}"
+    run_cache = getattr(self, "_ranking_run_resolution_cache", None)
+    if not isinstance(run_cache, dict):
+        run_cache = {}
+        self._ranking_run_resolution_cache = run_cache
+    if cache_key in run_cache:
+        return run_cache[cache_key]
+
+    history_dirs: list[Path] = []
+
+    try:
+        project_root = CAMPAIGN.get_active_project_root_dir()
+        if project_root is not None and _ranking_model_candidate_scope(self, safe_path, normalized_target) == "Projekt":
+            history_dirs.append(Path(project_root) / "5_training_runs")
+    except Exception:
+        pass
+
+    try:
+        history_dirs.append(CONFIG.get_training_history_dir(normalized_target))
+    except Exception:
+        target_dir = {"plate": "plates", "char": "chars", "vehicle": "vehicles"}.get(normalized_target, "plates")
+        history_dirs.append(Path(CONFIG.DIR_5_RUNS) / target_dir)
+
+    current_history = getattr(self, "history", None)
+    if current_history is not None:
+        history_dirs.append(Path(getattr(current_history, "history_dir", "")))
+
+    # Free-mode candidates can come from any project. Their copied model path
+    # contains the run id, while the original best.pt may already be gone.
+    try:
+        projects_root = Path(CONFIG.DIR_9_PROJECTS)
+        if projects_root.is_dir():
+            for project_root in projects_root.iterdir():
+                project_history = project_root / "5_training_runs"
+                if project_history.is_dir():
+                    history_dirs.append(project_history)
+    except Exception:
+        pass
+
+    seen_dirs: set[str] = set()
+    history_cache = getattr(self, "_ranking_history_runs_cache", None)
+    if not isinstance(history_cache, dict):
+        history_cache = {}
+        self._ranking_history_runs_cache = history_cache
+    for history_dir in history_dirs:
+        if not str(history_dir):
+            continue
+        try:
+            history_key = str(history_dir.resolve()).lower()
+        except Exception:
+            history_key = str(history_dir).lower()
+        if history_key in seen_dirs:
+            continue
+        seen_dirs.add(history_key)
+        if history_key not in history_cache:
+            try:
+                history = TrainingHistory(history_dir=history_dir, reconcile_on_load=False)
+                history_cache[history_key] = list(history.get_all_runs() or [])
+            except Exception:
+                history_cache[history_key] = []
+        runs = history_cache[history_key]
+        for run in runs:
+            run_id = str(getattr(run, "id", "") or "").strip()
+            best_weights = str(getattr(run, "best_weights", "") or "").strip()
+            output_dir = str(getattr(run, "output_dir", "") or "").strip()
+            if best_weights:
+                try:
+                    if Path(best_weights).resolve() == safe_path:
+                        run_cache[cache_key] = run
+                        return run
+                except Exception:
+                    pass
+            if output_dir:
+                try:
+                    if Path(output_dir).resolve() in safe_path.parents:
+                        run_cache[cache_key] = run
+                        return run
+                except Exception:
+                    pass
+            if run_id and run_id in safe_path.name:
+                run_cache[cache_key] = run
+                return run
+    run_cache[cache_key] = None
+    return None
 
 
 def _collect_plate_ranking_model_candidates(self, models_dir: Path) -> list[Path]:
@@ -1284,7 +1468,7 @@ def _collect_current_ranking_report_context(self) -> dict:
     }
 
 
-def _ranking_report_bar_svg(rows: list[dict], *, title: str) -> str:
+def _ranking_report_bar_svg(rows: list[dict], *, title: str, maximum=100.0, unit="%", precision=2, subtitle=None, axis_ticks=False) -> str:
     top_rows = rows[:12]
     width = 1180
     row_height = 42
@@ -1296,14 +1480,25 @@ def _ranking_report_bar_svg(rows: list[dict], *, title: str) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#101820"/>',
         f'<text x="24" y="36" fill="#f4f7f6" font-size="24" font-family="Segoe UI, Arial" font-weight="700">{_ranking_report_escape(title)}</text>',
-        '<text x="24" y="58" fill="#9fb0aa" font-size="13" font-family="Segoe UI, Arial">Ocena rankingowa w procentach. Dłuższy pasek oznacza lepszy wynik na tym samym torze testowym.</text>',
+        '<text x="24" y="58" fill="#9fb0aa" font-size="13" font-family="Segoe UI, Arial">' + _ranking_report_escape(subtitle or "Ocena rankingowa w procentach. Dłuższy pasek oznacza lepszy wynik na tym samym torze testowym.") + '</text>',
     ]
     if not top_rows:
         parts.append('<text x="24" y="110" fill="#f0b44c" font-size="18" font-family="Segoe UI, Arial">Brak wyników do wykresu.</text>')
+    if axis_ticks:
+        axis_y = height - 30
+        parts.append(f'<line x1="{left}" y1="{axis_y}" x2="{left + bar_width}" y2="{axis_y}" stroke="#9fb0aa"/>')
+        for index in range(5):
+            x = left + bar_width * index / 4
+            tick = f"{maximum * index / 4:g}{unit}".replace(".", ",")
+            parts.extend([
+                f'<line x1="{x}" y1="{top}" x2="{x}" y2="{axis_y}" stroke="#26343a" stroke-dasharray="3 4"/>',
+                f'<line x1="{x}" y1="{axis_y}" x2="{x}" y2="{axis_y + 5}" stroke="#9fb0aa"/>',
+                f'<text x="{x}" y="{axis_y + 18}" text-anchor="middle" fill="#c1cdc8" font-size="13" font-family="Segoe UI, Arial">{_ranking_report_escape(tick)}</text>',
+            ])
     for index, row in enumerate(top_rows):
         y = top + index * row_height
-        score = max(0.0, min(100.0, float(row.get("score", 0.0) or 0.0)))
-        bar_len = (score / 100.0) * bar_width
+        score = max(0.0, float(row.get("score", 0.0) or 0.0))
+        bar_len = min(1.0, score / maximum) * bar_width
         fill = "#2ecc71" if index == 0 else "#4aa3ff"
         label = textwrap.shorten(str(row.get("label", "-")), width=44, placeholder="...")
         parts.extend(
@@ -1311,7 +1506,7 @@ def _ranking_report_bar_svg(rows: list[dict], *, title: str) -> str:
                 f'<text x="24" y="{y + 20}" fill="#f4f7f6" font-size="14" font-family="Segoe UI, Arial">#{index + 1} {_ranking_report_escape(label)}</text>',
                 f'<rect x="{left}" y="{y + 5}" width="{bar_width}" height="22" rx="8" fill="#26343a"/>',
                 f'<rect x="{left}" y="{y + 5}" width="{bar_len:.1f}" height="22" rx="8" fill="{fill}"/>',
-                f'<text x="{left + bar_width + 18}" y="{y + 22}" fill="#f4f7f6" font-size="15" font-family="Segoe UI, Arial" font-weight="700">{score:.2f}%</text>',
+                f'<text x="{left + bar_width + 18}" y="{y + 22}" fill="#f4f7f6" font-size="15" font-family="Segoe UI, Arial" font-weight="700">{_ranking_report_escape(row.get("score_label") or f"{score:.{precision}f}{unit}")}</text>',
             ]
         )
     parts.append("</svg>")
@@ -1723,6 +1918,9 @@ def _draw_ranking_plate_diffs_canvas(canvas: tk.Canvas, rows: list[dict], palett
 
 
 def _open_ranking_report_viewer(self):
+    from .z4_eval396 import selected_eval396, open_results
+    if selected_eval396(self):
+        return open_results(self)
     try:
         context = _collect_current_ranking_report_context(self)
     except Exception as exc:
@@ -1980,6 +2178,9 @@ def _open_ranking_report_viewer(self):
 
 
 def _export_ranking_analysis_report(self):
+    from .z4_eval396 import selected_eval396, open_results
+    if selected_eval396(self):
+        return open_results(self, export_after_load=True)
     try:
         context = _collect_current_ranking_report_context(self)
     except Exception as exc:
@@ -2140,11 +2341,16 @@ def _count_ranking_dataset_splits(yaml_path: Path) -> dict[str, int]:
     return counts
 
 
-def _collect_ranking_track_candidates(self) -> list[dict]:
+def _collect_ranking_track_candidates(self, *, split_name=None) -> list[dict]:
     target = self._get_ranking_task_target()
-    selected_split = self._get_ranking_split_name()
+    selected_split = split_name or self._get_ranking_split_name()
     candidates: list[dict] = []
     seen: set[str] = set()
+    from .z4_eval396 import track_candidate
+    eval_candidate = track_candidate(Path(__file__).resolve().parents[2])
+    if eval_candidate:
+        candidates.append(eval_candidate)
+        seen.add(_ranking_path_key(eval_candidate["path"]))
 
     def add_candidate(path_like, *, source: str) -> None:
         raw = str(path_like or "").strip()
@@ -2214,6 +2420,7 @@ def _collect_ranking_track_candidates(self) -> list[dict]:
                 "split": "run",
                 "split_count": image_count,
                 "counts": {"total": image_count},
+                "xml_path": info.get("xml_path") or str(path / "annotations.xml"),
                 "created": created,
                 "source": source,
                 "status": "gotowy" if image_count > 0 else "brak obrazów",
@@ -2280,7 +2487,7 @@ def _collect_ranking_track_candidates(self) -> list[dict]:
 
     candidates.sort(
         key=lambda row: (
-            0 if row.get("source") in {"Aktualny", "Aktualny wariant"} else 1,
+            0 if row.get("source") in {"Aktualny", "Aktualny wariant", "Zamrożony"} else 1,
             0 if row.get("ready") else 1,
             str(row.get("created") or ""),
             str(row.get("id") or ""),
@@ -2291,799 +2498,17 @@ def _collect_ranking_track_candidates(self) -> list[dict]:
 
 
 def _open_ranking_track_modal(self):
-    existing = getattr(self, "_ranking_track_modal", None)
-    try:
-        if existing is not None and existing.winfo_exists():
-            existing.lift()
-            existing.focus_force()
-            return
-    except Exception:
-        pass
-
-    palette = getattr(self.app, "palette", {})
-    dialog = tk.Toplevel(getattr(self, "frame", None))
-    self._ranking_track_modal = dialog
-    dialog.title("Wybór toru testowego rankingu")
-    dialog.configure(bg=palette.get("panel", "#252526"))
-    dialog.resizable(True, True)
-    try:
-        dialog.transient(self.frame.winfo_toplevel())
-    except Exception:
-        pass
-
-    def close_dialog():
-        try:
-            self._ranking_track_modal = None
-        except Exception:
-            pass
-        try:
-            dialog.destroy()
-        except Exception:
-            pass
-
-    dialog.protocol("WM_DELETE_WINDOW", close_dialog)
-
-    shell = ttk.Frame(dialog, padding=14, style="Panel.TFrame")
-    shell.pack(fill=tk.BOTH, expand=True)
-    shell.grid_columnconfigure(0, weight=1)
-    shell.grid_rowconfigure(3, weight=1)
-
-    ttk.Label(
-        shell,
-        text="Tor testowy rankingu",
-        style="Panel.TLabel",
-        anchor=tk.W,
-    ).grid(row=0, column=0, sticky="ew")
-    ttk.Label(
-        shell,
-        text=(
-            "Wybierz jeden wspólny materiał testowy. Wszystkie modele pobiegną po tym samym torze, "
-            "więc wynik będzie porównywalny."
-        ),
-        style="PanelMuted.TLabel",
-        anchor=tk.W,
-        justify=tk.LEFT,
-        wraplength=760,
-    ).grid(row=1, column=0, sticky="ew", pady=(2, 10))
-
-    toolbar = ttk.Frame(shell, style="Panel.TFrame")
-    toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-    ttk.Label(
-        toolbar,
-        text=f"Konie: {self._get_ranking_task_label()}",
-        style="PanelMuted.TLabel",
-    ).pack(side=tk.LEFT, padx=(0, 12))
-    split_combo = None
-    if self._get_ranking_task_target() == "char":
-        ttk.Label(toolbar, text="Split toru:", style="PanelMuted.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        split_combo = ttk.Combobox(
-            toolbar,
-            textvariable=self.rank_split_var,
-            values=("test", "val"),
-            state="readonly",
-            width=8,
-        )
-        split_combo.pack(side=tk.LEFT)
-    ttk.Button(toolbar, text="Odśwież", command=lambda: load_rows()).pack(side=tk.RIGHT)
-
-    table_frame = ttk.Frame(shell, style="Panel.TFrame")
-    table_frame.grid(row=3, column=0, sticky="nsew")
-    table_frame.rowconfigure(0, weight=1)
-    table_frame.columnconfigure(0, weight=1)
-
-    cols = ("status", "track", "type", "split", "count", "created", "source")
-    tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
-    headings = {
-        "status": "Status",
-        "track": "Tor",
-        "type": "Typ",
-        "split": "Split",
-        "count": "Materiał",
-        "created": "Utworzono",
-        "source": "Źródło",
-    }
-    for col, text in headings.items():
-        tree.heading(col, text=text)
-    tree.column("status", width=82, minwidth=70, anchor=tk.CENTER, stretch=False)
-    tree.column("track", width=240, minwidth=170, anchor=tk.W, stretch=True)
-    tree.column("type", width=78, minwidth=68, anchor=tk.CENTER, stretch=False)
-    tree.column("split", width=72, minwidth=62, anchor=tk.CENTER, stretch=False)
-    tree.column("count", width=260, minwidth=180, anchor=tk.W, stretch=True)
-    tree.column("created", width=120, minwidth=104, anchor=tk.W, stretch=False)
-    tree.column("source", width=92, minwidth=80, anchor=tk.CENTER, stretch=False)
-    try:
-        tree.tag_configure("ready", foreground=palette.get("success", "#2ecc71"))
-        tree.tag_configure("blocked", foreground=palette.get("error", "#e05d5d"))
-        tree.tag_configure("current", background=blend_hex_colors(
-            palette.get("accent", "#0e639c"),
-            palette.get("panel", "#252526"),
-            0.82,
-        ))
-    except Exception:
-        pass
-
-    yscroll = WebSlimScrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
-    tree.configure(yscrollcommand=yscroll.set)
-    tree.grid(row=0, column=0, sticky="nsew")
-    yscroll.grid(row=0, column=1, sticky="ns")
-
-    status_lbl = ttk.Label(
-        shell,
-        text="Zaznacz wiersz i zastosuj go jako tor testowy rankingu.",
-        style="PanelMuted.TLabel",
-        anchor=tk.W,
-    )
-    status_lbl.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-
-    rows_by_id: dict[str, dict] = {}
-
-    def load_rows():
-        selected_path = str(getattr(getattr(self, "rank_data_dir", None), "get", lambda: "")() or "").strip()
-        selected_key = _ranking_path_key(selected_path)
-        rows_by_id.clear()
-        try:
-            tree.delete(*tree.get_children())
-        except Exception:
-            pass
-        participant_paths_by_item.clear()
-        rows = _collect_ranking_track_candidates(self)
-        for index, row in enumerate(rows):
-            path_key = _ranking_path_key(row.get("path"))
-            tags = []
-            tags.append("ready" if row.get("ready") else "blocked")
-            if selected_key and path_key == selected_key:
-                tags.append("current")
-            item_id = tree.insert("", tk.END, values=(
-                "jest" if row.get("ready") else "-",
-                row.get("id") or "-",
-                row.get("type") or "-",
-                str(row.get("split") or "-"),
-                row.get("details") or "-",
-                row.get("created") or "-",
-                row.get("source") or "-",
-            ), tags=tuple(tags))
-            rows_by_id[item_id] = row
-            if index == 0 and not selected_key:
-                try:
-                    tree.selection_set(item_id)
-                    tree.focus(item_id)
-                except Exception:
-                    pass
-            elif selected_key and path_key == selected_key:
-                try:
-                    tree.selection_set(item_id)
-                    tree.focus(item_id)
-                    tree.see(item_id)
-                except Exception:
-                    pass
-        if rows:
-            status_lbl.configure(text=f"Dostępne tory: {len(rows)}. Modele będą porównane tylko na zaznaczonym torze.")
-        else:
-            status_lbl.configure(text="Nie znaleziono gotowych torów testowych. Użyj Zaawansowane, jeśli musisz wskazać ścieżkę ręcznie.")
-
-    def accept_selection():
-        selected = tree.selection()
-        if not selected:
-            return messagebox.showwarning("Brak wyboru", "Zaznacz tor testowy w tabeli.")
-        row = rows_by_id.get(selected[0]) or {}
-        if not row.get("ready"):
-            return messagebox.showwarning(
-                "Tor nie jest gotowy",
-                "Ten tor nie ma materiału dla wybranego splitu. Wybierz inny tor albo zmień split.",
-            )
-        path = str(row.get("path") or "").strip()
-        if not path:
-            return
-        try:
-            self.rank_data_dir.set(path)
-        except Exception:
-            pass
-        try:
-            self._refresh_ranking_reference_ui()
-        except Exception:
-            pass
-        close_dialog()
-
-    tree.bind("<Double-1>", lambda _event: accept_selection(), add="+")
-    if split_combo is not None:
-        try:
-            split_combo.bind("<<ComboboxSelected>>", lambda _event: load_rows(), add="+")
-        except Exception:
-            pass
-
-    bottom = ttk.Frame(shell, style="Panel.TFrame")
-    bottom.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-    ttk.Button(
-        bottom,
-        text="[ OPCJE ] Zaawansowane",
-        command=self._open_ranking_advanced_modal,
-    ).pack(side=tk.LEFT)
-    ttk.Button(bottom, text="[ X ] Zamknij", command=close_dialog).pack(side=tk.RIGHT)
-    ttk.Button(
-        bottom,
-        text="[ TOR ] Zastosuj zaznaczony tor",
-        style="Accent.TButton",
-        command=accept_selection,
-    ).pack(side=tk.RIGHT, padx=(0, 8))
-
-    load_rows()
-    try:
-        dialog.update_idletasks()
-        root = self.frame.winfo_toplevel()
-        width = min(max(980, int(root.winfo_width() * 0.78)), 1280)
-        height = min(max(560, int(root.winfo_height() * 0.68)), 820)
-        x = int(root.winfo_rootx() + max(0, (root.winfo_width() - width) // 2))
-        y = int(root.winfo_rooty() + max(0, (root.winfo_height() - height) // 2))
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
-    except Exception:
-        dialog.geometry("1040x620")
-    try:
-        dialog.lift()
-        dialog.focus_force()
-    except Exception:
-        pass
+    from .z4_ranking_catalog import open_tracks
+    return open_tracks(self)
 
 
 def _open_ranking_participants_modal(self):
-    existing = getattr(self, "_ranking_participants_modal", None)
-    try:
-        if existing is not None and existing.winfo_exists():
-            existing.lift()
-            existing.focus_force()
-            return
-    except Exception:
-        pass
+    from .z4_eval396 import selected_eval396, open_participants
+    if selected_eval396(self):
+        return open_participants(self)
+    from .z4_ranking_catalog import open_models
+    return open_models(self)
 
-    palette = getattr(self.app, "palette", {})
-    if not hasattr(self, "rank_scope_var"):
-        default_scope = "Projekt" if CAMPAIGN.get_active_project_name() else "Wszystkie"
-        self.rank_scope_var = tk.StringVar(value=default_scope)
-
-    dialog = tk.Toplevel(getattr(self, "frame", None))
-    self._ranking_participants_modal = dialog
-    dialog.title("Uczestnicy rankingu modeli")
-    dialog.configure(bg=palette.get("panel", "#252526"))
-    dialog.resizable(True, True)
-    try:
-        dialog.transient(self.frame.winfo_toplevel())
-    except Exception:
-        pass
-
-    def close_dialog():
-        try:
-            self._ranking_participants_modal = None
-        except Exception:
-            pass
-        try:
-            dialog.destroy()
-        except Exception:
-            pass
-
-    dialog.protocol("WM_DELETE_WINDOW", close_dialog)
-
-    shell = ttk.Frame(dialog, padding=14, style="Panel.TFrame")
-    shell.pack(fill=tk.BOTH, expand=True)
-    shell.grid_columnconfigure(0, weight=1)
-    shell.grid_rowconfigure(3, weight=1)
-
-    ttk.Label(
-        shell,
-        text="Konie rankingu",
-        style="Panel.TLabel",
-        anchor=tk.W,
-    ).grid(row=0, column=0, sticky="ew")
-    intro = ttk.Label(
-        shell,
-        text=(
-            "Tu widać dokładnie, które modele wystartują w wyścigu. Zakres zmienia listę uczestników "
-            "i tę samą listę dostaje potem ranking."
-        ),
-        style="PanelMuted.TLabel",
-        anchor=tk.W,
-        justify=tk.LEFT,
-        wraplength=820,
-    )
-    intro.grid(row=1, column=0, sticky="ew", pady=(2, 10))
-
-    toolbar = ttk.Frame(shell, style="Panel.TFrame")
-    toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-    ttk.Label(toolbar, text="Zakres:", style="PanelMuted.TLabel").pack(side=tk.LEFT, padx=(0, 8))
-
-    def refresh_after_scope_change():
-        try:
-            self._refresh_ranking_reference_ui()
-        except Exception:
-            pass
-        try:
-            self._load_ranking()
-        except Exception:
-            pass
-        load_rows()
-
-    for label, value in (
-        ("Projektowe", "Projekt"),
-        ("Globalne", "Globalne"),
-        ("Wszystkie", "Wszystkie"),
-    ):
-        ttk.Radiobutton(
-            toolbar,
-            text=label,
-            value=value,
-            variable=self.rank_scope_var,
-            command=refresh_after_scope_change,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-
-    ttk.Button(toolbar, text="Odśwież", command=lambda: load_rows()).pack(side=tk.RIGHT)
-
-    def choose_global_models_dir():
-        initial = str(getattr(getattr(self, "rank_models_dir", None), "get", lambda: "")() or "")
-        dialog_kwargs = {
-            "title": "Wskaż katalog modeli globalnych",
-            "parent": dialog,
-        }
-        if initial and Path(initial).exists():
-            dialog_kwargs["initialdir"] = initial
-        selected = filedialog.askdirectory(**dialog_kwargs)
-        if not selected:
-            return
-        try:
-            self.rank_models_dir.set(selected)
-            self.rank_scope_var.set("Wszystkie")
-        except Exception:
-            pass
-        refresh_after_scope_change()
-
-    table_frame = ttk.Frame(shell, style="Panel.TFrame")
-    table_frame.grid(row=3, column=0, sticky="nsew")
-    table_frame.rowconfigure(0, weight=1)
-    table_frame.columnconfigure(0, weight=1)
-
-    participants_tree_style = "RankingParticipants.Treeview"
-    try:
-        style = ttk.Style()
-        style.configure(participants_tree_style, font=("Segoe UI", 9, "bold"), rowheight=24)
-        style.configure(f"{participants_tree_style}.Heading", font=("Segoe UI", 9, "bold"))
-    except Exception:
-        pass
-
-    def make_start_icon(enabled: bool) -> tk.PhotoImage:
-        icon = tk.PhotoImage(width=18, height=18)
-        color = palette.get("success", "#2ecc71") if enabled else palette.get("danger", "#e74c3c")
-        if enabled:
-            icon.put(color, to=(8, 3, 11, 15))
-            icon.put(color, to=(3, 8, 16, 11))
-        else:
-            icon.put(color, to=(3, 8, 16, 11))
-        return icon
-
-    start_icons = {
-        "on": make_start_icon(True),
-        "off": make_start_icon(False),
-    }
-    self._ranking_participants_start_icons = start_icons
-
-    cols = ("scope", "participant", "family", "size", "created", "epochs", "map", "train", "file", "source")
-    tree = ttk.Treeview(
-        table_frame,
-        columns=cols,
-        show="tree headings",
-        selectmode="browse",
-        style=participants_tree_style,
-    )
-    participant_sort_values: dict[str, dict] = {}
-    sort_state = {"column": "", "descending": False}
-
-    def sort_value(item_id: str, column: str):
-        data = participant_sort_values.get(str(item_id), {})
-        value = data.get(column)
-        if value is None:
-            return (2, "")
-        if isinstance(value, bool):
-            return (0, 0 if value else 1)
-        if isinstance(value, (int, float)):
-            return (0, float(value))
-        text = str(value or "").strip().lower()
-        if not text or text == "-":
-            return (2, "")
-        return (1, text)
-
-    def sort_by_column(column: str) -> None:
-        descending = False
-        if sort_state.get("column") == column:
-            descending = not bool(sort_state.get("descending"))
-        sort_state["column"] = column
-        sort_state["descending"] = descending
-        try:
-            items = list(tree.get_children(""))
-            items.sort(key=lambda item_id: sort_value(str(item_id), column), reverse=descending)
-            for index, item_id in enumerate(items):
-                tree.move(item_id, "", index)
-            refresh_sort_headings()
-        except Exception:
-            pass
-
-    headings = {
-        "scope": "Zakres",
-        "participant": "Uczestnik",
-        "family": "Rodzina",
-        "size": "MB",
-        "created": "Utworzono",
-        "epochs": "Epoki",
-        "map": "mAP50-95",
-        "train": "Obrazy train",
-        "file": "Wagi",
-        "source": "Źródło modelu",
-    }
-
-    def refresh_sort_headings() -> None:
-        active = str(sort_state.get("column") or "")
-        arrow = " ↓" if bool(sort_state.get("descending")) else " ↑"
-        tree.heading("#0", text=f"Start{arrow if active == 'start' else ''}", command=lambda: sort_by_column("start"))
-        for column, text in headings.items():
-            tree.heading(
-                column,
-                text=f"{text}{arrow if active == column else ''}",
-                command=lambda c=column: sort_by_column(c),
-            )
-
-    refresh_sort_headings()
-    tree.column("#0", width=88, minwidth=76, anchor=tk.CENTER, stretch=False)
-    tree.column("scope", width=132, minwidth=96, anchor=tk.W, stretch=False)
-    tree.column("participant", width=170, minwidth=140, anchor=tk.W, stretch=False)
-    tree.column("family", width=92, minwidth=74, anchor=tk.CENTER, stretch=False)
-    tree.column("size", width=64, minwidth=54, anchor=tk.CENTER, stretch=False)
-    tree.column("created", width=124, minwidth=108, anchor=tk.CENTER, stretch=False)
-    tree.column("epochs", width=76, minwidth=64, anchor=tk.CENTER, stretch=False)
-    tree.column("map", width=88, minwidth=76, anchor=tk.CENTER, stretch=False)
-    tree.column("train", width=94, minwidth=80, anchor=tk.CENTER, stretch=False)
-    tree.column("file", width=136, minwidth=106, anchor=tk.W, stretch=False)
-    tree.column("source", width=330, minwidth=240, anchor=tk.W, stretch=True)
-    try:
-        tree.tag_configure("project", foreground=palette.get("success", "#2ecc71"))
-        tree.tag_configure("global", foreground=palette.get("fg", "#f3f3f3"))
-        tree.tag_configure("disabled", foreground=palette.get("muted", "#8f8f8f"))
-    except Exception:
-        pass
-
-    yscroll = WebSlimScrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
-    xscroll = WebSlimScrollbar(table_frame, orient=tk.HORIZONTAL, command=tree.xview)
-    tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-    tree.grid(row=0, column=0, sticky="nsew")
-    yscroll.grid(row=0, column=1, sticky="ns")
-    xscroll.grid(row=1, column=0, sticky="ew")
-
-    status_lbl = ttk.Label(
-        shell,
-        text="Ładuję uczestników...",
-        style="PanelMuted.TLabel",
-        anchor=tk.W,
-    )
-    status_lbl.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-    participant_paths_by_item: dict[str, Path] = {}
-
-    def scope_cell_label(candidate_scope: str) -> str:
-        if candidate_scope == "Projekt":
-            try:
-                return str(CAMPAIGN.get_active_project_name() or "").strip() or "Projekt"
-            except Exception:
-                return "Projekt"
-        return "Globalne"
-
-    def model_family_label(path: Path, run) -> str:
-        raw = ""
-        if run is not None:
-            raw = str(getattr(run, "base_model", "") or "").strip()
-        if not raw:
-            raw = str(path.name or "").strip()
-        stem = Path(raw).stem if raw else ""
-        lower = stem.lower()
-        for suffix in ("-pose", "_pose", "-detect", "_detect", "-seg", "_seg", "-cls", "_cls"):
-            if lower.endswith(suffix):
-                stem = stem[: -len(suffix)]
-                lower = lower[: -len(suffix)]
-                break
-        match = re.search(r"(yolo(?:v)?\d+[nslmx]?)", lower)
-        if match:
-            return match.group(1)
-        return stem[:18] if stem else "-"
-
-    def model_size_label(path: Path) -> str:
-        try:
-            size_mb = float(Path(path).stat().st_size) / (1024.0 * 1024.0)
-            return f"{size_mb:.1f}"
-        except Exception:
-            return "-"
-
-    def format_timestamp_label(timestamp: float | None) -> str:
-        if not timestamp:
-            return "-"
-        try:
-            return datetime.datetime.fromtimestamp(float(timestamp)).strftime("%d.%m.%y %H:%M")
-        except Exception:
-            return "-"
-
-    def model_created_info(path: Path, run) -> tuple[str, float]:
-        raw = ""
-        if run is not None:
-            raw = str(getattr(run, "created_at", "") or getattr(run, "started_at", "") or "").strip()
-        if raw:
-            try:
-                dt = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                return dt.strftime("%d.%m.%y %H:%M"), float(dt.timestamp())
-            except Exception:
-                pass
-        try:
-            timestamp = float(Path(path).stat().st_ctime)
-            return format_timestamp_label(timestamp), timestamp
-        except Exception:
-            return "-", 0.0
-
-    def model_epochs_info(run) -> tuple[str, int]:
-        if run is None:
-            return "-", -1
-        current = int(getattr(run, "current_epoch", 0) or 0)
-        target = int(getattr(run, "epochs", 0) or 0)
-        if target <= 0 and current <= 0:
-            return "-", -1
-        if current > 0 and target > 0:
-            return f"{current}/{target}", current
-        return str(target or current), target or current
-
-    def model_map_info(run) -> tuple[str, float]:
-        if run is None:
-            return "-", -1.0
-        value = float(getattr(run, "best_map50_95", 0.0) or 0.0)
-        if value <= 0:
-            return "-", -1.0
-        percent = value * 100.0 if 0.0 < value <= 1.0 else value
-        return f"{percent:.1f}%", percent
-
-    dataset_train_count_cache: dict[str, tuple[str, int]] = {}
-
-    def dataset_train_images_info(run) -> tuple[str, int]:
-        raw = str(getattr(run, "dataset_path", "") or "").strip() if run is not None else ""
-        if not raw:
-            return "-", -1
-        try:
-            dataset_path = Path(raw)
-        except Exception:
-            return "-", -1
-        yaml_path = dataset_path if dataset_path.name.lower() == "data.yaml" else dataset_path / "data.yaml"
-        key = _ranking_path_key(yaml_path)
-        if key in dataset_train_count_cache:
-            return dataset_train_count_cache[key]
-        if not yaml_path.exists():
-            result = ("-", -1)
-        else:
-            try:
-                counts = _count_ranking_dataset_splits(yaml_path)
-                train_count = int((counts or {}).get("train", 0) or 0)
-                result = (str(train_count) if train_count > 0 else "-", train_count if train_count > 0 else -1)
-            except Exception:
-                result = ("-", -1)
-        dataset_train_count_cache[key] = result
-        return result
-
-    def participant_tags(candidate_scope: str, enabled: bool) -> tuple[str, ...]:
-        if not enabled:
-            return ("disabled",)
-        return ("project",) if candidate_scope == "Projekt" else ("global",)
-
-    def update_start_cell(item_id: str, enabled: bool) -> None:
-        try:
-            tree.item(
-                item_id,
-                text="TAK" if enabled else "NIE",
-                image=start_icons["on" if enabled else "off"],
-            )
-        except Exception:
-            pass
-
-    def update_status_label(total: int) -> None:
-        selected = sum(
-            1 for path in participant_paths_by_item.values()
-            if _is_ranking_participant_enabled(self, path)
-        )
-        scope = _get_ranking_scope(self)
-        target = self._get_ranking_task_target()
-        scope_label = _format_ranking_scope_label(self, scope, target)
-        status_lbl.configure(
-            text=(
-                f"Zakres: {scope_label}. Startuje: {selected}/{total}. "
-                "Tylko zaznaczone modele trafią do rankingu."
-            )
-        )
-
-    def toggle_participant_item(item_id: str) -> None:
-        path = participant_paths_by_item.get(str(item_id))
-        if path is None:
-            return
-        enabled = not _is_ranking_participant_enabled(self, path)
-        _set_ranking_participant_enabled(self, path, enabled)
-        update_start_cell(item_id, enabled)
-        try:
-            sort_data = participant_sort_values.get(str(item_id), {})
-            sort_data["start"] = bool(enabled)
-            tree.item(item_id, tags=participant_tags(str(sort_data.get("scope_key") or ""), enabled))
-        except Exception:
-            pass
-        update_status_label(len(participant_paths_by_item))
-        try:
-            self._refresh_ranking_reference_ui()
-        except Exception:
-            pass
-        try:
-            self._load_ranking()
-        except Exception:
-            pass
-
-    def on_tree_click(event):
-        try:
-            if tree.identify_column(event.x) != "#0":
-                return None
-            item_id = str(tree.identify_row(event.y) or "")
-        except Exception:
-            item_id = ""
-        if item_id:
-            toggle_participant_item(item_id)
-            return "break"
-        return None
-
-    def on_tree_space(_event=None):
-        try:
-            selection = list(tree.selection() or [])
-        except Exception:
-            selection = []
-        if selection:
-            toggle_participant_item(str(selection[0]))
-            return "break"
-        return None
-
-    def on_tree_motion(event):
-        try:
-            cursor = "hand2" if tree.identify_column(event.x) == "#0" and tree.identify_row(event.y) else ""
-            if str(tree.cget("cursor") or "") != cursor:
-                tree.configure(cursor=cursor)
-        except Exception:
-            pass
-
-    def on_tree_leave(_event=None):
-        try:
-            tree.configure(cursor="")
-        except Exception:
-            pass
-
-    tree.bind("<Button-1>", on_tree_click, add="+")
-    tree.bind("<space>", on_tree_space, add="+")
-    tree.bind("<Motion>", on_tree_motion, add="+")
-    tree.bind("<Leave>", on_tree_leave, add="+")
-
-    def model_run_for_path(path: Path):
-        resolver = getattr(self, "_resolve_training_run_from_model_path", None)
-        if callable(resolver):
-            try:
-                return resolver(Path(path))
-            except Exception:
-                return None
-        return None
-
-    def model_labels(path: Path, scope: str) -> tuple[str, str]:
-        run = model_run_for_path(path)
-        target = self._get_ranking_task_target()
-        if run is not None:
-            try:
-                run_ref = build_run_display_ref(run, kind_hint="training")
-                model_ref = build_model_display_ref(
-                    path,
-                    run=run,
-                    target_hint=target,
-                    source_run_label=run_ref.id,
-                )
-                return model_ref.id, f"Run {run_ref.id}"
-            except Exception:
-                run_id = str(getattr(run, "id", "") or "").strip()
-                try:
-                    target_task = self._get_ranking_task_label()
-                    return format_ranking_model_label(path.name, str(path), target_task), f"Run {run_id or '-'}"
-                except Exception:
-                    pass
-        try:
-            label = build_model_display_ref(path, target_hint=target).id
-        except Exception:
-            target_task = self._get_ranking_task_label()
-            label = format_ranking_model_label(path.name, str(path), target_task)
-        return label, "Projekt" if scope == "Projekt" else "Katalog modeli"
-
-    def load_rows():
-        try:
-            tree.delete(*tree.get_children())
-        except Exception:
-            pass
-        participant_paths_by_item.clear()
-        participant_sort_values.clear()
-        target = self._get_ranking_task_target()
-        scope = _get_ranking_scope(self)
-        models_dir_raw = str(getattr(getattr(self, "rank_models_dir", None), "get", lambda: "")() or "").strip()
-        try:
-            models_dir = Path(models_dir_raw) if models_dir_raw else None
-        except Exception:
-            models_dir = None
-        try:
-            participants = _collect_ranking_participant_candidates(self, models_dir, target, scope)
-        except Exception:
-            participants = []
-        for path in participants:
-            model_path = Path(path)
-            candidate_scope = _ranking_model_candidate_scope(self, model_path, target)
-            label, source = model_labels(model_path, candidate_scope)
-            run = model_run_for_path(model_path)
-            enabled = _is_ranking_participant_enabled(self, model_path)
-            created_label, created_sort = model_created_info(model_path, run)
-            epochs_label, epochs_sort = model_epochs_info(run)
-            map_label, map_sort = model_map_info(run)
-            train_label, train_sort = dataset_train_images_info(run)
-            size_label = model_size_label(model_path)
-            try:
-                size_sort = float(size_label)
-            except Exception:
-                size_sort = -1.0
-            scope_label = scope_cell_label(candidate_scope)
-            family_label = model_family_label(model_path, run)
-            item_id = tree.insert("", tk.END, values=(
-                scope_cell_label(candidate_scope),
-                label,
-                family_label,
-                size_label,
-                created_label,
-                epochs_label,
-                map_label,
-                train_label,
-                model_path.name,
-                source,
-            ), tags=participant_tags(candidate_scope, enabled))
-            update_start_cell(str(item_id), enabled)
-            participant_paths_by_item[str(item_id)] = model_path
-            participant_sort_values[str(item_id)] = {
-                "start": bool(enabled),
-                "scope": scope_label,
-                "scope_key": candidate_scope,
-                "participant": label,
-                "family": family_label,
-                "size": size_sort,
-                "created": created_sort,
-                "epochs": epochs_sort,
-                "map": map_sort,
-                "train": train_sort,
-                "file": model_path.name,
-                "source": source,
-            }
-        update_status_label(len(participants))
-
-    bottom = ttk.Frame(shell, style="Panel.TFrame")
-    bottom.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-    ttk.Button(
-        bottom,
-        text="[ DODAJ ] Wskaż katalog modeli",
-        command=choose_global_models_dir,
-    ).pack(side=tk.LEFT)
-    ttk.Button(bottom, text="[ X ] Zamknij", command=close_dialog).pack(side=tk.RIGHT)
-
-    load_rows()
-    try:
-        dialog.update_idletasks()
-        root = self.frame.winfo_toplevel()
-        width = min(max(1320, int(root.winfo_width() * 0.9)), 1600)
-        height = min(max(580, int(root.winfo_height() * 0.7)), 860)
-        x = int(root.winfo_rootx() + max(0, (root.winfo_width() - width) // 2))
-        y = int(root.winfo_rooty() + max(0, (root.winfo_height() - height) // 2))
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
-    except Exception:
-        dialog.geometry("1360x680")
-    try:
-        dialog.lift()
-        dialog.focus_force()
-    except Exception:
-        pass
 
 def _on_analysis_plot_selected(self, event=None):
     listbox = getattr(self, "_analysis_plots_list", None)
@@ -3138,7 +2563,7 @@ def _build_ranking_panel_v2(self, parent):
     self.rank_data_dir = tk.StringVar()
     self.rank_split_var = tk.StringVar(value="test")
     if not hasattr(self, "rank_scope_var"):
-        default_scope = "Projekt" if CAMPAIGN.get_active_project_name() else "Wszystkie"
+        default_scope = "Projekt" if CAMPAIGN.get_active_project_name() else "Globalne"
         self.rank_scope_var = tk.StringVar(value=default_scope)
     self.rank_progress_var = tk.DoubleVar(value=0.0)
     self.btn_run_rank = None
@@ -3521,6 +2946,9 @@ def _build_ranking_panel_v2(self, parent):
     self._refresh_ranking_reference_ui()
 
 def _open_ranking_results_modal(self):
+    from .z4_eval396 import selected_eval396, open_results
+    if selected_eval396(self):
+        return open_results(self)
     existing = getattr(self, "_ranking_results_modal", None)
     try:
         if existing is not None and existing.winfo_exists():
@@ -3969,6 +3397,9 @@ def _open_ranking_advanced_modal(self):
         dialog.geometry("560x390")
 
 def _run_ranking_v2(self):
+    from .z4_eval396 import selected_eval396, open_results
+    if selected_eval396(self):
+        return open_results(self)
     if self.rank_is_running:
         return
 
@@ -4020,6 +3451,7 @@ def _run_ranking_v2(self):
     self._start_ranking_watchdog("start przygotowania rankingu")
 
     def worker():
+        temporary_ranking_dir = None
         try:
             ranking_started_at = time.perf_counter()
             cancelled = False
@@ -4239,7 +3671,11 @@ def _run_ranking_v2(self):
             comparator = AnnotationComparator()
             conf_thresh = float(CONFIG.DEFAULT_CONFIDENCE)
             total_models = len(models_to_test)
-            temp_xml_path = Path(str(reference_info.get("reference_dir") or models_dir)) / "temp_ranking_auto.xml"
+            import tempfile
+            scratch_root = Path(CONFIG.get_ranking_dir(target)) / "temporary"
+            scratch_root.mkdir(parents=True, exist_ok=True)
+            temporary_ranking_dir = tempfile.TemporaryDirectory(prefix="ranking_", dir=scratch_root)
+            temp_xml_path = Path(temporary_ranking_dir.name) / "predictions.xml"
             self._append_ranking_log(
                 f"Przygotowanie zakończone. Modele pose: {total_models} | obrazy do porównania: {len(images)}"
             )
@@ -4364,6 +3800,8 @@ def _run_ranking_v2(self):
             self._ui(lambda err=e: messagebox.showerror("Błąd", f"Błąd w trakcie rankingu:\n{err}"))
             self._set_ranking_ui_state(status="Błąd rankingu", status_color="red")
         finally:
+            if temporary_ranking_dir is not None:
+                temporary_ranking_dir.cleanup()
             self._stop_ranking_watchdog()
             self.rank_is_running = False
             self.rank_cancel_requested = False

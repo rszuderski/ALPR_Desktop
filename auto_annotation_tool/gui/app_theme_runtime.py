@@ -1172,6 +1172,18 @@ def style_panel_surface(self, root, background: str = None):
             return
         visited.add(widget_id)
 
+        # Loading overlays own several different nested backgrounds. Let
+        # their theme handler style the whole subtree instead of flattening
+        # it to the enclosing panel during a later refresh.
+        surface_theme = getattr(widget, "_panel_surface_theme_handler", None)
+        if callable(surface_theme):
+            try:
+                surface_theme()
+            except Exception as exc:
+                logger.debug(f"Custom panel surface theme failed: {exc}")
+            else:
+                return
+
         try:
             class_name = str(widget.winfo_class())
         except Exception:

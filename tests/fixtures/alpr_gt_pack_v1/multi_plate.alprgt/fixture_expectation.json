@@ -1,0 +1,7 @@
+{
+  "ground_truth": {
+    "plate-ann-fixture-left": "AAA111",
+    "plate-ann-fixture-right": "BBB222"
+  },
+  "image_id": "img-sha256-ad2b013b9241a086387f5f94e7b79f4a6cf45beffc66933fa2c95a5e69439028"
+}

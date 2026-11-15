@@ -9,13 +9,15 @@ from pathlib import Path
 
 from ..config import AVAILABLE_DETECT_MODELS
 from ..validators import format_yolo_model_identity, validate_model_file
+from ..annotators.plate_model_contract import plate_class_ids
 from .web_slim_scrollbar import WebSlimScrollbar, blend_hex_colors
 
 
 def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | None = None) -> dict | None:
     self = host
     scope_open_visible_state = {
-        "annotations": copy.deepcopy(list(getattr(self, "current_annotations", []) or [])),
+        # The modal locks annotation editing; it only changes selection/settings.
+        "annotations": list(getattr(self, "current_annotations", []) or []),
         "image_map": dict(getattr(self, "_preview_image_path_map", {}) or {}),
         "preview_index": getattr(self, "current_preview_index", None),
         "approved_filenames": set(getattr(self, "_preview_approved_filenames", set()) or set()),
@@ -23,13 +25,14 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
         "hidden_project_approved": set(getattr(self, "_campaign_hidden_project_approved_filenames", set()) or set()),
         "hidden_char_effective": set(getattr(self, "_campaign_hidden_char_effective_filenames", set()) or set()),
     }
+    scope_protected_filenames = self._get_preview_auto_scope_protected_filenames()
     scope_info = self._collect_plate_auto_scope_candidates(
         candidate_image_paths=candidate_image_paths,
         protect_existing=True,
+        protected_filenames=scope_protected_filenames,
     )
     raw_all_paths = list(scope_info.get("raw_all_paths") or [])
     all_paths = list(scope_info.get("all_paths") or [])
-    scope_protected_filenames = self._get_preview_auto_scope_protected_filenames()
     all_source_paths = raw_all_paths or all_paths
     scope_candidate_path_map = {
         str(path.name or "").strip().lower(): path
@@ -1347,7 +1350,7 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
     vehicle_check["row"].pack(anchor=tk.W, fill=tk.X)
     tk.Label(
         vehicle_card,
-        text="Model pojazdów służy tylko do zawężenia szukania tablic do obszaru pojazdu. Boxy pojazdów nie są eksportowane do finalnego YOLO.",
+        text="Model pojazdów zawęża szukanie tablic do obszaru pojazdu. Po wyłączeniu asysty nowy wynik nie zachowa także wcześniejszych pomocniczych ramek pojazdów.",
         bg=field_bg,
         fg=muted,
         font=("Segoe UI", 9),
@@ -1953,6 +1956,7 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
             live_scope = self._collect_plate_auto_scope_candidates(
                 candidate_image_paths=all_source_paths,
                 protect_existing=bool(protect_existing_var.get()),
+                protected_filenames=scope_protected_filenames,
             )
             live_selected_paths = list(live_scope.get("selected_paths") or [])
             if not live_selected_paths:
@@ -1986,6 +1990,7 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
             live_scope = self._collect_plate_auto_scope_candidates(
                 candidate_image_paths=all_source_paths,
                 protect_existing=bool(protect_existing_var.get()),
+                protected_filenames=scope_protected_filenames,
             )
             live_all_paths = list(live_scope.get("all_paths") or [])
             if not live_all_paths:
@@ -2053,6 +2058,11 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
                     if not ok:
                         messagebox.showerror("Nieprawidłowy model", f"Nie udało się użyć wybranego modelu:\n{message}", parent=dialog)
                         return
+                    try:
+                        plate_class_ids(info.get("classes"))
+                    except ValueError as exc:
+                        messagebox.showerror("Nieprawidłowy model tablic", str(exc), parent=dialog)
+                        return
                     self.plate_custom_var.set(str(chosen_plate_path))
                     self._remember_plate_model_runtime_meta(
                         model_path=chosen_plate_path,
@@ -2067,6 +2077,8 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
                 campaign_context=(not self._is_free_mode_session_context()),
             )
             self.mode_var.set("C: Pojazdy + tablice" if use_vehicle else "B: Tylko tablice")
+            result["payload"]["use_vehicle"] = use_vehicle
+            result["payload"]["protected_filenames"] = scope_protected_filenames
             self.vehicle_model_var.set(str(modal_vehicle_model_var.get() or "").strip())
             self.vehicle_custom_var.set(str(modal_vehicle_custom_var.get() or "").strip())
             self._auto_route_settings_pending = False
@@ -2264,6 +2276,7 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
         live_scope = self._collect_plate_auto_scope_candidates(
             candidate_image_paths=all_source_paths,
             protect_existing=protection_enabled,
+            protected_filenames=scope_protected_filenames,
         )
         live_selected_count = int(live_scope.get("selected_count", 0) or 0)
         live_selected_total_count = int(live_scope.get("selected_total_count", live_selected_count) or 0)
@@ -2273,13 +2286,11 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
         live_selected_plate_count = _count_scope_existing_plates(list(live_scope.get("selected_paths") or []))
         live_all_paths = list(live_scope.get("all_paths") or [])
         live_all_plate_count = _count_scope_existing_plates(live_all_paths)
-        live_bucket_paths = self._collect_plate_auto_scope_bucket_paths(
-            candidate_image_paths=all_source_paths,
-            protect_existing=False,
-        )
+        live_bucket_paths = bucket_paths
         live_bucket_protected_counts = self._collect_plate_auto_scope_bucket_protected_counts(
             candidate_image_paths=all_source_paths,
             protect_existing=protection_enabled,
+            protected_filenames=scope_protected_filenames,
         )
         live_manual_count = len(list(live_bucket_paths.get("manual") or []))
         live_auto_count = len(list(live_bucket_paths.get("auto") or []))
@@ -2608,6 +2619,9 @@ def prompt_plate_auto_scope_choice(host, *, candidate_image_paths: list[Path] | 
 
         visible_annotations = scope_open_visible_state.get("annotations")
         if not isinstance(visible_annotations, list):
+            return
+        current = list(getattr(self, "current_annotations", []) or [])
+        if len(current) == len(visible_annotations) and all(a is b for a, b in zip(current, visible_annotations)):
             return
         try:
             self.current_annotations = copy.deepcopy(visible_annotations)

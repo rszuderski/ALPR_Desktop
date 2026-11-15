@@ -14,10 +14,17 @@ from ..config import CONFIG, logger
 from ..character_recognition import PlateGenerator
 from ..data_models import Detection, ImageAnnotation
 from ..project_cache import PROJECT_CACHE
+from ..gt_resource_companions import (
+    collect_image_resource_gt_pack_paths,
+)
 from .help_manager import HELP
 from .lazy_notebook_tab import _LazyNotebookTab
 from .section_header_label import SectionHeaderLabel
 from .web_slim_scrollbar import WebSlimScrollbar, blend_hex_colors
+from .z3_extraction_sources import read_xml_plate_attributes
+from .z3_extraction_progress import ExtractionProgress
+from .z3_loading_progress import LoadingProgressBar
+from . import z3_preview_run_browser
 
 
 def _is_live_widget(widget) -> bool:
@@ -29,7 +36,49 @@ def _is_live_widget(widget) -> bool:
         return False
 
 
-def _ensure_campaign_detect_splash_widgets(host):
+def _apply_campaign_detect_splash_theme(host):
+    overlay = getattr(host, "campaign_detect_splash_overlay", None)
+    if not _is_live_widget(overlay):
+        return
+    palette = getattr(host.app, "palette", {})
+    panel_bg = palette.get("panel", "#252526")
+    tone = str(getattr(host, "_campaign_detect_splash_tone", "info"))
+    accent = palette.get(tone if tone in {"error", "warning"} else "accent", "#4f8de3")
+    overlay_bg = blend_hex_colors(panel_bg, palette.get("bg", panel_bg), .45)
+    card_bg = palette.get("field", panel_bg)
+    border = blend_hex_colors(palette.get("panel_border", "#3c3c3c"), accent, .30)
+    overlay.configure(bg=overlay_bg)
+    host.campaign_detect_splash_card.configure(bg=card_bg, highlightthickness=1,
+                                               highlightbackground=border, highlightcolor=border)
+    host.campaign_detect_splash_content.configure(bg=card_bg)
+    host.campaign_detect_splash_accent_bar.configure(bg=accent)
+    host.campaign_detect_splash_progress_header.configure(bg=card_bg)
+    for widget, color in ((host.campaign_detect_splash_eyebrow_lbl, accent),
+                          (host.campaign_detect_splash_title_lbl, palette.get("fg", "#f3f3f3")),
+                          (host.campaign_detect_splash_body_lbl, palette.get("muted", "#c7c7c7")),
+                          (host.campaign_detect_splash_progress_caption_lbl, palette.get("muted", "#c7c7c7")),
+                          (host.campaign_detect_splash_progress_pct_lbl, accent)):
+        widget.configure(bg=card_bg, fg=color)
+    host.campaign_detect_splash_progress.configure(
+        bg=card_bg, fill_color=accent,
+        trough_color=blend_hex_colors(palette.get("progress_trough", palette.get("panel_alt", panel_bg)), border, .18),
+        border_color=border,
+    )
+
+
+def _layout_campaign_detect_splash(host, event=None):
+    overlay = host.campaign_detect_splash_overlay
+    width = int(event.width) if event is not None else overlay.winfo_width()
+    if width <= 1:
+        return
+    card_width = max(120, min(640, width - 48))
+    wrap = max(70, card_width - 58)
+    host.campaign_detect_splash_card.place(relx=.5, rely=.5, anchor=tk.CENTER, width=card_width)
+    host.campaign_detect_splash_title_lbl.configure(wraplength=wrap)
+    host.campaign_detect_splash_body_lbl.configure(wraplength=wrap)
+
+
+def _ensure_campaign_detect_splash_widgets(host, *, return_text=None, return_command=None):
     force_root_surface = bool(getattr(host, "_campaign_detect_splash_force_root_surface", False))
     surface = getattr(host, "frame", None) if force_root_surface else getattr(host, "detect_content_frame", None)
     if not _is_live_widget(surface):
@@ -45,6 +94,7 @@ def _ensure_campaign_detect_splash_widgets(host):
         and _is_live_widget(getattr(host, "campaign_detect_splash_title_lbl", None))
         and _is_live_widget(getattr(host, "campaign_detect_splash_body_lbl", None))
         and _is_live_widget(getattr(host, "campaign_detect_splash_progress", None))
+        and _is_live_widget(getattr(host, "campaign_detect_splash_progress_header", None))
     )
     if (
         has_widgets
@@ -53,6 +103,8 @@ def _ensure_campaign_detect_splash_widgets(host):
     ):
         return existing_surface
     if has_widgets and existing_surface is surface:
+        if return_text is not None:
+            host.campaign_detect_splash_return_btn.configure(text=return_text, command=return_command)
         return surface
 
     if _is_live_widget(overlay):
@@ -61,67 +113,74 @@ def _ensure_campaign_detect_splash_widgets(host):
         except Exception:
             pass
 
-    palette = getattr(host.app, "palette", {})
-    panel_bg = palette.get("panel", "#252526")
-    accent = palette.get("accent", "#4f8de3")
-    overlay_bg = blend_hex_colors(panel_bg, "#000000", 0.24)
-    card_bg = blend_hex_colors(panel_bg, accent, 0.10)
-    border_color = blend_hex_colors(accent, palette.get("panel_border", palette.get("border", "#3c3c3c")), 0.48)
-
-    overlay = tk.Frame(surface, bd=0, highlightthickness=0, bg=overlay_bg)
+    overlay = tk.Frame(surface, bd=0, highlightthickness=0)
     card = tk.Frame(
         overlay,
         bd=0,
         highlightthickness=1,
-        highlightbackground=border_color,
-        highlightcolor=border_color,
-        padx=22,
-        pady=20,
-        bg=card_bg,
     )
-    card.place(relx=0.5, rely=0.34, anchor="n")
-    card.grid_columnconfigure(0, weight=1, minsize=560)
+    card.place(relx=.5, rely=.5, anchor=tk.CENTER, width=640)
+    card.grid_columnconfigure(0, weight=1)
+    accent_bar = tk.Frame(card, height=4, bd=0, highlightthickness=0)
+    accent_bar.grid(row=0, column=0, sticky="ew")
+    content = tk.Frame(card, padx=26, pady=22, bd=0, highlightthickness=0)
+    content.grid(row=1, column=0, sticky="ew")
+    content.grid_columnconfigure(0, weight=1)
+    eyebrow_lbl = tk.Label(content, text="PRZYGOTOWANIE Z3", anchor="w",
+                           font=("Segoe UI", 9, "bold"), bd=0, highlightthickness=0)
+    eyebrow_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
     title_lbl = tk.Label(
-        card,
+        content,
         text="Przygotowuję wyodrębnione tablice dla Z3",
         anchor="w",
         justify=tk.LEFT,
-        font=("Segoe UI Semibold", 13),
+        font=("Segoe UI", 15, "bold"),
         bd=0,
         highlightthickness=0,
-        bg=card_bg,
-        fg=accent,
     )
-    title_lbl.grid(row=0, column=0, sticky="ew")
+    title_lbl.grid(row=1, column=0, sticky="ew")
 
     body_lbl = tk.Label(
-        card,
+        content,
         text="To automatyczny krok pośredni przed pracą nad znakami.",
         anchor="w",
         justify=tk.LEFT,
-        wraplength=560,
+        wraplength=580,
+        font=("Segoe UI", 10),
         bd=0,
         highlightthickness=0,
-        bg=card_bg,
-        fg=palette.get("fg", "#f3f3f3"),
     )
-    body_lbl.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+    body_lbl.grid(row=2, column=0, sticky="ew", pady=(10, 20))
 
-    progressbar = ttk.Progressbar(card, mode="determinate", maximum=100.0)
-    progressbar.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+    progress_header = tk.Frame(content, bd=0, highlightthickness=0)
+    progress_header.grid(row=3, column=0, sticky="ew")
+    progress_caption_lbl = tk.Label(progress_header, text="Postęp", anchor="w",
+                                    font=("Segoe UI", 9), bd=0, highlightthickness=0)
+    progress_caption_lbl.pack(side=tk.LEFT)
+    progress_pct_lbl = tk.Label(progress_header, text="0%", anchor="e",
+                                font=("Segoe UI", 10, "bold"), bd=0, highlightthickness=0)
+    progress_pct_lbl.pack(side=tk.RIGHT)
+    progressbar = LoadingProgressBar(content)
+    progressbar.grid(row=4, column=0, sticky="ew", pady=(6, 0))
 
     return_btn = ttk.Button(
-        card,
-        text="Zatwierdź PZ1 i wróć do pracy T05",
-        command=getattr(host, "_return_to_t05_work_after_step3_pz1", lambda: None),
+        content,
+        text=return_text or "Zatwierdź PZ1 i wróć do pracy T05",
+        command=return_command or getattr(host, "_return_to_t05_work_after_step3_pz1", lambda: None),
     )
-    return_btn.grid(row=3, column=0, sticky="w", pady=(14, 0))
+    return_btn.grid(row=5, column=0, sticky="w", pady=(14, 0))
     return_btn.grid_remove()
     overlay.place_forget()
 
     host.campaign_detect_splash_overlay = overlay
     host.campaign_detect_splash_card = card
+    host.campaign_detect_splash_content = content
+    host.campaign_detect_splash_accent_bar = accent_bar
+    host.campaign_detect_splash_eyebrow_lbl = eyebrow_lbl
+    host.campaign_detect_splash_progress_header = progress_header
+    host.campaign_detect_splash_progress_caption_lbl = progress_caption_lbl
+    host.campaign_detect_splash_progress_pct_lbl = progress_pct_lbl
     host.campaign_detect_splash_title_lbl = title_lbl
     host.campaign_detect_splash_body_lbl = body_lbl
     host.campaign_detect_splash_progress = progressbar
@@ -130,6 +189,11 @@ def _ensure_campaign_detect_splash_widgets(host):
     host._campaign_detect_splash_visible = False
     host._campaign_detect_splash_key = None
     host._campaign_detect_splash_progress_indeterminate = False
+    overlay.bind("<Configure>", lambda event: _layout_campaign_detect_splash(host, event), add="+")
+    overlay.apply_theme = lambda: _apply_campaign_detect_splash_theme(host)
+    for surface_widget in (overlay, card, content, progress_header):
+        surface_widget._panel_surface_theme_handler = overlay.apply_theme
+    _apply_campaign_detect_splash_theme(host)
     return surface
 
 
@@ -156,9 +220,6 @@ def show_campaign_detect_splash(
     if overlay is None or title_lbl is None or body_lbl is None or progressbar is None or card is None or surface is None:
         return
 
-    palette = getattr(host.app, "palette", {})
-    panel_bg = palette.get("panel", "#252526")
-    fg = palette.get("fg", "#f3f3f3")
     tone_key = str(tone or "info").strip().lower()
     splash_key = (
         title_text,
@@ -177,34 +238,11 @@ def show_campaign_detect_splash(
         and _is_live_widget(surface)
         and str(overlay.winfo_manager())
     )
-    if tone_key == "error":
-        accent = palette.get("error", "#e74c3c")
-    elif tone_key == "success":
-        accent = palette.get("success", "#2ecc71")
-    else:
-        accent = palette.get("accent", "#4f8de3")
-
-    overlay_bg = blend_hex_colors(panel_bg, "#000000", 0.24)
-    card_bg = blend_hex_colors(panel_bg, accent, 0.10)
-    border_color = blend_hex_colors(accent, palette.get("panel_border", palette.get("border", "#3c3c3c")), 0.48)
-
+    host._campaign_detect_splash_tone = tone_key
+    _apply_campaign_detect_splash_theme(host)
     if not same_splash:
-        try:
-            overlay.configure(bg=overlay_bg, highlightbackground=overlay_bg, highlightcolor=overlay_bg)
-        except Exception:
-            pass
-        try:
-            card.configure(bg=card_bg, highlightbackground=border_color, highlightcolor=border_color)
-        except Exception:
-            pass
-        try:
-            title_lbl.configure(text=title_text, bg=card_bg, fg=accent)
-        except Exception:
-            pass
-        try:
-            body_lbl.configure(text=body_text, bg=card_bg, fg=fg)
-        except Exception:
-            pass
+        title_lbl.configure(text=title_text)
+        body_lbl.configure(text=body_text)
 
     try:
         if show_progress:
@@ -218,16 +256,20 @@ def show_campaign_detect_splash(
                 value = max(0.0, min(100.0, float(progress)))
                 progressbar.configure(mode="determinate", maximum=100.0, value=value)
                 host._campaign_detect_splash_progress_value = value
+                host.campaign_detect_splash_progress_pct_lbl.configure(text=f"{value:.1f}".rstrip("0").rstrip(".") + "%")
             else:
                 progressbar.configure(mode="indeterminate", maximum=100.0)
                 if not bool(getattr(host, "_campaign_detect_splash_progress_indeterminate", False)):
                     try:
-                        progressbar.start(12)
+                        progressbar.start(40)
                     except Exception:
                         pass
                 host._campaign_detect_splash_progress_indeterminate = True
+                host.campaign_detect_splash_progress_pct_lbl.configure(text="Przygotowanie…")
+                host._campaign_detect_splash_progress_value = None
             if not str(progressbar.winfo_manager()):
-                progressbar.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+                progressbar.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+            host.campaign_detect_splash_progress_header.grid()
         else:
             try:
                 if bool(getattr(host, "_campaign_detect_splash_progress_indeterminate", False)):
@@ -237,6 +279,7 @@ def show_campaign_detect_splash(
             host._campaign_detect_splash_progress_indeterminate = False
             if str(progressbar.winfo_manager()):
                 progressbar.grid_remove()
+            host.campaign_detect_splash_progress_header.grid_remove()
     except Exception:
         pass
 
@@ -245,7 +288,7 @@ def show_campaign_detect_splash(
             if return_btn is not None:
                 if show_return:
                     if not str(return_btn.winfo_manager()):
-                        return_btn.grid(row=3, column=0, sticky="w", pady=(14, 0))
+                        return_btn.grid(row=5, column=0, sticky="w", pady=(14, 0))
                 elif str(return_btn.winfo_manager()):
                     return_btn.grid_remove()
         except Exception:
@@ -775,8 +818,8 @@ def refresh_extract_entry_cards(host) -> None:
 
     descriptions = {
         "manual": (
-            "Podaj annotations.xml oraz folder oryginalnych obrazów, z których mam "
-            "wyodrębnić tablice. To dobry tor dla importu z zewnątrz."
+            "Wybierz gotowy run wyodrębnionych tablic albo użyj annotations.xml "
+            "i obrazów źródłowych. Gotowe tablice mogą przejść bezpośrednio do PZ2."
         ),
         "continue": (
             "Tablice są już wyodrębnione. Otwórz kafel, aby zobaczyć tabelę "
@@ -828,7 +871,7 @@ def refresh_extract_entry_cards(host) -> None:
             elif mode == "continue":
                 badge.configure(text="WEJŚCIE Z Z2", fg=muted)
             elif mode == "manual":
-                badge.configure(text="XML + OBRAZY", fg=muted)
+                badge.configure(text="WŁASNE ŹRÓDŁO", fg=muted)
             else:
                 badge.configure(text="WYBIERZ", fg=muted)
         except Exception:
@@ -1810,6 +1853,50 @@ def refresh_extract_start_summary(host, *, lightweight: bool = False):
     self._refresh_extract_action_state(lightweight=lightweight)
 
 
+def normalize_manual_source_kind(host, value: str | None = None) -> str:
+    try:
+        raw = (
+            value
+            if value is not None
+            else host.extract_manual_source_kind_var.get()
+        )
+    except Exception:
+        raw = value or ""
+    normalized = str(raw or "").strip().lower()
+    return normalized if normalized in {"crops", "xml"} else ""
+
+
+def select_manual_source_kind(host, kind: str) -> None:
+    normalized = normalize_manual_source_kind(host, kind)
+    if not normalized:
+        return
+
+    try:
+        host.extract_manual_source_kind_var.set(normalized)
+    except Exception:
+        return
+
+    if normalized == "crops":
+        try:
+            host._extract_last_source_binding_result = {"ok": False}
+        except Exception:
+            pass
+        try:
+            host._set_source_binding_status("", "warning")
+        except Exception:
+            pass
+    else:
+        try:
+            host._refresh_source_binding_status(allow_autofind=False)
+        except Exception:
+            pass
+
+    try:
+        host._refresh_extract_workflow_ui()
+    except Exception:
+        pass
+
+
 def refresh_extract_workflow_ui(host):
     self = host
     workflow_vm = self._get_step3_extract_workflow_view_model()
@@ -1877,17 +1964,141 @@ def refresh_extract_workflow_ui(host):
         except Exception:
             pass
 
+    if hasattr(self, "extract_manual_source_choice_frame"):
+        try:
+            choice_visible = bool(
+                workflow_vm.show_source
+                and route == "manual"
+                and not workflow_vm.linear_mode
+            )
+            if choice_visible:
+                if not str(
+                    self.extract_manual_source_choice_frame.winfo_manager()
+                ):
+                    self.extract_manual_source_choice_frame.pack(
+                        fill=tk.X,
+                        pady=(0, 12),
+                        after=getattr(
+                            self,
+                            "extract_source_intro_lbl",
+                            None,
+                        ),
+                    )
+            elif str(
+                self.extract_manual_source_choice_frame.winfo_manager()
+            ):
+                self.extract_manual_source_choice_frame.pack_forget()
+        except Exception:
+            pass
+
+    manual_source_kind = normalize_manual_source_kind(self)
+
+    try:
+        crops_btn = getattr(self, "extract_manual_crops_btn", None)
+        xml_btn = getattr(self, "extract_manual_xml_btn", None)
+        if crops_btn is not None:
+            crops_btn.configure(
+                style=(
+                    "WorkflowCardPrimary.TButton"
+                    if manual_source_kind == "crops"
+                    else "WorkflowCard.TButton"
+                )
+            )
+        if xml_btn is not None:
+            xml_btn.configure(
+                style=(
+                    "WorkflowCardPrimary.TButton"
+                    if manual_source_kind == "xml"
+                    else "WorkflowCard.TButton"
+                )
+            )
+    except Exception:
+        pass
+
+    if hasattr(self, "extract_preview_run_frame"):
+        try:
+            browser_visible = bool(
+                workflow_vm.show_source
+                and route == "manual"
+                and not workflow_vm.linear_mode
+                and manual_source_kind == "crops"
+            )
+            if browser_visible:
+                if not str(self.extract_preview_run_frame.winfo_manager()):
+                    self.extract_preview_run_frame.pack(
+                        fill=tk.X,
+                        pady=(0, 12),
+                        after=getattr(
+                            self,
+                            "extract_manual_source_choice_frame",
+                            None,
+                        ),
+                    )
+                right_panel = getattr(
+                    self,
+                    "extract_preview_run_right_panel",
+                    None,
+                )
+                if right_panel is not None:
+                    try:
+                        right_panel.grid()
+                    except Exception:
+                        pass
+                z3_preview_run_browser.refresh_preview_run_browser(
+                    self,
+                    force=False,
+                )
+            else:
+                if str(self.extract_preview_run_frame.winfo_manager()):
+                    self.extract_preview_run_frame.pack_forget()
+                right_panel = getattr(
+                    self,
+                    "extract_preview_run_right_panel",
+                    None,
+                )
+                if right_panel is not None:
+                    try:
+                        right_panel.grid_remove()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     if hasattr(self, "extract_source_fields_frame"):
         try:
-            fields_visible = bool(workflow_vm.show_source and route == "manual")
+            fields_visible = bool(
+                workflow_vm.show_source
+                and route == "manual"
+                and not workflow_vm.linear_mode
+                and manual_source_kind == "xml"
+            )
             if fields_visible:
                 if not str(self.extract_source_fields_frame.winfo_manager()):
                     self.extract_source_fields_frame.pack(
                         fill=tk.X,
-                        after=getattr(self, "extract_source_intro_lbl", None),
+                        after=getattr(
+                            self,
+                            "extract_manual_source_choice_frame",
+                            None,
+                        ),
                     )
             elif str(self.extract_source_fields_frame.winfo_manager()):
                 self.extract_source_fields_frame.pack_forget()
+        except Exception:
+            pass
+
+    if manual_source_kind != "xml":
+        try:
+            status_frame = getattr(
+                self,
+                "source_binding_status_frame",
+                None,
+            )
+            if (
+                status_frame is not None
+                and str(status_frame.winfo_manager())
+            ):
+                status_frame.pack_forget()
         except Exception:
             pass
 
@@ -2067,24 +2278,162 @@ def refresh_extract_start_card_style(host, progress_bar_cls, *, lightweight: boo
             pass
 
 
+def _continue_campaign_pz1_to_pz2(host) -> bool:
+    """Commit successful PZ1 and continue directly to campaign PZ2.
+
+    T05 CTA 1 is a single work action: prepare plate crops and then enter the
+    character-annotation surface. The graph remains the fallback only when the
+    direct PZ2 transition itself fails.
+    """
+    try:
+        CAMPAIGN.set_current_step(3)
+        CAMPAIGN.set_step3_stage1_done(True)
+        CAMPAIGN.set_step3_stage2_done(False)
+        CAMPAIGN.set_step3_pending()
+    except Exception as exc:
+        logger.debug(
+            f"Nie udało się zapisać gotowości PZ1 przed wejściem do PZ2: {exc}"
+        )
+
+    try:
+        host.go_to_substep_2(force=True)
+        return True
+    except Exception as exc:
+        logger.debug(
+            f"Nie udało się automatycznie przejść z PZ1 do PZ2: {exc}"
+        )
+
+    try:
+        host._campaign_pz2_sync_loading = False
+    except Exception:
+        pass
+
+    try:
+        host._return_to_t05_work_after_step3_pz1()
+    except Exception as fallback_exc:
+        logger.debug(
+            f"Nie udało się również wrócić do pracy T05 po błędzie PZ2: "
+            f"{fallback_exc}"
+        )
+    return False
+
+
+
+def _register_completed_pz1_run_in_az_registry(
+    host,
+    run_dir: Path,
+    *,
+    interpolation: str,
+    source_at_ref: str = "",
+) -> dict:
+    """Best-effort rejestracja finalnego runu PZ1 w registry AZ.
+
+    Awaria registry nie może przerwać istniejącego workflow PZ1/PZ2.
+    """
+    try:
+        from ..registry.az_registry import (
+            AZRegistry,
+            ensure_campaign_project,
+        )
+        from ..registry.pz1_run_registry import register_pz1_preview_run
+
+        registry = AZRegistry.for_workspace(CONFIG.WORKSPACE_DIR)
+
+        project_id = None
+        iteration_num = None
+        active_project = str(CAMPAIGN.get_active_project_name() or "").strip()
+        in_campaign = bool(
+            getattr(host, "_step3_linear_mode", False)
+            and active_project
+        )
+
+        if in_campaign:
+            project_data = dict(
+                (CAMPAIGN.state.get("projects", {}) or {}).get(
+                    active_project,
+                    {},
+                )
+                or {}
+            )
+            folder_name = str(
+                project_data.get("folder_name") or ""
+            ).strip()
+            if not folder_name:
+                raise RuntimeError(
+                    "Aktywny projekt kampanii nie ma folder_name."
+                )
+
+            project_id = ensure_campaign_project(
+                registry,
+                project_name=active_project,
+                folder_name=folder_name,
+            )
+            iteration_num = int(
+                CAMPAIGN.get_current_iteration_num() or 1
+            )
+
+        report = register_pz1_preview_run(
+            registry,
+            run_dir,
+            interpolation=interpolation,
+            project_id=project_id,
+            iteration_num=iteration_num,
+            source_mode="pz1",
+            source_at_ref=str(source_at_ref or "").strip() or None,
+        )
+        payload = report.to_dict()
+        payload["ok"] = True
+        payload["project_id"] = project_id
+        payload["iteration_num"] = iteration_num
+
+        logger.info(
+            "[AZ][PZ1] registry: total=%s new_crops=%s reused_crops=%s "
+            "new_artifacts=%s project=%s iteration=%s",
+            payload.get("total", 0),
+            payload.get("new_crops", 0),
+            payload.get("reused_crops", 0),
+            payload.get("new_artifacts", 0),
+            project_id or "FREE",
+            iteration_num or 0,
+        )
+        return payload
+    except Exception as exc:
+        logger.warning(
+            "[AZ][PZ1] Nie udało się zarejestrować runu %s: %s",
+            run_dir,
+            exc,
+        )
+        return {
+            "ok": False,
+            "preview_dir": str(run_dir or ""),
+            "error": str(exc),
+        }
+
 def run_extraction(host) -> None:
     self = host
     campaign_step3_active = _campaign_step3_context_active(self)
+    if campaign_step3_active:
+        from .z3_approved_source import bind_approved_source, source_for_campaign
+        try:
+            bind_approved_source(self, source_for_campaign(CAMPAIGN))
+        except (OSError, ValueError) as exc:
+            self._show_campaign_extract_failure_modal(
+                title="Nie mogę przygotować zatwierdzonych tablic",
+                message=str(exc), tone="error", default_action="repair", allow_retry=False,
+            )
+            return
     if self._is_extract_preview_ready():
         plate_count = self._get_extract_preview_ready_count()
         self._refresh_extract_action_state()
         if campaign_step3_active:
             try:
                 self._set_extraction_status(
-                    "Tablice są już wyodrębnione. Wracam do pracy bramki T05, gdzie wybierzesz kolejny krok.",
+                    "Tablice są już wyodrębnione. Otwieram PZ2.",
                     "success",
                 )
             except Exception:
                 pass
-            try:
-                self._return_to_t05_work_after_step3_pz1()
-            except Exception as exc:
-                logger.debug(f"Nie udało się wrócić do pracy T05 po gotowym PZ1 kampanii: {exc}")
+            _continue_campaign_pz1_to_pz2(self)
             return
         if bool(getattr(self, "_campaign_detect_splash_visible", False)):
             try:
@@ -2250,6 +2599,41 @@ def run_extraction(host) -> None:
     self.btn_ext_stop.config(state=tk.NORMAL)
     self.is_processing = True
     self._set_extraction_status("Start wyodrębniania...", "neutral")
+    interpolation = self.interpolation_var.get()
+
+    def present_progress(processed, total, plates, phase):
+        percent = min(99.0, 99.0 * processed / max(1, total))
+        self.ext_progress.config(value=percent)
+        self._campaign_detect_splash_progress_value = percent
+        if phase == "prepare":
+            message = "Sprawdzam historię GT i przygotowuję wycinanie tablic..."
+        elif phase == "save":
+            message = f"Zapisuję metadane i historię {plates} wyciętych tablic..."
+        else:
+            message = f"Wycinanie: {processed}/{total} obrazów · {plates} tablic"
+        self._set_extraction_status(message, "neutral")
+        if campaign_step3_active and not bool(getattr(self, "_campaign_detect_splash_visible", False)):
+            self._show_campaign_detect_splash(
+                title="Wyodrębniam tablice dla Z3", body=message, tone="neutral",
+                progress=percent, show_progress=True, show_return=False,
+            )
+
+    progress = ExtractionProgress(
+        self.frame, present_progress,
+        lambda: session_token == self._project_reset_token and self.is_processing,
+    )
+    progress.publish(0, len(xml_images), 0, "prepare")
+
+    try:
+        gt_pack_paths = collect_image_resource_gt_pack_paths(
+            images_dir,
+            campaign=CAMPAIGN,
+        )
+    except Exception as exc:
+        logger.debug(
+            f"Nie udało się zebrać GT Packów dla PZ1: {exc}"
+        )
+        gt_pack_paths = []
 
     def worker():
         campaign_success_to_pz2 = False
@@ -2259,7 +2643,10 @@ def run_extraction(host) -> None:
                 return
 
             self._log(self.ext_log, f"\nROZPOCZETO RUN WYCINANIA PZ1: {run_dir.name}\n", "HEADER")
-            generator = PlateGenerator(run_dir)
+            generator = PlateGenerator(
+                run_dir,
+                gt_pack_paths=gt_pack_paths,
+            )
             total = len(xml_images)
             processed = 0
 
@@ -2275,11 +2662,13 @@ def run_extraction(host) -> None:
                 for poly in img_el.findall(".//polygon[@label='plate']"):
                     pts = [tuple(map(float, p.split(","))) for p in poly.get("points", "").split(";")]
                     if len(pts) >= 4:
+                        confidence, attributes = read_xml_plate_attributes(poly)
                         plates.append(
                             Detection(
-                                "plate", 1.0,
+                                "plate", confidence,
                                 (min(x for x, y in pts), min(y for x, y in pts), max(x for x, y in pts), max(y for x, y in pts)),
-                                polygon=pts
+                                polygon=pts,
+                                attributes=attributes,
                             )
                         )
 
@@ -2291,42 +2680,13 @@ def run_extraction(host) -> None:
                         rectify=True,
                         do_deskew=False,
                         enhance_contrast=False,
-                        interpolation=self.interpolation_var.get()
+                        interpolation=interpolation
                     )
 
                 processed += 1
-                self.frame.after(
-                    0,
-                    lambda p=(processed / max(1, total)) * 100: (
-                        self.ext_progress.config(value=p),
-                        setattr(self, "_campaign_detect_splash_progress_value", p),
-                        self._show_campaign_detect_splash(
-                            title=str(getattr(self, "_campaign_detect_splash_title_text", "") or "Wyodrębniam tablice dla Z3"),
-                            body=str(getattr(self, "ext_status", None).cget("text") if getattr(self, "ext_status", None) is not None else ""),
-                            tone="info",
-                            progress=p,
-                            show_progress=True,
-                            show_return=False,
-                        ) if (
-                            session_token == self._project_reset_token
-                            and (
-                                bool(getattr(self, "_campaign_detect_splash_visible", False))
-                                or (
-                                    bool(getattr(self, "_step3_linear_mode", False))
-                                    and bool(CAMPAIGN.get_active_project_name())
-                                )
-                            )
-                        ) else None
-                    )
-                )
-                self.frame.after(
-                    0,
-                    lambda c=processed, t=total: (
-                        self._set_extraction_status(f"{c}/{t} obrazów...", "neutral")
-                        if session_token == self._project_reset_token else None
-                    )
-                )
+                progress.publish(processed, total, generator.plate_counter)
 
+            progress.publish(processed, total, generator.plate_counter, "save")
             generator.save_metadata()
             generated_count = int(getattr(generator, "plate_counter", 0) or 0)
             if generated_count > 0:
@@ -2345,6 +2705,15 @@ def run_extraction(host) -> None:
                 logger.debug(f"Nie udało się zachować poprzednich boxów przy reextractcie Z3: {merge_exc}")
             finally:
                 self._campaign_step3_reextract_seed_metadata = {}
+
+            if generated_count > 0:
+                _register_completed_pz1_run_in_az_registry(
+                    self,
+                    run_dir,
+                    interpolation=interpolation,
+                    source_at_ref=str(xml_path),
+                )
+
             if self.is_processing and session_token == self._project_reset_token:
                 campaign_step3_active = bool(
                     getattr(self, "_step3_linear_mode", False)
@@ -2355,6 +2724,8 @@ def run_extraction(host) -> None:
                     and str(CAMPAIGN.get_iteration_target() or "").strip().lower() == "char"
                     and generated_count < self._get_campaign_step3_min_extracted_plate_count()
                 )
+                self.frame.after(0, lambda: self.ext_progress.config(value=100)
+                    if session_token == self._project_reset_token else None)
                 self.frame.after(
                     0,
                     lambda: self._set_extraction_status(
@@ -2382,7 +2753,7 @@ def run_extraction(host) -> None:
                         self._campaign_step3_hold_pz2_after_reextract = False
                     except Exception:
                         pass
-                    def _commit_preview_and_return_t05(path=run_dir):
+                    def _commit_preview_and_open_pz2(path=run_dir):
                         preview_dir_raw = str(path or "").strip()
                         if preview_dir_raw:
                             try:
@@ -2404,9 +2775,10 @@ def run_extraction(host) -> None:
                                 self._force_save_all()
                             except Exception:
                                 pass
-                        self._return_to_t05_work_after_step3_pz1()
+                        _continue_campaign_pz1_to_pz2(self)
 
-                    self.frame.after(0, _commit_preview_and_return_t05)
+                    campaign_success_to_pz2 = True
+                    self.frame.after(0, _commit_preview_and_open_pz2)
                 else:
                     self.frame.after(0, self.unlock_detection_subtab)
                 if generated_count > 0 and not campaign_below_minimum and not campaign_step3_active:
@@ -2418,7 +2790,7 @@ def run_extraction(host) -> None:
                     self.frame.after(
                         0,
                         lambda: self.app.update_status(
-                            "Wyodrębnianie tablic zakończone. W pracy bramki T05 wybierz PZ2 jako następny krok.",
+                            "Wyodrębnianie tablic zakończone. Otwieram PZ2 do pracy nad znakami.",
                             "success",
                         ) if hasattr(self.app, "update_status") else None,
                     )
@@ -2442,6 +2814,7 @@ def run_extraction(host) -> None:
                     )
                 self._log(self.ext_log, f"\n❌ BŁĄD: {e}\n", "ERROR")
         finally:
+            progress.close()
             if session_token == self._project_reset_token:
                 self.is_processing = False
                 self._campaign_step3_reextract_seed_metadata = {}
@@ -2472,7 +2845,8 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
 
     parent.grid_rowconfigure(0, weight=1)
     parent.grid_rowconfigure(1, weight=0)
-    parent.grid_columnconfigure(0, weight=1)
+    parent.grid_columnconfigure(0, weight=0)
+    parent.grid_columnconfigure(1, weight=1)
 
     self._extract_content_inset = 14
     self._extract_content_max_width = 760
@@ -2482,7 +2856,18 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
     left_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 5))
     self.extract_main_left_frame = left_frame
     self.extract_main_pane = None
-    self.extract_main_right_frame = None
+
+    right_frame = ttk.Frame(parent, style="Panel.TFrame")
+    right_frame.grid(
+        row=0,
+        column=1,
+        sticky="nsew",
+        padx=(0, 10),
+        pady=(10, 5),
+    )
+    right_frame.grid_rowconfigure(0, weight=1)
+    right_frame.grid_columnconfigure(0, weight=1)
+    self.extract_main_right_frame = right_frame
 
     left_frame.grid_rowconfigure(0, weight=1)
     left_frame.grid_rowconfigure(1, weight=0)
@@ -2660,7 +3045,7 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
     manual_card.pack(fill=tk.X)
     manual_badge = tk.Label(
         manual_card,
-        text="XML + OBRAZY",
+        text="WŁASNE ŹRÓDŁO",
         anchor="w",
         justify=tk.LEFT,
         font=("Segoe UI", 9, "bold"),
@@ -2671,7 +3056,7 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
     manual_badge.pack(anchor=tk.W, fill=tk.X)
     manual_title = tk.Label(
         manual_card,
-        text="Wskaż anotacje do wyodrębnienia",
+        text="Wskaż własne źródło",
         anchor="w",
         justify=tk.LEFT,
         font=("Segoe UI Semibold", 11),
@@ -2683,8 +3068,8 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
     manual_desc = tk.Label(
         manual_card,
         text=(
-            "Podaj annotations.xml oraz folder oryginalnych obrazów, z których mam "
-            "wyciąć tablice. To dobry tor dla importu z zewnątrz."
+            "Wybierz gotowy run wyodrębnionych tablic albo użyj annotations.xml "
+            "i obrazów źródłowych. Gotowe tablice mogą przejść bezpośrednio do PZ2."
         ),
         anchor="w",
         justify=tk.LEFT,
@@ -2712,6 +3097,15 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
     self._bind_extract_entry_card(continue_card, "continue")
     self._bind_extract_entry_card(manual_card, "manual")
     self._paint_extract_entry_cards_first()
+
+    from .z3_mobile_acquisition import open_crop_acquisition
+
+    self.mobile_acquisition_btn = ttk.Button(
+        self.extract_entry_section,
+        text="Akwizycja Androida",
+        command=lambda: open_crop_acquisition(self),
+    )
+    self.mobile_acquisition_btn.pack(anchor=tk.W, pady=(12, 0))
 
     self.extract_source_section = ttk.Frame(self.extract_workflow_shell_inner, style="Panel.TFrame")
     self.extract_source_section.pack(fill=tk.X, pady=(18, 0))
@@ -2826,9 +3220,211 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
     ensure_wrap(self.extract_continue_images_value_lbl, self.extract_continue_summary_frame, padding=120, min_wrap=220)
     self._refresh_continue_source_summary()
 
+    self.extract_manual_source_kind_var = tk.StringVar(value="")
+
+    self.extract_manual_source_choice_frame = ttk.LabelFrame(
+        self.extract_source_section,
+        text=" Wybierz rodzaj własnego źródła ",
+        padding=12,
+    )
+    self.extract_manual_source_choice_frame.pack(fill=tk.X, pady=(0, 12))
+    self.extract_manual_source_choice_frame.pack_forget()
+
+    self.extract_manual_source_choice_hint_lbl = tk.Label(
+        self.extract_manual_source_choice_frame,
+        text="To dwa niezależne tory. Wybierz jeden — drugi zostanie ukryty.",
+        anchor="w",
+        justify=tk.LEFT,
+        wraplength=720,
+        bd=0,
+        highlightthickness=0,
+    )
+    self.extract_manual_source_choice_hint_lbl.pack(
+        anchor=tk.W,
+        fill=tk.X,
+        pady=(0, 8),
+    )
+    self._set_inline_status_label_state(
+        self.extract_manual_source_choice_hint_lbl,
+        text=self.extract_manual_source_choice_hint_lbl.cget("text"),
+        tone="muted",
+        emphasis=False,
+    )
+    ensure_wrap(
+        self.extract_manual_source_choice_hint_lbl,
+        self.extract_manual_source_choice_frame,
+        padding=28,
+        min_wrap=240,
+    )
+
+    self.extract_manual_source_choice_row = ttk.Frame(
+        self.extract_manual_source_choice_frame
+    )
+    self.extract_manual_source_choice_row.pack(fill=tk.X)
+    self.extract_manual_source_choice_row.grid_columnconfigure(
+        0, weight=1, uniform="z3_manual_source"
+    )
+    self.extract_manual_source_choice_row.grid_columnconfigure(
+        1, weight=1, uniform="z3_manual_source"
+    )
+
+    self.extract_manual_crops_btn = ttk.Button(
+        self.extract_manual_source_choice_row,
+        text="Gotowe tablice\nUżyj istniejącego runu PZ1",
+        style="WorkflowCard.TButton",
+        command=lambda: select_manual_source_kind(self, "crops"),
+    )
+    self.extract_manual_crops_btn.grid(
+        row=0, column=0, sticky="ew", padx=(0, 6)
+    )
+
+    self.extract_manual_xml_btn = ttk.Button(
+        self.extract_manual_source_choice_row,
+        text="XML + obrazy\nUtwórz nowy run cropów",
+        style="WorkflowCard.TButton",
+        command=lambda: select_manual_source_kind(self, "xml"),
+    )
+    self.extract_manual_xml_btn.grid(
+        row=0, column=1, sticky="ew", padx=(6, 0)
+    )
+
+    self.extract_preview_run_frame = ttk.LabelFrame(
+        self.extract_source_section,
+        text=" Gotowe tablice — istniejący run PZ1 ",
+        padding=12,
+    )
+    self.extract_preview_run_frame.pack(fill=tk.X, pady=(0, 12))
+    self.extract_preview_run_frame.pack_forget()
+
+    self.extract_preview_run_var = tk.StringVar(value="")
+    self.extract_preview_run_combo = ttk.Combobox(
+        self.extract_preview_run_frame,
+        textvariable=self.extract_preview_run_var,
+        state="readonly",
+    )
+    self.extract_preview_run_combo.pack(fill=tk.X)
+    self.extract_preview_run_combo.bind(
+        "<<ComboboxSelected>>",
+        lambda event: z3_preview_run_browser.on_preview_run_selection_changed(
+            self,
+            event,
+        ),
+    )
+
+    self.extract_preview_run_actions = ttk.Frame(
+        self.extract_preview_run_frame
+    )
+    self.extract_preview_run_actions.pack(fill=tk.X, pady=(8, 0))
+
+    self.extract_preview_run_use_btn = ttk.Button(
+        self.extract_preview_run_actions,
+        text="Użyj tego runu i przejdź do PZ2",
+        command=lambda: z3_preview_run_browser.use_selected_preview_run(self),
+        state=tk.DISABLED,
+    )
+    self.extract_preview_run_use_btn.pack(
+        side=tk.LEFT,
+        fill=tk.X,
+        expand=True,
+    )
+
+    self.extract_preview_run_refresh_btn = ttk.Button(
+        self.extract_preview_run_actions,
+        text="Odśwież listę",
+        command=lambda: z3_preview_run_browser.refresh_preview_run_browser(
+            self,
+            force=True,
+        ),
+    )
+    self.extract_preview_run_refresh_btn.pack(
+        side=tk.LEFT,
+        padx=(8, 0),
+    )
+
+    self.extract_preview_run_external_btn = ttk.Button(
+        self.extract_preview_run_frame,
+        text="Wskaż run spoza listy…",
+        command=lambda: z3_preview_run_browser.pick_external_preview_run(self),
+    )
+    self.extract_preview_run_external_btn.pack(
+        anchor=tk.W,
+        pady=(8, 0),
+    )
+
+    self.extract_preview_run_right_panel = tk.Frame(
+        right_frame,
+        bg=panel_bg,
+        bd=0,
+        highlightthickness=0,
+    )
+    self.extract_preview_run_right_panel.grid(
+        row=0,
+        column=0,
+        sticky="nsew",
+    )
+    self.extract_preview_run_right_panel.grid_remove()
+
+    self.extract_preview_run_right_title_lbl = tk.Label(
+        self.extract_preview_run_right_panel,
+        text="Podgląd wybranego runu PZ1",
+        bg=panel_bg,
+        fg=palette.get("fg", "#f3f3f3"),
+        anchor="w",
+        justify=tk.LEFT,
+        font=("Segoe UI Semibold", 12),
+        bd=0,
+        highlightthickness=0,
+    )
+    self.extract_preview_run_right_title_lbl.pack(
+        fill=tk.X,
+        padx=10,
+        pady=(8, 2),
+    )
+
+    self.extract_preview_run_summary_var = tk.StringVar(
+        value="Wybierz run po lewej stronie."
+    )
+    self.extract_preview_run_summary_lbl = tk.Label(
+        self.extract_preview_run_right_panel,
+        textvariable=self.extract_preview_run_summary_var,
+        bg=panel_bg,
+        fg=palette.get("muted", "#c7c7c7"),
+        anchor="w",
+        justify=tk.LEFT,
+        wraplength=900,
+        bd=0,
+        highlightthickness=0,
+        font=("Segoe UI", 9),
+    )
+    self.extract_preview_run_summary_lbl.pack(
+        anchor=tk.W,
+        fill=tk.X,
+        padx=10,
+        pady=(0, 8),
+    )
+    ensure_wrap(
+        self.extract_preview_run_summary_lbl,
+        self.extract_preview_run_right_panel,
+        padding=28,
+        min_wrap=320,
+    )
+
+    self.extract_preview_run_grid = tk.Frame(
+        self.extract_preview_run_right_panel,
+        bd=0,
+        highlightthickness=0,
+        bg=panel_bg,
+    )
+    self.extract_preview_run_grid.pack(
+        fill=tk.BOTH,
+        expand=True,
+        padx=4,
+        pady=(0, 6),
+    )
+
     self.extract_source_fields_frame = ttk.LabelFrame(
         self.extract_source_section,
-        text=" annotations.xml i katalog obrazów ",
+        text=" XML + obrazy — utwórz nowy run cropów ",
         padding=12,
     )
     self.extract_source_fields_frame.pack(fill=tk.X)
@@ -3321,7 +3917,14 @@ def build_extraction_tab(host, parent, SlimProgressBar, nav_button_width):
     self.extract_step_next_btn.config(text="Dalej", padding=(8, 2), width=NAV_BUTTON_WIDTH)
 
     self.extract_main_nav_panel = ttk.Frame(parent, style="Panel.TFrame")
-    self.extract_main_nav_panel.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+    self.extract_main_nav_panel.grid(
+        row=1,
+        column=0,
+        columnspan=2,
+        sticky="ew",
+        padx=10,
+        pady=(0, 10),
+    )
     self.extract_main_nav_panel.grid_remove()
 
     self.extract_nav_divider = tk.Frame(

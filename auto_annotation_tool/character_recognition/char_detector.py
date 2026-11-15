@@ -104,6 +104,7 @@ class CharacterDetector:
         self.last_ocr_detections: List[CharacterDetection] = []
         self.last_yolo_raw_detections: List[CharacterDetection] = []
         self.last_yolo_nms_detections: List[CharacterDetection] = []
+        self.last_yolo_box_detections: List[CharacterDetection] = []
         self.last_yolo_detections: List[CharacterDetection] = []
         self.last_yolo_ocr_detections: List[CharacterDetection] = []
         self.last_yolo_requested_device = yolo_device
@@ -118,6 +119,7 @@ class CharacterDetector:
         self.last_ocr_detections = []
         self.last_yolo_raw_detections = []
         self.last_yolo_nms_detections = []
+        self.last_yolo_box_detections = []
         self.last_yolo_detections = []
         self.last_yolo_ocr_detections = []
 
@@ -132,12 +134,13 @@ class CharacterDetector:
             DetectionMethod.YOLO_SYMBOL,
         ]:
             self.last_yolo_detections = self._detect_with_yolo(plate_image)
+            # Geometry uses the box-confidence stream, then the same sequence
+            # guards as symbols. An empty filtered result must stay empty.
+            self.last_yolo_box_detections = self._filter_yolo_sequence_consistency(
+                list(self.last_yolo_nms_detections)
+            )
             if self.method == DetectionMethod.YOLO_OCR:
-                yolo_boxes_for_ocr = (
-                    list(self.last_yolo_nms_detections)
-                    or list(self.last_yolo_detections)
-                    or list(self.last_yolo_raw_detections)
-                )
+                yolo_boxes_for_ocr = list(self.last_yolo_box_detections)
                 if yolo_boxes_for_ocr:
                     self.last_yolo_ocr_detections = self._detect_with_yolo_boxes_and_ocr(
                         plate_image,
@@ -150,9 +153,7 @@ class CharacterDetector:
                     detections.extend(self.last_ocr_detections)
             elif self.method == DetectionMethod.YOLO_BOX:
                 detections.extend(
-                    list(self.last_yolo_nms_detections)
-                    or list(self.last_yolo_detections)
-                    or list(self.last_yolo_raw_detections)
+                    self.last_yolo_box_detections
                 )
             else:
                 detections.extend(self.last_yolo_detections)
@@ -202,6 +203,7 @@ class CharacterDetector:
                 pass
             self.last_yolo_raw_detections = []
             self.last_yolo_nms_detections = []
+            self.last_yolo_box_detections = []
             self.last_yolo_detections = []
             self.last_yolo_ocr_detections = []
 

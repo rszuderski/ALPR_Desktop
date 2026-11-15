@@ -1,3 +1,4 @@
+-c requirements-constraints.txt
 ultralytics
 torch
 torchvision
@@ -5,7 +6,6 @@ onnx>=1.12.0,<2.0.0
 onnxruntime
 onnxslim>=0.1.71
 jsonschema
-pytest
 tensorflow>=2.0.0,<=2.19.0
 tf_keras<=2.19.0
 sng4onnx>=1.0.1

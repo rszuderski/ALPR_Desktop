@@ -1672,9 +1672,10 @@ def _collect_plate_auto_scope_candidates(
     *,
     candidate_image_paths: list[Path] | None = None,
     protect_existing: bool = True,
+    protected_filenames: set[str] | None = None,
 ) -> dict:
     protected_filenames = (
-        self._get_preview_auto_scope_protected_filenames()
+        (self._get_preview_auto_scope_protected_filenames() if protected_filenames is None else protected_filenames)
         if bool(protect_existing)
         else set()
     )
@@ -1749,10 +1750,12 @@ def _collect_plate_auto_scope_bucket_protected_counts(
     *,
     candidate_image_paths: list[Path] | None = None,
     protect_existing: bool = True,
+    protected_filenames: set[str] | None = None,
 ) -> dict[str, int]:
     if not bool(protect_existing):
         return {"manual": 0, "auto": 0, "problem": 0}
-    protected_filenames = self._get_preview_auto_scope_protected_filenames()
+    if protected_filenames is None:
+        protected_filenames = self._get_preview_auto_scope_protected_filenames()
     candidate_paths = self._dedupe_image_paths_by_name(candidate_image_paths or [])
     candidate_names = {
         str(getattr(path, "name", "") or "").strip().lower()

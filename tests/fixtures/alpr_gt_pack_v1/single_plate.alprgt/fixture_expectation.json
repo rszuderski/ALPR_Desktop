@@ -1,0 +1,6 @@
+{
+  "ground_truth": "ABC123",
+  "image_id": "img-sha256-0f8b6327327aa97711d20804dc230cba1940816aedbdc27c4e95726635dc1562",
+  "plate_id": "plate-ann-fixture-single",
+  "source_file_sha256": "0f8b6327327aa97711d20804dc230cba1940816aedbdc27c4e95726635dc1562"
+}

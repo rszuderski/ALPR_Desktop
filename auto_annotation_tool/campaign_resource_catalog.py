@@ -29,7 +29,7 @@ RESOURCE_DEFINITIONS: Mapping[str, CampaignResourceDefinition] = {
         code="O",
         label="O - obrazy",
         short_label="O",
-        description="Katalog obrazów wejściowych dla bieżącej iteracji.",
+        description="Katalog obrazów wejściowych dla bieżącej iteracji wraz z opcjonalnymi danymi towarzyszącymi, np. GT Pack.",
         counted=True,
     ),
     "plate_model": CampaignResourceDefinition(

@@ -615,6 +615,11 @@ def _get_training_device_recommendation(self, device_value: str | None = None) -
     }
 
 def _refresh_training_device_hint(self):
+    from . import z4_mz_experiment
+    if z4_mz_experiment.is_active(self):
+        self.device_var.set(self._mz_protocol["training"]["device"])
+        z4_mz_experiment.refresh_controls(self)
+        return
     if not bool(getattr(self, "_step4_train_tab_built", False)):
         return
     combo = getattr(self, "device_combo", None)

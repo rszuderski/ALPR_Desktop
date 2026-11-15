@@ -27,3 +27,7 @@
 *.pt binary
 *.onnx binary
 *.engine binary
+
+# Preserve upstream legal notices byte-for-byte (including intentional rules
+# and separators that Git would otherwise flag as whitespace/conflict text).
+packaging/third_party_licenses/** -text -diff

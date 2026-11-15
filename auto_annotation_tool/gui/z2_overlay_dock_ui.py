@@ -66,6 +66,23 @@ def get_preview_overlay_dock_theme(owner) -> dict:
     }
 
 
+def _format_preview_gate_have_text(state: dict, gate_metric: str) -> str:
+    metric = str(gate_metric or "").strip().lower()
+    approved_images = int(state.get("approved_images", 0) or 0)
+    approved_plates = int(state.get("approved_plates", 0) or 0)
+
+    if metric == "plates":
+        text = f"TABLICE [OK]\n{approved_plates}"
+        gt_plates = int(state.get("gt_plates", 0) or 0)
+        gt_total = int(state.get("gt_total_plates", 0) or 0)
+        missing_gt = int(state.get("missing_gt", 0) or 0)
+        if gt_total > 0 or gt_plates > 0 or missing_gt > 0:
+            text += f"\nGT {gt_plates}/{gt_total}"
+        return text
+
+    return f"OBRAZY [OK]\n{approved_images}"
+
+
 def _pointer_inside_widget(widget) -> bool:
     if widget is None:
         return False
@@ -441,6 +458,7 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
         approval_key,
         str(getattr(owner, "current_annotation_run_dir", "") or ""),
         int(len(getattr(owner, "current_annotations", []) or [])),
+        int(getattr(owner, "_preview_counter_version", 0) or 0),
     )
     cached_inline_gate_source_key = getattr(owner, "_preview_overlay_dock_inline_gate_source_key", None)
     if not fullscreen:
@@ -469,6 +487,10 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
                 "tone",
                 "approved_images",
                 "approved_plates",
+                "gt_plates",
+                "gt_total_plates",
+                "missing_gt",
+                "gt_ready",
                 "missing_images",
                 "missing_to_open",
                 "missing_plates",
@@ -611,6 +633,7 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
                         if isinstance(cached_size, (tuple, list)) and len(cached_size) >= 2:
                             return int(cached_size[0]), int(cached_size[1])
                     success = str(theme["active"])
+                    drawer_text_fg = "#ffffff"
                     error = str(getattr(getattr(owner, "app", None), "palette", {}).get("error", "#c7422f"))
                     warning = str(getattr(getattr(owner, "app", None), "palette", {}).get("warning", "#f39c12"))
                     fill = theme["fill"]
@@ -642,15 +665,17 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
                         missing_focus_value = int(missing_focus_value_raw or 0)
                     except Exception:
                         missing_focus_value = int(missing_to_open or 0)
-                    have_value = approved_plates if gate_metric == "plates" else approved_images
-                    have_label = "TABLICE" if gate_metric == "plates" else "OBRAZY"
+                    have_text_value = _format_preview_gate_have_text(
+                        inline_gate,
+                        gate_metric,
+                    )
                     quality_score = max(0, approved_plates) if gate_metric == "plates" else min(max(0, approved_images), max(0, approved_plates))
                     quality_info = CONFIG.describe_yolo_pose_dataset_quality(quality_score)
                     quality_label = str(quality_info.get("label", "SŁABY") or "SŁABY")
                     quality_tone = str(quality_info.get("tone", "error") or "error").strip().lower()
                     quality_color = success if quality_tone == "success" else warning if quality_tone == "warning" else error
                     gate_status_fill = success if ready else error
-                    status_text = "#111111" if owner._legend_color_is_light(gate_status_fill) else "#ffffff"
+                    status_text = drawer_text_fg
                     have_fill = blend_hex_colors(success, fill, 0.36)
                     info_color = str(palette.get("info", palette.get("accent", "#4aa3ff")))
                     missing_base = (
@@ -663,9 +688,9 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
                         else error
                     )
                     missing_fill = blend_hex_colors(missing_base, fill, 0.36)
-                    have_text = "#111111" if owner._legend_color_is_light(have_fill) else "#ffffff"
-                    missing_text = "#111111" if owner._legend_color_is_light(missing_fill) else "#ffffff"
-                    quality_text = "#111111" if owner._legend_color_is_light(quality_color) else "#ffffff"
+                    have_text = drawer_text_fg
+                    missing_text = drawer_text_fg
+                    quality_text = drawer_text_fg
                     instruction = str(inline_gate.get("instruction") or "").strip()
                     if not instruction and not ready:
                         instruction = "Oznaczaj dalej."
@@ -673,12 +698,12 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
                     ann = owner._get_preview_annotation()
                     approved = bool(owner._preview_annotation_is_explicitly_approved(ann)) if ann is not None else False
                     approval_fill = success if approved else error
-                    approval_text = "#111111" if owner._legend_color_is_light(approval_fill) else "#ffffff"
+                    approval_text = drawer_text_fg
                     getattr(owner, "preview_overlay_dock_gate_frame").configure(bg=fill)
                     gate_title_lbl = getattr(owner, "preview_overlay_dock_gate_title_lbl")
                     gate_title_lbl.configure(
                         bg=theme["section_fill"],
-                        fg=theme.get("section_text", muted),
+                        fg=drawer_text_fg,
                         font=("Segoe UI Semibold", 8),
                         padx=10,
                         pady=7,
@@ -709,7 +734,7 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
                     getattr(owner, "preview_overlay_dock_gate_have_lbl").configure(
                         bg=have_fill,
                         fg=have_text,
-                        text=f"{have_label}\n{have_value}",
+                        text=have_text_value,
                     )
                     getattr(owner, "preview_overlay_dock_gate_missing_lbl").configure(
                         bg=missing_fill,
@@ -732,7 +757,7 @@ def render_preview_overlay_dock(owner, *, force_render: bool = False) -> tuple[i
                             info_lbl.pack(fill=tk.X, padx=6, pady=(0, 6))
                         info_lbl.configure(
                             bg=body_fill,
-                            fg=text_fill,
+                            fg=drawer_text_fg,
                             text=instruction,
                             wraplength=214,
                         )
@@ -969,9 +994,10 @@ def render_preview_campaign_gate_overlay(owner, state: dict, *, force_render: bo
             instruction_text = "Dodaj ramkę tablicy."
         else:
             instruction_text = "Oznaczaj dalej."
-    have_value = approved_plates if gate_metric == "plates" else approved_images
-    have_label = "TABLICE" if gate_metric == "plates" else "OBRAZY"
-    have_text = f"{have_label}\n{have_value}"
+    have_text = _format_preview_gate_have_text(
+        state,
+        gate_metric,
+    )
     missing_text = f"{missing_focus_label}\n{'MAX' if missing_focus_tone == 'success' and missing_focus_value <= 0 else missing_focus_value}"
     render_key = (
         str(state.get("status") or ""),

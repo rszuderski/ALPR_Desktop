@@ -1,0 +1,13 @@
+{
+  "normalization_policy": "uppercase_alphanumeric.v1",
+  "observed_by": [
+    "auto_annotation_tool"
+  ],
+  "operation": "set",
+  "parents": [],
+  "plate_id": "plate-ann-fixture-geometry-conflict",
+  "revision_id": "rev-sha256-8be670aaa31388cf1ec65dd2897b3f525299dfdb85cba7d3093a9af35c2c40fb",
+  "schema": "alpr.gt.revision.v1",
+  "source": "manual_z2",
+  "value": "XYZ999"
+}

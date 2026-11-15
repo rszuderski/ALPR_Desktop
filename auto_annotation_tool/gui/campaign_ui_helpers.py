@@ -29,6 +29,64 @@ from . import campaign_dashboard_cache
 from .help_manager import HELP
 from .app_theme_definitions import CAMPAIGN_SIDEBAR_STYLE
 from .web_slim_scrollbar import WebSlimScrollbar, blend_hex_colors
+
+# Jeden kontrakt semantyczny kolorów dla workflow kampanii.
+# Kolor opisuje znaczenie stanu, a nie konkretną bramkę.
+CAMPAIGN_WORKFLOW_TONE_BY_STATE = {
+    "done": "success",
+    "current": "warning",
+    "attention": "warning",
+    "blocked": "muted",
+    "error": "error",
+    "neutral": "info",
+}
+
+
+def campaign_workflow_semantic_tone(state: str) -> str:
+    normalized = str(state or "neutral").strip().lower()
+    return CAMPAIGN_WORKFLOW_TONE_BY_STATE.get(normalized, "info")
+
+
+def campaign_workflow_semantic_color(
+    palette: dict,
+    state: str,
+    *,
+    graph: bool = False,
+) -> str:
+    tone = campaign_workflow_semantic_tone(state)
+    if graph:
+        graph_key = {
+            "success": "campaign_card_success",
+            "warning": "campaign_card_warning",
+            "error": "campaign_card_error",
+            "muted": "campaign_card_disabled",
+            "info": "campaign_card_accent",
+        }[tone]
+        return str(
+            palette.get(graph_key)
+            or palette.get("campaign_card_muted")
+            or palette.get("muted")
+            or "#808080"
+        )
+
+    if tone == "error":
+        return str(
+            palette.get("error")
+            or palette.get("danger")
+            or "#c0392b"
+        )
+    key = {
+        "success": "success",
+        "warning": "warning",
+        "muted": "muted",
+        "info": "accent",
+    }[tone]
+    return str(
+        palette.get(key)
+        or palette.get("fg")
+        or "#808080"
+    )
+
 from .z2_view_models import Step2CtaViewModel, Step2ViewModel
 from .z3_view_models import Step3ViewModel
 

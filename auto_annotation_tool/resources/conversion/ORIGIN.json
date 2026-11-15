@@ -1,0 +1,11 @@
+{
+  "source": "https://github.com/ultralytics/assets/releases/download/v8.4.0/calibration_image_sample_data_20x128x128x3_float32.npy.zip",
+  "github_asset_id": 340061018,
+  "archive_sha256": "693baf8972f94483c201b8d9f0896dbdb0b433e75e3f83973e43ac95aabd45b2",
+  "file": "calibration_image_sample_data_20x128x128x3_float32.npy",
+  "sha256": "7760bb2bc187ab76c0a9249033ccfe2bf98423f075d6251d966a5deedc8a1379",
+  "bytes": 3932288,
+  "license_source": "https://raw.githubusercontent.com/ultralytics/assets/main/LICENSE",
+  "license": "AGPL-3.0",
+  "purpose": "Unmodified upstream converter diagnostic input; never a replacement for operator INT8 calibration data."
+}

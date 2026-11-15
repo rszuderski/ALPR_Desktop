@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Trener modeli YOLO Pose.
@@ -11,6 +11,7 @@ import math
 import os
 import re
 import subprocess
+from alpr_runtime import python_module_command
 import sys
 import threading
 import time
@@ -29,7 +30,11 @@ from ..config import (
     is_cuda_available,
 )
 from ..utils import cleanup_gpu_memory, safe_load_yaml
-from ..validators import validate_model_file
+from ..validators import (
+    validate_model_file,
+    read_model_metadata_sidecar,
+    write_model_metadata_sidecar,
+)
 from .dataset_augmentation import ensure_yolo_dataset_yaml_points_to_root
 from .model_provenance import (
     build_checkpoint_training_snapshot,
@@ -41,6 +46,9 @@ from .model_provenance import (
 from .training_history import TrainingHistory, TrainingRun, TrainingStatus
 from .training_report import TrainingReportGenerator
 from .resource_monitor import format_resource_sample_line, sample_system_memory
+from .experiment_protocol import (
+    CONTROLLED_TRAIN_FIELDS, protocol_differences, training_protocol_snapshot, validate_requested_protocol,
+)
 
 YOLO = None
 
@@ -374,7 +382,15 @@ class YOLOPoseTrainer:
         if metrics_epoch is not None:
             candidates.append(metrics_epoch)
 
-        checkpoint_epoch = self._resolve_completed_epoch_from_checkpoint(last_checkpoint) if last_checkpoint else None
+        # Reading a YOLO checkpoint with torch.load can temporarily consume
+        # hundreds of MiB. During normal finalization runtime/metrics already
+        # provide the completed epoch count, so use the checkpoint only as a
+        # true fallback.
+        checkpoint_epoch = (
+            self._resolve_completed_epoch_from_checkpoint(last_checkpoint)
+            if last_checkpoint and not candidates
+            else None
+        )
         if checkpoint_epoch is not None:
             candidates.append(checkpoint_epoch)
 
@@ -594,12 +610,13 @@ class YOLOPoseTrainer:
         lr0: float,
         dataset_profile: Dict,
         label: str,
+        preserve_lr: bool = False,
     ) -> Dict:
         is_pose = bool((dataset_profile or {}).get("is_pose"))
         safe_batch = 1 if is_pose else max(1, min(int(batch_size or 1), 2))
         safe_img_size = 512 if int(img_size or 640) >= 640 else self._next_lower_training_imgsz(int(img_size or 640))
         safe_img_size = max(256, int(safe_img_size))
-        safe_lr0 = round(max(0.0025, float(lr0 or 0.01) * 0.85), 4)
+        safe_lr0 = float(lr0) if preserve_lr else round(max(0.0025, float(lr0 or 0.01) * 0.85), 4)
         return {
             "batch_size": int(safe_batch),
             "img_size": int(safe_img_size),
@@ -609,6 +626,7 @@ class YOLOPoseTrainer:
             "close_mosaic": 0,
             "plots": False,
             "cache": False,
+            "workers": 0,
             "label": str(label),
             "ram_safe": True,
         }
@@ -628,6 +646,7 @@ class YOLOPoseTrainer:
         close_mosaic: int | None = None,
         plots: bool = True,
         cache: bool = False,
+        workers: int = 0,
     ) -> Dict:
         train_args = {
             "data": str(Path(dataset_path) / "data.yaml"),
@@ -645,7 +664,7 @@ class YOLOPoseTrainer:
             "save_period": 10,
             "patience": 50,
             "plots": bool(plots),
-            "workers": 0,
+            "workers": max(0, int(workers or 0)),
             # Jawne cache=False zapobiega niekontrolowanemu trzymaniu obrazów w RAM.
             "cache": bool(cache),
             "amp": bool(amp),
@@ -654,7 +673,53 @@ class YOLOPoseTrainer:
             train_args["mosaic"] = float(mosaic)
         if close_mosaic is not None:
             train_args["close_mosaic"] = int(close_mosaic)
+        requested = dict(getattr(run, "training_protocol_requested", None) or {})
+        train_args["seed"] = int(requested.get("seed", 0))
+        train_args["optimizer"] = str(requested.get("optimizer", "auto"))
+        if bool(getattr(run, "strict_experiment", False)):
+            validate_requested_protocol(requested)
+            # A memory retry must never silently replace the requested core
+            # configuration. Optional/default args below implement the recipe.
+            core = {key:train_args[key] for key in ("batch","imgsz","epochs","lr0","device")}
+            changed = protocol_differences({key:requested[key] for key in core}, core)
+            if changed:
+                raise RuntimeError("Strict experiment parameter drift: " + str(changed))
+            train_args.update({key:value for key,value in requested.items() if key in CONTROLLED_TRAIN_FIELDS})
         return train_args
+
+    def _capture_training_protocol(self, run, arguments, *, source):
+        requested = dict(getattr(run, "training_protocol_requested", None) or {})
+        strict = bool(getattr(run, "strict_experiment", False))
+        snapshot = training_protocol_snapshot(requested, arguments, strict=strict, source=source)
+        actual = dict(snapshot.get("actual") or {})
+        for key in ("memory_policy", "ram_safe_applied", "attempt_label"):
+            if key in arguments:
+                actual[key] = arguments.get(key)
+        snapshot["actual"] = actual
+        self.history.update_run(run.id, training_protocol_snapshot=snapshot)
+        run.training_protocol_snapshot = snapshot
+        if strict and snapshot["differences"]:
+            raise RuntimeError("Strict experiment runtime parameter drift: " + str(snapshot["differences"]))
+
+    def _reject_experiment_memory_fallback(self, run, reason):
+        snapshot = dict(getattr(run, "training_protocol_snapshot", None) or {})
+        snapshot.update(schema="alpr.training_protocol_snapshot.v1", comparable=False,
+            strict_experiment=True, memory_fallback_required=True, failure_reason=str(reason))
+        self.history.update_run(run.id, training_protocol_snapshot=snapshot)
+        run.training_protocol_snapshot = snapshot
+        raise RuntimeError("Strict experiment cannot change protocol for RAM/OOM safety: " + str(reason))
+
+    @staticmethod
+    def _apply_experiment_data_policy(run, runtime_trainer):
+        if not bool(getattr(run, "strict_experiment", False)):
+            return
+        requested = dict(getattr(run, "training_protocol_requested", None) or {})
+        if requested.get("augmentation_policy") != "source_only":
+            raise RuntimeError("Strict experiment requires an explicit augmentation policy")
+        # Ultralytics 8.4.19 supports hyp.augmentations in its dataset builder,
+        # but not as a validated top-level model.train keyword. This callback
+        # runs before get_dataset()/loader creation; no global patch is used.
+        runtime_trainer.args.augmentations = []
 
     def _export_training_report_artifacts(self, run: TrainingRun) -> None:
         if run is None:
@@ -1278,6 +1343,18 @@ class YOLOPoseTrainer:
             model_file = f"{base_model}.pt"
 
         run_metadata = {}
+        requested_protocol = dict(kwargs.pop("training_protocol", None) or {})
+        strict_experiment = bool(kwargs.get("strict_experiment", False))
+        if strict_experiment:
+            try:
+                validate_requested_protocol(requested_protocol)
+                if resume_from:
+                    raise ValueError("Controlled MZ comparisons start from official base weights, not resume")
+            except ValueError as exc:
+                logger.error(str(exc))
+                return None
+        run_metadata.update(strict_experiment=strict_experiment,
+            experiment_id=str(kwargs.get("experiment_id") or ""), training_protocol_requested=requested_protocol)
         for key in (
             "lineage_mode",
             "parent_run_id",
@@ -1437,11 +1514,12 @@ class YOLOPoseTrainer:
             env = os.environ.copy()
             env.setdefault("PYTHONFAULTHANDLER", "1")
             process = subprocess.Popen(
-                [sys.executable, "-m", worker_module, ipc_paths["job_file"]],
+                python_module_command(worker_module, ipc_paths["job_file"]),
                 cwd=str(Path(CONFIG.WORKSPACE_DIR).parent),
                 stdout=stdout_handle,
                 stderr=subprocess.STDOUT,
                 env=env,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
         except Exception as exc:
             self.is_training = False
@@ -1517,8 +1595,24 @@ class YOLOPoseTrainer:
 
             is_resuming = bool(resume_from and Path(resume_from).exists())
             dataset_profile = self._get_dataset_runtime_profile(dataset_path)
+            # Z4FTGUI001-FIX02 trainer protocol
+            requested_protocol = dict(getattr(run, "training_protocol_requested", None) or {})
+            explicit_ft_protocol = bool(requested_protocol.get("ui_fine_tune_protocol"))
+            ram_safe_enabled = bool(requested_protocol.get("ram_safe_enabled", True)) if explicit_ft_protocol else True
+            allow_automatic_safety = (not explicit_ft_protocol) or ram_safe_enabled
+            requested_amp = bool(requested_protocol.get("amp", True))
+            try:
+                requested_mosaic = float(requested_protocol.get("mosaic", 1.0))
+            except Exception:
+                requested_mosaic = 1.0
+            requested_close_mosaic = requested_protocol.get("close_mosaic", 0 if requested_mosaic <= 0.0 else None)
+            requested_cache = bool(requested_protocol.get("cache", False))
+            requested_workers = max(0, int(requested_protocol.get("workers", 0) or 0))
+            requested_plots = bool(requested_protocol.get("plots", True))
+
             disable_mosaic_from_start = bool(
-                not is_resuming
+                allow_automatic_safety
+                and not is_resuming
                 and bool(dataset_profile.get("is_pose"))
                 and int(dataset_profile.get("train_images", 0) or 0) >= 1000
             )
@@ -1527,16 +1621,21 @@ class YOLOPoseTrainer:
                 is_pose=bool(dataset_profile.get("is_pose")),
             )
             start_with_safe_pose_profile = bool(
-                not is_resuming
+                allow_automatic_safety
+                and not is_resuming
                 and bool(dataset_profile.get("is_pose"))
                 and int(batch_size) <= 1
                 and int(img_size) <= 448
             )
             ram_state = sample_system_memory()
             start_with_ram_safe_profile = bool(
-                not is_resuming
+                ram_safe_enabled
+                and not is_resuming
                 and self._is_ram_pressure_high(ram_state, dataset_profile)
             )
+            strict_experiment = bool(getattr(run, "strict_experiment", False))
+            if strict_experiment and (start_with_ram_safe_profile or start_with_safe_pose_profile or disable_mosaic_from_start):
+                self._reject_experiment_memory_fallback(run, "RAM-safe preflight or automatic safety profile")
             if disable_mosaic_from_start:
                 logger.info(
                     "Duży dataset POSE tablic wykryty. Startuję trening bez mosaic, "
@@ -1559,6 +1658,16 @@ class YOLOPoseTrainer:
                 if self.on_progress:
                     self.on_progress(0.0, ram_msg)
 
+            if explicit_ft_protocol and not ram_safe_enabled and self._is_ram_pressure_high(ram_state, dataset_profile):
+                fixed_msg = (
+                    "Fine-tuning ma politykę `Stałe parametry`. Wykryto presję RAM, "
+                    "ale aplikacja nie zmieni batch/imgsz/LR ani opcji runtime. "
+                    f"{self._format_ram_state(ram_state)}"
+                )
+                logger.warning(fixed_msg)
+                if self.on_progress:
+                    self.on_progress(0.0, fixed_msg)
+
             self.history.update_run(
                 run.id,
                 status=TrainingStatus.RUNNING.value,
@@ -1578,8 +1687,30 @@ class YOLOPoseTrainer:
             self._training_batch_state = batch_state
             dataset_verified = False
 
+            def on_pretrain_routine_start(_trainer):
+                self._apply_experiment_data_policy(run, _trainer)
+
             def on_pretrain_routine_end(_trainer):
                 nonlocal dataset_verified
+                runtime_args = getattr(_trainer, "args", None)
+                runtime_args = runtime_args if isinstance(runtime_args, dict) else getattr(runtime_args, "__dict__", None)
+                if isinstance(runtime_args, dict):
+                    actual = dict(runtime_args)
+                    if strict_experiment:
+                        if actual.get("augmentations") != []:
+                            raise RuntimeError("Strict source_only policy was not applied before loader creation")
+                    if hasattr(_trainer, "amp"):
+                        actual["amp"] = bool(_trainer.amp)
+                    optimizer = getattr(_trainer, "optimizer", None)
+                    if optimizer is not None:
+                        actual["optimizer"] = type(optimizer).__name__
+                    self._capture_training_protocol(run, actual, source="ultralytics_pretrain_runtime")
+                    if strict_experiment:
+                        policy_snapshot = dict(run.training_protocol_snapshot)
+                        policy_snapshot["augmentation_policy"] = "source_only"
+                        policy_snapshot["albumentations_transforms"] = []
+                        self.history.update_run(run.id, training_protocol_snapshot=policy_snapshot)
+                        run.training_protocol_snapshot = policy_snapshot
                 if self.on_progress:
                     self.on_progress((completed_epoch / max(1, epochs)) * 100,
                                      "Potwierdzam dataset po przygotowaniu obrazów...")
@@ -1743,6 +1874,7 @@ class YOLOPoseTrainer:
                         lr0=float(lr0),
                         dataset_profile=dataset_profile,
                         label="ram_safe_preflight",
+                        preserve_lr=explicit_ft_protocol,
                     )
                 ]
             else:
@@ -1751,23 +1883,25 @@ class YOLOPoseTrainer:
                         "batch_size": int(batch_size),
                         "img_size": int(img_size),
                         "lr0": float(lr0),
-                        "amp": (False if start_with_safe_pose_profile else True),
-                        "mosaic": (0.0 if (disable_mosaic_from_start or start_with_safe_pose_profile) else None),
-                        "close_mosaic": (0 if (disable_mosaic_from_start or start_with_safe_pose_profile) else None),
-                        "plots": True,
-                        "cache": False,
+                        "amp": (requested_amp if explicit_ft_protocol else (False if start_with_safe_pose_profile else True)),
+                        "mosaic": (requested_mosaic if explicit_ft_protocol else (0.0 if (disable_mosaic_from_start or start_with_safe_pose_profile) else None)),
+                        "close_mosaic": (requested_close_mosaic if explicit_ft_protocol else (0 if (disable_mosaic_from_start or start_with_safe_pose_profile) else None)),
+                        "plots": (requested_plots if explicit_ft_protocol else True),
+                        "cache": (requested_cache if explicit_ft_protocol else False),
+                        "workers": (requested_workers if explicit_ft_protocol else 0),
                         "label": "start",
                         "ram_safe": False,
                     }
                 ]
             used_memory_fallback = False
-            if not is_resuming and not start_with_ram_safe_profile:
+            if ram_safe_enabled and not is_resuming and not start_with_ram_safe_profile and not strict_experiment:
                 fallback_attempt = self._build_ram_safe_training_attempt(
                     batch_size=int(batch_size),
                     img_size=int(img_size),
                     lr0=float(lr0),
                     dataset_profile=dataset_profile,
                     label="oom_fallback",
+                    preserve_lr=explicit_ft_protocol,
                 )
                 if fallback_attempt != training_attempts[0]:
                     training_attempts.append(fallback_attempt)
@@ -1795,6 +1929,7 @@ class YOLOPoseTrainer:
                 except Exception:
                     pass
 
+                self.model.add_callback("on_pretrain_routine_start", on_pretrain_routine_start)
                 self.model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
                 self.model.add_callback("on_train_epoch_start", on_train_epoch_start)
                 self.model.add_callback("on_train_batch_end", on_train_batch_end)
@@ -1846,14 +1981,35 @@ class YOLOPoseTrainer:
                             close_mosaic=attempt.get("close_mosaic"),
                             plots=bool(attempt.get("plots", True)),
                             cache=bool(attempt.get("cache", False)),
+                            workers=int(attempt.get("workers", requested_workers) or 0),
                         )
+                        protocol_actual = dict(train_args)
+                        protocol_actual.update({
+                            "memory_policy": ("adaptive" if ram_safe_enabled else "fixed"),
+                            "ram_safe_applied": bool(attempt.get("ram_safe")),
+                            "attempt_label": str(attempt.get("label") or ""),
+                        })
+                        self._capture_training_protocol(run, protocol_actual, source="model_train_arguments")
                         self.model.train(**train_args)
                     last_training_error = None
                     break
                 except Exception as train_error:
                     last_training_error = train_error
+                    if strict_experiment and self._is_training_memory_error(train_error):
+                        self._reject_experiment_memory_fallback(run, str(train_error))
+                    if explicit_ft_protocol and not ram_safe_enabled and self._is_training_memory_error(train_error):
+                        raise RuntimeError(
+                            "Fine-tuning z polityką `Stałe parametry` napotkał błąd pamięci. "
+                            "Aplikacja nie zmieni automatycznie batch/imgsz/LR ani opcji runtime. "
+                            "Zmień ustawienia jawnie w Z4/PZ2 i uruchom nowy run. "
+                            f"Ustawienia: batch={int(attempt['batch_size'])}, "
+                            f"imgsz={int(attempt['img_size'])}, lr0={float(attempt['lr0']):.6g}."
+                        ) from train_error
                     progressed_batches = int(batch_state.get("batch", 0) or 0) > 0
                     can_retry = (
+                        ram_safe_enabled
+                        and not strict_experiment
+                        and
                         attempt_index < (len(training_attempts) - 1)
                         and not is_resuming
                         and not self.should_stop
@@ -1907,6 +2063,12 @@ class YOLOPoseTrainer:
                     self.on_training_end(False, "Wstrzymano" if self.should_pause else "Zatrzymano")
                 return
 
+            # model.train() has already returned. Release the live training
+            # model before checkpoint provenance/report/export work. On 8 GiB
+            # systems keeping the training graph alive while loading best/last
+            # checkpoints can push Windows into paging and make Tk appear hung.
+            self._reset_runtime_state()
+
             train_dir = Path(run.output_dir) / "train"
             best_weights = train_dir / "weights" / "best.pt"
             last_weights = train_dir / "weights" / "last.pt"
@@ -1937,6 +2099,7 @@ class YOLOPoseTrainer:
                     last_checkpoint=last_weights if last_weights.exists() else None,
                     best_epoch=best_epoch,
                     best_epoch_source=best_epoch_source,
+                    inspect_checkpoint_epoch=False,
                 )
                 self.history.update_run(run.id, output_checkpoint_snapshot=output_checkpoint_snapshot)
             except Exception as snapshot_err:
@@ -1981,6 +2144,86 @@ class YOLOPoseTrainer:
 
                     shutil.copy2(best_weights, target_path)
                     logger.info(f"[OK] Skopiowano najlepszy model do: {target_path.name}")
+
+                    source_metadata = read_model_metadata_sidecar(best_weights)
+                    if source_metadata is not None:
+                        metadata_info = source_metadata[2] if len(source_metadata) >= 3 else {}
+                        metadata_ok = bool(source_metadata[0])
+                        metadata_message = str(source_metadata[1] or "")
+                    else:
+                        # best.pt is a successful output of the just-finished
+                        # training run. Do not instantiate YOLO(target_path)
+                        # again only to build UI metadata: that duplicates the
+                        # model in CPU RAM at the worst possible moment.
+                        task_type = "pose" if task_tag == "plate" else "detect"
+                        dataset_cfg = {}
+                        try:
+                            dataset_cfg = safe_load_yaml(Path(run.dataset_path) / "data.yaml")
+                            if not isinstance(dataset_cfg, dict):
+                                dataset_cfg = {}
+                        except Exception:
+                            dataset_cfg = {}
+                        names = dataset_cfg.get("names")
+                        if isinstance(names, dict):
+                            def _name_sort_key(value):
+                                text = str(value)
+                                return (0, int(text)) if text.isdigit() else (1, text)
+                            classes = [str(names[key]) for key in sorted(names, key=_name_sort_key)]
+                        elif isinstance(names, (list, tuple)):
+                            classes = [str(value) for value in names]
+                        else:
+                            classes = []
+                        source_model = str(getattr(run, "base_model", "") or "").strip()
+                        source_model_name = Path(source_model).name if source_model else ""
+                        identity_match = re.search(
+                            r"yolo(?:v)?(8|11|26)([nsmlx])(?:[-_ ]?(pose))?",
+                            source_model_name.lower(),
+                        )
+                        identity = {}
+                        if identity_match:
+                            version = str(identity_match.group(1) or "")
+                            size = str(identity_match.group(2) or "").lower()
+                            family = f"YOLOv{version}" if version == "8" else f"YOLO{version}"
+                            variant = f"{family}{size}"
+                            identity = {
+                                "yolo_family": family,
+                                "yolo_version": version,
+                                "yolo_size": size,
+                                "yolo_variant": variant,
+                                "architecture_label": f"{variant} {'Pose' if task_type == 'pose' else 'Detect'}",
+                            }
+                        metadata_info = {
+                            "type": task_type,
+                            "task": task_type,
+                            "classes": classes,
+                            "num_classes": len(classes),
+                            "keypoints": bool(task_type == "pose"),
+                            "kpt_shape": dataset_cfg.get("kpt_shape") if task_type == "pose" else None,
+                            "file_name": target_path.name,
+                            "source_model": source_model,
+                            "source_model_name": source_model_name,
+                            "source_architecture_label": str(identity.get("architecture_label") or ""),
+                            **identity,
+                        }
+                        try:
+                            metadata_info["file_size_mb"] = round(target_path.stat().st_size / (1024 * 1024), 2)
+                        except Exception:
+                            metadata_info["file_size_mb"] = 0
+                        metadata_ok = True
+                        metadata_message = "Model utworzony przez zakończony run treningowy"
+                    write_model_metadata_sidecar(
+                        target_path,
+                        metadata_info,
+                        validation_ok=metadata_ok,
+                        validation_message=metadata_message,
+                        extra={
+                            "source": "training_finalization",
+                            "run_id": str(run.id or ""),
+                            "training_target": task_tag,
+                            "metadata_scope": "lightweight_completed_training_output",
+                        },
+                    )
+                    logger.info(f"[OK] Zapisano lekkie metadata modelu: {target_path.name}.metadata.json")
 
                     # =========================================================
                     # AUTO-WIRING: aktualizacja modeli aktywnego projektu

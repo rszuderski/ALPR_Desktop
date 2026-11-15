@@ -647,3 +647,25 @@ class ModelTrainingProvenanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def test_output_snapshot_can_skip_checkpoint_epoch_load_when_epoch_is_known():
+    import auto_annotation_tool.training.model_provenance as provenance_module
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint = Path(tmp) / "best.pt"
+        checkpoint.write_bytes(b"checkpoint-bytes")
+        with patch.object(
+            provenance_module,
+            "_checkpoint_completed_epoch",
+            side_effect=AssertionError("heavy checkpoint load must be skipped"),
+        ):
+            snapshot = build_output_checkpoint_training_snapshot(
+                best_checkpoint=checkpoint,
+                best_epoch=2,
+                best_epoch_source="metrics_history",
+                inspect_checkpoint_epoch=False,
+            )
+        assert snapshot["best_epoch"] == 2
+        assert snapshot["best_epoch_source"] == "metrics_history"
+        assert snapshot["best_checkpoint_sha256"]

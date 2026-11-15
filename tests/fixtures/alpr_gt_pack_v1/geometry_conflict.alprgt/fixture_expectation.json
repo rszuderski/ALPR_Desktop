@@ -1,0 +1,7 @@
+{
+  "geometry_heads": [
+    "geom-sha256-07366f72df324815deefac240f6ea2f4b434935cdf2b99d432ec657a857dcf00",
+    "geom-sha256-0c0bec759e917d0aa88987b03320e0934e7cd9c786cad8bcdf7077c64dbb766c"
+  ],
+  "plate_id": "plate-ann-fixture-geometry-conflict"
+}

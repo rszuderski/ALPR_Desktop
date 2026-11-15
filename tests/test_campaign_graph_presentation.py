@@ -12,6 +12,7 @@ from auto_annotation_tool.gui.app_theme_definitions import get_theme_palette, TH
 from auto_annotation_tool.gui.campaign_graph_presentation import (
     CanvasWorkflowFocus, GraphToolbar, WorkflowFocus, resolve_workflow_focus,
 )
+from auto_annotation_tool.gui.campaign_gate_fields import gate_field_copy, field_layout, draw_field, text_height
 
 
 def scope(edge):
@@ -188,13 +189,13 @@ class GraphPresentationTkTests(unittest.TestCase):
         end = next(index for index, node in enumerate(gate.body) if assigns(node, "gate_h"))
         fonts = [node for node in draw.body if isinstance(node, ast.FunctionDef) and node.name in {"_gate_font", "_gate_layout_font"}]
         ns = {"tkfont": tkfont, "canvas": self.canvas, "width": width, "local_zoom": local_zoom,
+              "gate_field_copy": gate_field_copy, "field_layout": field_layout, "text_height": text_height,
               "zoom_for_fonts": zoom, "graph_zoom_scale": zoom, "graph_base_font_scale": 1.22,
               "gate_title_text": title, "status_text": status, "resource_status_value": "OK",
               "work_status_value": "KONTROLUJ AT", "approve_display_label": "ZATWIERDŹ",
-              "rows": [(label, "", None, False) for label in ("BRAMKA", "ZASOBY", "PRACA", "ZATWIERDŹ")]}
+              "rows": [(label, value, None, False) for label, value in
+                       (("BRAMKA", status), ("ZASOBY", "OK"), ("PRACA", "KONTROLUJ AT"), ("ZATWIERDŹ", ""))]}
         exec(compile(ast.Module(body=fonts + gate.body[start:end + 1], type_ignores=[]), "gate_dimensions", "exec"), ns)
-        ns["status_body"] = next(node.body for node in ast.walk(gate)
-                                 if isinstance(node, ast.If) and ast.unparse(node.test) == "idx == 0")
         return ns
 
     def test_gate_dimensions_stay_fixed_while_sidebar_changes_viewport(self):
@@ -221,9 +222,10 @@ class GraphPresentationTkTests(unittest.TestCase):
                     row_width, row_height = ns["gate_w"], ns["row_heights"]["BRAMKA"]
                     row = self.canvas.create_rectangle(20, 30, 20 + row_width, 30 + row_height,
                         fill="#141e12", outline="#81ecd0", width=1)
-                    ns.update(x=20, y0=30, current_row_h=row_height, value=status,
-                              row_fill="#141e12", graph_card_muted="#a0b19a", value_color="#81ecd0", row_tags=("status",))
-                    exec(compile(ast.Module(body=ns["status_body"], type_ignores=[]), "gate_status", "exec"), ns)
+                    draw_field(self.canvas, ns["field_copies"]["BRAMKA"], ns["field_layouts"]["BRAMKA"],
+                        x=20, y=30, width=row_width, scale=local_zoom, zoom=zoom,
+                        fonts={"caption": ns["row_label_font"], "primary": ns["row_value_font"], "detail": ns["detail_label_font"]},
+                        colors={"caption": "#a0b19a", "primary": "#81ecd0", "detail": "#a0b19a"}, tags=("status",))
                     self.canvas.scale("all", 0, 0, zoom, zoom)
                     for y in (30 * zoom, (30 + row_height) * zoom):
                         for fraction in (0.6, 0.8, 0.95):

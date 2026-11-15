@@ -102,3 +102,22 @@ class DrawerSlideTests(unittest.TestCase):
         self.slide.toggle()
         self.assertFalse(self.slide.hidden)
         self.assertIsNone(self.slide._job)
+
+    def test_vertical_tab_follows_drawer_and_finishes_at_right_edge(self):
+        self.root.update_idletasks()
+        open_x = int(self.slide.button.place_info()["x"])
+
+        self.slide.toggle()
+        self.advance(0.3)
+        self.root.update_idletasks()
+
+        hidden_x = int(self.slide.button.place_info()["x"])
+        self.assertGreater(hidden_x, open_x)
+        self.assertGreaterEqual(hidden_x, 990)
+        self.assertEqual(self.panel.winfo_manager(), "")
+
+        self.slide.toggle()
+        self.advance(0.3)
+        self.root.update_idletasks()
+        reopened_x = int(self.slide.button.place_info()["x"])
+        self.assertEqual(reopened_x, open_x)

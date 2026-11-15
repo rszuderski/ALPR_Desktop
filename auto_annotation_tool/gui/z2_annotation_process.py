@@ -90,6 +90,8 @@ from .z2_shared_ui import (
     refresh_workflow_route_cards as dispatch_refresh_workflow_route_cards,
 )
 from .z2_view_models import Step2CtaViewModel, Step2ViewModel
+from .z2_gt_readiness import build_char_gt_readiness
+from .z2_auto_run_result import remove_vehicle_assistance, merge_completed_view, protected_view_bundle
 from .zoomable_canvas import ZoomableCanvas
 from .z2_panel_workflow import (
     _refresh_free_mode_workflow_ui,
@@ -605,6 +607,35 @@ def _force_render_campaign_graph_t06_right_panel(
     ready = bool(snapshot.get("ready"))
     total_images = int(snapshot.get("total_images", 0) or 0)
     total_plates = int(snapshot.get("total_plates", 0) or 0)
+
+    try:
+        gt_state = dict(
+            build_char_gt_readiness(
+                self,
+                run_dir=run_dir,
+                force_parse_xml=False,
+            )
+            or {}
+        )
+    except Exception:
+        gt_state = {}
+    gt_count = int(gt_state.get("gt_plates", 0) or 0)
+    gt_missing = max(
+        int(gt_state.get("missing_gt", 0) or 0),
+        max(0, int(total_plates or 0) - int(gt_count or 0)),
+    )
+    gt_ready = bool(
+        int(total_plates or 0) > 0
+        and int(gt_count or 0) >= int(total_plates or 0)
+        and int(gt_missing or 0) == 0
+    )
+    rows.append(
+        (
+            "GT numerów tablic",
+            f"{gt_count}/{total_plates}",
+            "success" if gt_ready else "warning",
+        )
+    )
     missing_plates = max(0, int(required_plates or 0) - int(total_plates or 0))
     try:
         quality_info = CONFIG.describe_yolo_pose_dataset_quality(max(0, total_plates))
@@ -815,6 +846,9 @@ def _force_render_campaign_graph_right_panel(self) -> bool:
         approval_context = dict(self._get_campaign_step2_approval_context() or {})
     except Exception:
         approval_context = {}
+    approval_iteration_target = str(
+        approval_context.get("iteration_target") or ""
+    ).strip().lower()
     run_dir = approval_context.get("run_dir")
     xml_exists = bool(run_dir and (Path(run_dir) / "annotations.xml").exists())
 
@@ -874,8 +908,59 @@ def _force_render_campaign_graph_right_panel(self) -> bool:
         except Exception:
             t02_project_images = 0
             t02_project_plates = 0
-        effective_approved_images = max(0, int(t02_project_images or 0) + int(t02_session_images or 0))
-        effective_approved_plates = max(0, int(t02_project_plates or 0) + int(t02_session_plates or 0))
+
+        # "Nowe [OK] w kontroli" jest deltą względem puli projektu.
+        # Po ponownym otwarciu T02 ten sam run może nadal mieć approved_filenames,
+        # ale jeśli te obrazy są już w puli projektu, nie wolno liczyć ich drugi raz.
+        try:
+            project_approved_names = {
+                str(name or "").strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+                for name in set(self._get_campaign_plate_approved_filenames() or set())
+                if str(name or "").strip()
+            }
+            session_approved_names = {
+                str(name or "").strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+                for name in set(self._get_preview_approved_filenames() or set())
+                if str(name or "").strip()
+            }
+            session_only_names = session_approved_names - project_approved_names
+
+            session_images = 0
+            session_plates = 0
+            for ann in list(getattr(self, "current_annotations", []) or []):
+                filename = (
+                    str(getattr(ann, "filename", "") or "")
+                    .strip()
+                    .replace("\\", "/")
+                    .rsplit("/", 1)[-1]
+                    .lower()
+                )
+                if not filename or filename not in session_only_names:
+                    continue
+                try:
+                    plate_count = int(len(self._get_plate_detections(ann)))
+                except Exception:
+                    plate_count = 0
+                if plate_count <= 0:
+                    continue
+                session_images += 1
+                session_plates += plate_count
+
+            t02_session_images = int(session_images)
+            t02_session_plates = int(session_plates)
+        except Exception:
+            # Zachowaj dotychczasowe liczniki tylko jako bezpieczny fallback.
+            t02_session_images = int(approved_images or 0)
+            t02_session_plates = int(approved_plates or 0)
+
+        effective_approved_images = max(
+            0,
+            int(t02_project_images or 0) + int(t02_session_images or 0),
+        )
+        effective_approved_plates = max(
+            0,
+            int(t02_project_plates or 0) + int(t02_session_plates or 0),
+        )
         gate_state = {
             **dict(gate_state or {}),
             "approved_images": int(effective_approved_images or 0),
@@ -883,6 +968,13 @@ def _force_render_campaign_graph_right_panel(self) -> bool:
         }
     missing_plates = max(0, int(required_plates) - int(effective_approved_plates))
     ready = bool(gate_state.get("ready", missing_plates <= 0 and xml_exists))
+
+    gt_count = int(gate_state.get("gt_plates", 0) or 0)
+    gt_total = int(
+        gate_state.get("gt_total_plates", effective_approved_plates)
+        or 0
+    )
+    gt_ready = bool(gate_state.get("gt_ready", True))
     if gate_id == "T02":
         ready = bool(missing_plates <= 0)
     tone = "success" if ready else "warning"
@@ -1014,6 +1106,15 @@ def _force_render_campaign_graph_right_panel(self) -> bool:
                 "success" if xml_exists else "warning",
             ),
         ]
+
+    if approval_iteration_target == "char":
+        rows.append(
+            (
+                "GT numerów tablic",
+                f"{gt_count}/{gt_total}",
+                "success" if gt_ready else "warning",
+            )
+        )
 
     try:
         self.approve_btn_row.configure(text=f" {display_gate_title} ")
@@ -1515,6 +1616,39 @@ def _refresh_step2_action_states(self, *, lightweight: bool = False):
             and not self.is_processing
         )
     )
+    char_gt_readiness = {}
+    if project_active and approval_iteration_target == "char":
+        try:
+            char_gt_readiness = dict(
+                build_char_gt_readiness(
+                    self,
+                    run_dir=approval_run_dir,
+                    force_parse_xml=False,
+                )
+                or {}
+            )
+        except Exception:
+            char_gt_readiness = {}
+
+        gt_count = int(char_gt_readiness.get("gt_plates", 0) or 0)
+        expected_gt_total = max(
+            int(char_display_plates or 0),
+            int(cumulative_char_approved_plates or 0),
+        )
+        gt_missing = max(
+            int(char_gt_readiness.get("missing_gt", 0) or 0),
+            max(0, int(expected_gt_total) - int(gt_count)),
+        )
+        char_gt_readiness.update(
+            {
+                "expected_total_plates": int(expected_gt_total),
+                "gt_plates": int(gt_count),
+                "missing_gt": int(gt_missing),
+                "geometry_ready": bool(int(expected_gt_total) > 0),
+                "gt_complete": bool(int(expected_gt_total) > 0 and int(gt_missing) == 0),
+            }
+        )
+
     approval_action = ""
     if approve_ready:
         if (
@@ -1970,6 +2104,26 @@ def _refresh_step2_action_states(self, *, lightweight: bool = False):
                 quality_next_tone,
             ),
         ]
+        gt_expected_total = int(
+            char_gt_readiness.get(
+                "expected_total_plates",
+                gate_current_plates,
+            )
+            or 0
+        )
+        gt_count = int(
+            char_gt_readiness.get("gt_plates", 0) or 0
+        )
+        gt_ready = bool(
+            char_gt_readiness.get("gt_complete", False)
+        )
+        approve_hint_table_rows.append(
+            (
+                "GT numerów tablic",
+                f"{gt_count}/{gt_expected_total}",
+                "success" if gt_ready else "warning",
+            )
+        )
     elif project_active and approval_iteration_target == "char" and (current_step >= 3 or repair_mode):
         if graph_gate_is_t06:
             approve_context_text = (
@@ -2464,6 +2618,8 @@ def _refresh_step2_action_states(self, *, lightweight: bool = False):
             logger.debug(f"Nie udało się wymusić prawego panelu bramki grafu Z2: {exc}")
 
 def _start_annotation(self):
+    from .z2_preview_autosave import wait_for_pending_save
+    wait_for_pending_save(self)
     route = self._get_workflow_route()
     manual_entry_mode = self._get_manual_entry_mode()
     try:
@@ -2545,7 +2701,9 @@ def _start_annotation(self):
                 source_plan = self._collect_campaign_auto_annotation_sources(
                     effective_input_dir,
                     include_previous=(bool(self.campaign_reuse_manual_var.get()) if not manual_template else False),
-                    exclude_manual_touched=True,
+                    # Protection is selected in the scope modal. Filtering here
+                    # made disabling it unable to include imported/manual rows.
+                    exclude_manual_touched=bool(route != "auto" or manual_template),
                 )
                 pending_images = list(source_plan.get("image_paths") or [])
                 self._pending_source_image_map = dict(source_plan.get("image_map") or {})
@@ -2750,9 +2908,12 @@ def _start_annotation(self):
                 filenames=[Path(path).name for path in selected_scope_paths],
             )
         if route == "auto":
+            use_vehicle = bool((scope_selection or {}).get(
+                "use_vehicle", self._get_auto_vehicle_choice() == "use"
+            ))
             mode_text = (
                 "C: Pojazdy + tablice"
-                if self._get_auto_vehicle_choice() == "use"
+                if use_vehicle
                 else "B: Tylko tablice"
             )
             self.mode_var.set(mode_text)
@@ -2786,6 +2947,7 @@ def _start_annotation(self):
         self._manual_review_export_ready = False
         self._current_run_manual_template = manual_template
         self._current_run_manual_vehicle_assist = manual_vehicle_assist
+        self._current_run_vehicle_assist = bool(self._mode_uses_vehicle(mode_text) and not manual_template)
         safe_output_dir = self._coerce_annotation_output_dir(self.output_dir_var.get())
         self.output_dir_var.set(str(safe_output_dir))
         app = getattr(self, "app", None)
@@ -2873,8 +3035,10 @@ def _start_annotation(self):
         # the UI before the replacement annotations exist.
 
         if not manual_template:
-            live_manual_bundle = self._get_current_campaign_manual_preview_bundle()
-            self._campaign_auto_pre_run_snapshot = self._get_current_campaign_preview_snapshot()
+            approved_snapshot = set(self._get_preview_approved_filenames())
+            # The full rollback view below already owns an independent copy.
+            # A second full snapshot repeated IO and cloning of every image.
+            self._campaign_auto_pre_run_snapshot = {}
             self._campaign_auto_pre_run_visible_state = {
                 "annotations": copy.deepcopy(list(getattr(self, "current_annotations", []) or [])),
                 "image_map": dict(getattr(self, "_preview_image_path_map", {}) or {}),
@@ -2883,7 +3047,7 @@ def _start_annotation(self):
                 "input_dir": str(getattr(self, "current_input_dir", "") or ""),
                 "last_staging_run_dir": str(getattr(self, "last_staging_run_dir", "") or ""),
                 "preview_index": getattr(self, "current_preview_index", None),
-                "approved_filenames": set(self._get_preview_approved_filenames()),
+                "approved_filenames": set(approved_snapshot),
                 "campaign_pending_approved": set(getattr(self, "_campaign_pending_approved_filenames", set()) or set()),
                 "hidden_project_approved": set(getattr(self, "_campaign_hidden_project_approved_filenames", set()) or set()),
                 "hidden_char_effective": set(getattr(self, "_campaign_hidden_char_effective_filenames", set()) or set()),
@@ -2894,27 +3058,48 @@ def _start_annotation(self):
                 "input_dir": str(getattr(self, "current_input_dir", "") or ""),
                 "image_map": dict(getattr(self, "_preview_image_path_map", {}) or {}),
                 "preview_index": getattr(self, "current_preview_index", None),
-                "approved_filenames": set(self._get_preview_approved_filenames()),
+                "approved_filenames": set(approved_snapshot),
                 "campaign_pending_approved": set(getattr(self, "_campaign_pending_approved_filenames", set()) or set()),
             }
+            if self._campaign_auto_pre_run_visible_state["annotations"]:
+                protected_names = (scope_selection or {}).get("protected_filenames")
+                if protected_names is None:
+                    protected_names = self._get_preview_auto_scope_protected_filenames()
+                live_manual_bundle = protected_view_bundle(
+                    self._campaign_auto_pre_run_visible_state, set(protected_names),
+                    build_manual_override=self._build_manual_override_annotation,
+                )
+            else:
+                live_manual_bundle = self._get_current_campaign_manual_preview_bundle()
             persisted_overlay_bundle = dict(getattr(self, "_campaign_auto_manual_overlay_bundle", {}) or {})
             self._campaign_auto_manual_overlay_bundle = (
                 live_manual_bundle
                 if live_manual_bundle
                 else persisted_overlay_bundle
             )
+            # A selected image may intentionally overwrite a protected plate.
+            # Do not merge its old detections back over the new model result.
+            selected_names = {
+                Path(path).name.lower() for path in (scope_selection or {}).get("image_paths", [])
+            }
+            self._campaign_auto_manual_overlay_bundle = {
+                name: payload for name, payload in self._campaign_auto_manual_overlay_bundle.items()
+                if str(name).strip().lower() not in selected_names
+            }
             self._pending_preview_approved_filenames = set(
-                self._get_preview_approved_filenames()
+                approved_snapshot
             ) | set(
                 str(name or "").strip().lower()
                 for name in set(getattr(self, "_campaign_pending_approved_filenames", set()) or set())
                 if str(name or "").strip()
             )
+            if not bool((scope_selection or {}).get("protect_existing", True)):
+                self._pending_preview_approved_filenames.difference_update(selected_names)
             self._append_z2_trace(
                 "start-snapshot",
                 (
                     f"protected={len(dict(getattr(self, '_campaign_auto_manual_overlay_bundle', {}) or {}))} "
-                    f"full={len(dict(getattr(self, '_campaign_auto_pre_run_snapshot', {}) or {}))} "
+                    f"full={len(self._campaign_auto_pre_run_visible_state['annotations'])} "
                     f"approved={len(set(getattr(self, '_pending_preview_approved_filenames', set()) or set()))} "
                     f"route={route} manual_template={int(bool(manual_template))}"
                 ),
@@ -3490,6 +3675,29 @@ def _approve_annotation_stage(self, *, _run_deferred: bool = False):
             )
         _approval_mark("approved_counts")
 
+        if approval_iteration_target == "char":
+            try:
+                char_gt_state = dict(
+                    build_char_gt_readiness(
+                        self,
+                        run_dir=staging_run,
+                        force_parse_xml=False,
+                    )
+                    or {}
+                )
+            except Exception:
+                char_gt_state = {}
+
+            gt_count = int(char_gt_state.get("gt_plates", 0) or 0)
+            gt_total = max(
+                int(char_gt_state.get("total_plates", 0) or 0),
+                int(cumulative_char_approved_plates or 0),
+            )
+            gt_missing = max(
+                int(char_gt_state.get("missing_gt", 0) or 0),
+                max(0, int(gt_total) - int(gt_count)),
+            )
+
         if approval_total_plates <= 0 and not (
             (approval_iteration_target == "plate" and cumulative_plate_gate_ready)
             or (approval_iteration_target == "char" and cumulative_char_gate_ready)
@@ -4044,6 +4252,15 @@ def _process_thread(
                 logger.debug(f"Nie udało się dołączyć ręcznych poprawek do wyniku runu auto Z2: {e}")
         
         pending_image_path_map = dict(getattr(self, "_pending_source_image_map", {}) or {})
+        if not manual_template:
+            annotations, pending_image_path_map = merge_completed_view(
+                annotations, pending_image_path_map,
+                dict(getattr(self, "_campaign_auto_pre_run_visible_state", {}) or {}),
+            )
+        if not manual_template and getattr(self, "_current_run_vehicle_assist", None) is False:
+            removed = remove_vehicle_assistance(annotations)
+            if removed:
+                logger.info("[Z2 AUTO] Asysta wyłączona: pominięto %s wcześniejszych ramek pojazdów.", removed)
 
         run_dir = self._allocate_annotation_run_dir(base_out_dir)
         cvat_xml_path = run_dir / "annotations.xml"
@@ -4064,7 +4281,9 @@ def _process_thread(
             if manual_template
             else "Zapisywanie cache autoanotacji (auto_annotation_cache.xml)..."
         )
-        export_only_successful = bool(not manual_template and self._is_free_mode_session_context())
+        # Persist the same full result published in Z2, including empty/error
+        # rows. Otherwise reopening a run would lose rows shown after completion.
+        export_only_successful = False
         export_xml_path = cache_xml_path if cache_xml_path is not None else cvat_xml_path
         CVATExporter().export(
             annotations,
@@ -4165,16 +4384,6 @@ def _process_thread(
         except Exception as e:
             logger.debug(f"Nie udało się przywrócić stanu Kroku 2 z gotowego runu Z2: {e}")
 
-        try:
-            self._post_to_ui(
-                lambda run_dir=run_dir, manual_template=manual_template: self._finalize_successful_annotation_run_ui(
-                    run_dir,
-                    manual_template=manual_template,
-                )
-            )
-        except Exception as e:
-            logger.debug(f"Nie udało się zaplanować odświeżenia UI po zakończeniu Z2: {e}")
-
         logger.info(f"[OK] {message}")
         
     except KeyboardInterrupt:
@@ -4205,11 +4414,34 @@ def _process_thread(
         success = False
     finally:
         try:
-            self._post_to_ui(lambda: self._finish(success, message))
+            self._post_to_ui(lambda: self._finish(
+                success, message, run_dir=run_dir if success else None,
+                manual_template=manual_template,
+            ))
         except Exception:
             pass
 
-def _finish(self, success, msg):
+def _refresh_campaign_dashboard_when_visible(campaign_tab):
+    frame = campaign_tab.frame
+    if frame.winfo_viewable():
+        campaign_tab._refresh_dashboard()
+        return
+    if getattr(campaign_tab, "_z2_dashboard_refresh_binding", None):
+        return
+
+    def on_map(event):
+        if event.widget is not frame:
+            return
+        binding = campaign_tab._z2_dashboard_refresh_binding
+        campaign_tab._z2_dashboard_refresh_binding = None
+        if binding:
+            frame.unbind("<Map>", binding)
+        frame.after_idle(campaign_tab._refresh_dashboard)
+
+    campaign_tab._z2_dashboard_refresh_binding = frame.bind("<Map>", on_map, add="+")
+
+
+def _finish(self, success, msg, *, run_dir=None, manual_template=False):
     stop_requested = bool(getattr(self, "_annotation_stop_requested", False))
     self.is_processing = False
     self._annotation_stop_requested = False
@@ -4239,6 +4471,12 @@ def _finish(self, success, msg):
         self.app.end_exclusive_operation("z2.annotation.run")
     else:
         self.app.set_processing(False)
+    if success and run_dir is not None:
+        # Tk ignores listbox delete/insert while disabled. Unlock first, then
+        # publish the worker's complete in-memory result exactly once.
+        self._finalize_successful_annotation_run_ui(
+            Path(run_dir), manual_template=manual_template, result_loaded=True,
+        )
     self.start_btn.config(state=tk.NORMAL)
     self.stop_btn.config(state=tk.DISABLED)
     try:
@@ -4288,7 +4526,9 @@ def _finish(self, success, msg):
             and self._get_workflow_route() == "manual"
             and self._get_manual_entry_mode() == "new"
         )
-        hold_manual_template_on_start = bool(manual_template_free_mode_new_run)
+        # New free-mode manual runs move straight into correction after the
+        # primary "Rozpocznij anotację" action. No intermediate "Dalej" gate.
+        hold_manual_template_on_start = False
         self._last_completed_workflow_route = self._get_workflow_route() or (
             "manual" if manual_template_success else "auto"
         )
@@ -4326,7 +4566,7 @@ def _finish(self, success, msg):
                 if staging_total_plates > 0:
                     self.approve_btn.config(state=tk.NORMAL)
                 if "campaign" in self.app.tabs:
-                    self.app.tabs["campaign"]._refresh_dashboard()
+                    _refresh_campaign_dashboard_when_visible(self.app.tabs["campaign"])
         except Exception as e:
             logger.debug(f"Nie udalo sie zaktualizowac stanu kroku 2: {e}")
 
@@ -4336,7 +4576,7 @@ def _finish(self, success, msg):
         if manual_template_free_mode_new_run:
             try:
                 self._schedule_left_panel_scroll_to_widget(
-                    getattr(self, "workflow_start_section", None)
+                    getattr(self, "manual_stage_section", None)
                     or getattr(self, "actions_section", None),
                     delay_ms=80,
                 )
@@ -4350,29 +4590,9 @@ def _finish(self, success, msg):
             except Exception:
                 pass
             if manual_template_free_mode_new_run:
-                try:
-                    parent_window = self.frame.winfo_toplevel()
-                except Exception:
-                    parent_window = getattr(self.app, "root", None)
-
-                def _show_manual_xml_success_dialog():
-                    messagebox.showinfo(
-                        "XML anotacji utworzony",
-                        (
-                            "Utworzono nowy run ręcznej anotacji Z2 oraz plik annotations.xml.\n\n"
-                            "Etap wejścia jest gotowy. Kliknij Dalej w karcie, aby przejść do kroku "
-                            "„Korekta i decyzja po anotacji ręcznej”. Tam wykonasz właściwą pracę na tablicach.\n\n"
-                            "Warunek dalszych akcji: narysuj lub popraw ramkę/poligon tablicy na co najmniej "
-                            "jednym obrazie, zapisz anotację i nadaj temu obrazowi status [OK]. Dopiero wtedy "
-                            "aktywują się akcje „Wyodrębnij tablice” oraz „Eksport”."
-                        ),
-                        parent=parent_window,
-                    )
-
-                try:
-                    self.frame.after_idle(_show_manual_xml_success_dialog)
-                except Exception:
-                    _show_manual_xml_success_dialog()
+                # The UI is already on "Korekta i decyzja"; a modal asking for
+                # another "Dalej" would reintroduce the obsolete two-gate flow.
+                pass
             elif not manual_template_success:
                 try:
                     self.frame.after_idle(
@@ -4508,6 +4728,21 @@ def _switch_annotation_input_dir(self, input_dir: Path, *, show_hint: bool = Tru
     if not self._ensure_preview_edits_saved("zmiana puli obrazow Z2"):
         return False
 
+    if free_mode_context:
+        try:
+            from . import z2_gt_companion_flow
+
+            z2_gt_companion_flow.prepare_free_mode_gt_binding(
+                self,
+                resolved_input_dir,
+                parent=getattr(self, "frame", None),
+            )
+        except Exception as exc:
+            # GT is optional metadata and must never block Z2 work.
+            logger.debug(
+                f"Nie udało się przygotować opcjonalnego GT companion dla free mode: {exc}"
+            )
+
     defer_heavy_source_refresh = bool(free_mode_context and current_route == "auto")
 
     if free_mode_context:
@@ -4572,7 +4807,7 @@ def _switch_annotation_input_dir(self, input_dir: Path, *, show_hint: bool = Tru
 
         if current_manual_entry_mode == "new":
             if free_mode_context:
-                self._set_workflow_step("manual_input", refresh_detection_ui=True)
+                self._set_workflow_step("manual_start", refresh_detection_ui=True)
                 return True
             self._set_workflow_step("manual_start")
         else:

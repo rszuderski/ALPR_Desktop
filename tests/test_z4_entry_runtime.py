@@ -311,3 +311,105 @@ def test_pending_profile_prevents_applying_incomplete_gpu_recommendation():
     host._apply_training_recommended_start_params()
     assert host.batch_var.get() == 7
     host._resolve_selected_training_base_model_profile.assert_not_called()
+
+
+
+def test_z4_train_entry_restores_existing_history_after_restart():
+    import ast
+    from pathlib import Path
+    import auto_annotation_tool.gui.z4_train_tab_builder as train_builder
+    import auto_annotation_tool.gui.z4_campaign_flow as campaign_flow
+
+    builder_source = Path(train_builder.__file__).read_text(encoding="utf-8-sig")
+    builder_tree = ast.parse(builder_source)
+    builder_fn = next(
+        node for node in builder_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_build_train_tab"
+    )
+    builder_body = ast.get_source_segment(builder_source, builder_fn) or ""
+    assert "self._load_history()" in builder_body
+    assert "self._refresh_campaign_training_result_selector()" in builder_body
+
+    flow_source = Path(campaign_flow.__file__).read_text(encoding="utf-8-sig")
+    flow_tree = ast.parse(flow_source)
+    flow_fn = next(
+        node for node in flow_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "open_campaign_step4_entry"
+    )
+    flow_body = ast.get_source_segment(flow_source, flow_fn) or ""
+    assert "host._load_history()" in flow_body
+    assert "host._refresh_campaign_training_result_selector()" in flow_body
+
+def test_t06_selector_always_follows_pinned_run_even_when_old_choice_is_still_valid():
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    from auto_annotation_tool.gui import z4_training_runtime as runtime
+
+    class Var:
+        def __init__(self, value=""):
+            self.value = value
+        def get(self):
+            return self.value
+        def set(self, value):
+            self.value = value
+
+    old_run = SimpleNamespace(id="20260929_112740")
+    new_run = SimpleNamespace(id="20260929_121300")
+    old_label = "MZ-old | run TRN-old"
+    new_label = "MZ-new | run TRN-new"
+
+    selector = Mock()
+    selector.winfo_exists.return_value = True
+    history = SimpleNamespace(
+        get_run=lambda run_id: {
+            old_run.id: old_run,
+            new_run.id: new_run,
+        }.get(run_id)
+    )
+    host = SimpleNamespace(
+        campaign_training_result_entry=selector,
+        campaign_training_result_var=Var(old_label),
+        app=SimpleNamespace(palette={}),
+        history=history,
+        get_campaign_step4_finish_state=lambda **_kwargs: {
+            "ready": True,
+            "run_id": new_run.id,
+            "target": "char",
+        },
+    )
+
+    with patch.object(runtime.CAMPAIGN, "get_active_project_name", return_value="AZ007C3_TARGET"), \
+         patch.object(runtime, "_campaign_training_result_candidates", return_value=[new_run, old_run]), \
+         patch.object(
+             runtime,
+             "_campaign_training_result_choice_label",
+             side_effect=lambda _self, run: new_label if run.id == new_run.id else old_label,
+         ), \
+         patch.object(runtime, "_campaign_training_result_target", return_value="char"), \
+         patch.object(runtime, "_campaign_training_result_detail_text", return_value=""):
+        runtime._refresh_campaign_training_result_selector(host)
+
+    assert host.campaign_training_result_var.get() == new_label
+
+
+
+def test_cockpit_pinned_t06_has_priority_over_training_readiness_copy():
+    import ast
+    from pathlib import Path
+    import auto_annotation_tool.gui.z4_training_metrics as training_metrics
+
+    source = Path(training_metrics.__file__).read_text(encoding="utf-8-sig")
+    tree = ast.parse(source)
+    fn = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_build_training_cockpit_summary"
+    )
+    body = ast.get_source_segment(source, fn) or ""
+
+    pinned_pos = body.index('status = "Wynik T06 wybrany"')
+    ready_pos = body.index('status = "Gotowe do startu"')
+    fill_pos = body.index('status = "Uzupełnij model"')
+
+    assert pinned_pos < ready_pos < fill_pos
+    assert 'subtitle = "Model wynikowy jest przypięty. Wróć do bramki T06 i zakończ decyzję."' in body
+    assert 'tone = "success"' in body[pinned_pos:ready_pos]

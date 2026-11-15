@@ -10,7 +10,7 @@ import math
 import random
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from ..config import CONFIG, PIL_AVAILABLE, cv2, np
 from ..training import (
@@ -23,7 +23,6 @@ from ..training import (
     get_augmentation_presets_dir,
     get_albumentations_status,
     load_augmentation_preset,
-    manual_randomness_group_specs,
     normalize_augmentation_randomness_mode,
     normalize_relief_profile_curve,
     normalize_relief_profile_preset,
@@ -43,6 +42,42 @@ try:
 except Exception:
     psutil = None
 
+
+def _choose_range_slider_handle(
+    min_x: float,
+    max_x: float,
+    click_x: float,
+    *,
+    origin_x: float | None = None,
+    dragging: bool = False,
+    overlap_px: float = 3.0,
+) -> str | None:
+    """Wybierz uchwyt zakresu także wtedy, gdy oba uchwyty się pokrywają.
+
+    Gdy min==max, samo "najbliższy uchwyt" jest nierozstrzygalne i dawniej
+    zawsze wygrywał min. Wtedy przy wartości 0.0 nie dało się już rozsunąć
+    zakresu w prawo. Przy nakładaniu decyzję podejmujemy z kierunku pierwszego
+    ruchu myszy: lewo=min, prawo=max.
+    """
+    min_x = float(min_x)
+    max_x = float(max_x)
+    click_x = float(click_x)
+    if abs(max_x - min_x) > float(overlap_px):
+        return "min" if abs(click_x - min_x) <= abs(click_x - max_x) else "max"
+
+    shared_x = (min_x + max_x) * 0.5
+    if dragging and origin_x is not None:
+        delta = click_x - float(origin_x)
+        if delta > 0.75:
+            return "max"
+        if delta < -0.75:
+            return "min"
+
+    if click_x > shared_x + float(overlap_px):
+        return "max"
+    if click_x < shared_x - float(overlap_px):
+        return "min"
+    return None
 
 class Step4AugmentationModal:
     """Single modal with settings and side-by-side visual preview."""
@@ -211,7 +246,17 @@ class Step4AugmentationModal:
         self.scene_view_yaw_var = tk.DoubleVar(value=0.0)
         self.scene_view_pitch_var = tk.DoubleVar(value=89.0)
         self.scene_view_roll_var = tk.DoubleVar(value=0.0)
-        self.scene_plate_texture_var = tk.BooleanVar(value=bool(getattr(self.initial_profile, "scene_plate_texture_enabled", True)))
+        # Zakres zawartości:
+        # - target="plate" => MT, czyli pełne zdjęcie/scena z pojazdem,
+        # - target="char"  => MZ, czyli wycięta tablica.
+        # Tekstura/płaszczyzna tablicy ma sens tylko dla cropu tablicy.
+        self.scene_plate_texture_var = tk.BooleanVar(
+            value=(
+                bool(getattr(self.initial_profile, "scene_plate_texture_enabled", True))
+                if self.target != "plate"
+                else False
+            )
+        )
 
         def _default_plate_world(norm_x: float, norm_y: float, scale: float = 1.0) -> tuple[float, float]:
             plate_w = max(0.25, min(3.0, float(self.scene_plate_width_var.get() or 1.0)))
@@ -367,6 +412,14 @@ class Step4AugmentationModal:
         self._raw_preview_request_id = 0
         self._raw_preview_worker_running = False
         self._raw_preview_pending = False
+
+        # Pełny render efektu jest kosztowny. Nie wykonujemy go w głównej
+        # pętli Tk; kolejne szybkie zmiany suwaków są koaleskowane.
+        self._effect_preview_request_id = 0
+        self._effect_preview_worker_running = False
+        self._effect_preview_pending = False
+        self._effect_preview_pending_job = None
+
         self._vector_tool: str | None = None
         self._vector_drag_start: tuple[int, int] | None = None
         self._vector_drag_end: tuple[int, int] | None = None
@@ -403,7 +456,9 @@ class Step4AugmentationModal:
         self._scene_pan_drag: dict | None = None
         self._scene_projection_active: str = "xy"
         self._scene_viewport_mode: str = "xy"
-        self._scene_viewport_visible: bool = True
+        # Model 3D powierzchni tablicy jest wyłącznie narzędziem cropu MZ.
+        # Dla MT podgląd pozostaje zwykłym pełnym obrazem.
+        self._scene_viewport_visible: bool = self.target != "plate"
         self._scene_view_rotation_matrix: tuple[tuple[float, float, float], ...] | None = None
         self._scene_view_rotation_key: tuple[float, float, float] | None = None
         self._scene_view_pan_x = 0.0
@@ -894,7 +949,7 @@ class Step4AugmentationModal:
         self.randomness_combo.pack(side=tk.LEFT)
         ttk.Button(
             randomness_box,
-            text="Odchylki",
+            text="Odchyłki serii",
             command=self._open_manual_randomness_modal,
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
@@ -945,7 +1000,7 @@ class Step4AugmentationModal:
             ("soft", "Łagodny"),
             ("realistic", "Realistyczny"),
             ("wide", "Agresywny"),
-            ("manual", "Reczny"),
+            ("manual", "Ręczny"),
         )
 
     def _randomness_mode_to_label(self, mode: object) -> str:
@@ -996,135 +1051,13 @@ class Step4AugmentationModal:
                 pass
 
     def _open_manual_randomness_modal(self):
-        config = self._manual_randomness_config_for_profile()
-        window = tk.Toplevel(self.window)
-        window.title("Reczne odchylki augmentacji")
-        window.transient(self.window)
-        window.resizable(True, True)
-        self._center_child_window(window, 760, 640)
+        from .z4_randomness_modal import RandomnessModal
 
-        shell = ttk.Frame(window, padding=12)
-        shell.grid(row=0, column=0, sticky=tk.NSEW)
-        window.columnconfigure(0, weight=1)
-        window.rowconfigure(0, weight=1)
-        shell.columnconfigure(0, weight=1)
-        shell.rowconfigure(1, weight=1)
-
-        intro = ttk.Label(
-            shell,
-            text=(
-                "Ustaw, ktore grupy efektow i ktore cechy moga losowo odchylac sie "
-                "od profilu bazowego. 0% blokuje odchylke, 100% daje pelny zakres presetu."
-            ),
-            wraplength=700,
-            justify=tk.LEFT,
-        )
-        intro.grid(row=0, column=0, sticky=tk.EW, pady=(0, 10))
-
-        canvas = tk.Canvas(shell, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=canvas.yview)
-        body = ttk.Frame(canvas)
-        body_id = canvas.create_window((0, 0), window=body, anchor=tk.NW)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=1, column=0, sticky=tk.NSEW)
-        scrollbar.grid(row=1, column=1, sticky=tk.NS)
-        body.columnconfigure(0, weight=1)
-
-        def _sync_scrollregion(_event=None):
-            try:
-                canvas.configure(scrollregion=canvas.bbox("all"))
-                canvas.itemconfigure(body_id, width=max(1, int(canvas.winfo_width())))
-            except Exception:
-                pass
-
-        body.bind("<Configure>", _sync_scrollregion, add="+")
-        canvas.bind("<Configure>", _sync_scrollregion, add="+")
-
-        variables: dict[str, dict] = {}
-
-        def _make_percent_row(parent, row: int, label: str, enabled_var, amount_var, *, disabled: bool = False):
-            state = tk.DISABLED if disabled else tk.NORMAL
-            ttk.Checkbutton(parent, variable=enabled_var, state=state).grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-            ttk.Label(parent, text=label).grid(row=row, column=1, sticky=tk.W, padx=(0, 8), pady=2)
-            value_lbl = ttk.Label(parent, text=f"{float(amount_var.get() or 0.0):.0f}%", width=5, anchor=tk.E)
-            slider = ttk.Scale(parent, from_=0, to=100, variable=amount_var, orient=tk.HORIZONTAL, state=state)
-            slider.grid(row=row, column=2, sticky=tk.EW, padx=(0, 8), pady=2)
-            value_lbl.grid(row=row, column=3, sticky=tk.E, pady=2)
-
-            def _refresh_label(*_args):
-                try:
-                    value_lbl.configure(text=f"{float(amount_var.get() or 0.0):.0f}%")
-                except Exception:
-                    pass
-
-            amount_var.trace_add("write", _refresh_label)
-
-        for group_index, spec in enumerate(manual_randomness_group_specs(self.target)):
-            group_key = str(spec.get("key") or "")
-            group_state = (config.get("groups") or {}).get(group_key, {})
-            frame = ttk.LabelFrame(body, text=str(spec.get("label") or group_key), padding=10)
-            frame.grid(row=group_index, column=0, sticky=tk.EW, pady=(0, 10))
-            frame.columnconfigure(2, weight=1)
-            applicable = bool(spec.get("applicable", True))
-            enabled_var = tk.BooleanVar(value=bool(group_state.get("enabled")) and applicable)
-            amount_var = tk.DoubleVar(value=float(group_state.get("amount", 100.0) if applicable else 0.0))
-            variables[group_key] = {"enabled": enabled_var, "amount": amount_var, "fields": {}}
-            _make_percent_row(
-                frame,
-                0,
-                "Cala grupa",
-                enabled_var,
-                amount_var,
-                disabled=not applicable,
-            )
-            note = str(spec.get("note") or "")
-            if note:
-                ttk.Label(frame, text=note, wraplength=660, justify=tk.LEFT).grid(row=1, column=0, columnspan=4, sticky=tk.EW, pady=(0, 6))
-            start_row = 2
-            raw_fields = group_state.get("fields", {}) if isinstance(group_state.get("fields"), dict) else {}
-            for field_index, field_spec in enumerate(spec.get("fields", [])):
-                field_key = str(field_spec.get("key") or "")
-                field_state = raw_fields.get(field_key, {}) if isinstance(raw_fields, dict) else {}
-                field_enabled = tk.BooleanVar(value=bool(field_state.get("enabled", True)) and applicable)
-                field_amount = tk.DoubleVar(value=float(field_state.get("amount", 100.0) if applicable else 0.0))
-                variables[group_key]["fields"][field_key] = {"enabled": field_enabled, "amount": field_amount}
-                _make_percent_row(
-                    frame,
-                    start_row + field_index,
-                    str(field_spec.get("label") or field_key),
-                    field_enabled,
-                    field_amount,
-                    disabled=not applicable,
-                )
-
-        footer = ttk.Frame(shell)
-        footer.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
-        footer.columnconfigure(0, weight=1)
-
-        def _apply():
-            groups = {}
-            for group_key, group_vars in variables.items():
-                field_values = {}
-                for field_key, field_vars in group_vars["fields"].items():
-                    field_values[field_key] = {
-                        "enabled": bool(field_vars["enabled"].get()),
-                        "amount": float(field_vars["amount"].get() or 0.0),
-                    }
-                groups[group_key] = {
-                    "enabled": bool(group_vars["enabled"].get()),
-                    "amount": float(group_vars["amount"].get() or 0.0),
-                    "fields": field_values,
-                }
-            self._manual_randomness = normalize_manual_randomness_config(
-                {"target": self.target, "groups": groups},
-                self.target,
-            )
-            self.randomness_mode_var.set(self._randomness_mode_to_label("manual"))
-            self._refresh_preview(redraw_only=True)
-            window.destroy()
-
-        ttk.Button(footer, text="Anuluj", command=window.destroy).pack(side=tk.RIGHT)
-        ttk.Button(footer, text="Zastosuj odchylki", command=_apply).pack(side=tk.RIGHT, padx=(0, 8))
+        current = getattr(self, "_manual_randomness_dialog", None)
+        if current is not None and not current.closed:
+            current.focus()
+            return current
+        return RandomnessModal(self)
 
     def _profile_var_bindings(self) -> tuple[tuple[str, object], ...]:
         return (
@@ -1287,6 +1220,9 @@ class Step4AugmentationModal:
         self._refresh_preview(redraw_only=True)
 
     def _augmentation_preset_initial_dir(self) -> Path:
+        previous_path = getattr(self, "_augmentation_preset_path", None)
+        if previous_path is not None and Path(previous_path).parent.is_dir():
+            return Path(previous_path).parent.resolve()
         try:
             path = get_augmentation_presets_dir(self.target)
         except Exception:
@@ -1321,28 +1257,35 @@ class Step4AugmentationModal:
             messagebox.showerror("Nie mozna wczytac presetu", f"Plik nie zawiera poprawnego presetu augmentacji:\n{exc}", parent=self.window)
             return
         self._apply_profile_to_vars(profile)
+        self._augmentation_preset_path = Path(path)
         messagebox.showinfo("Preset wczytany", "Ustawienia augmentacji zostaly wczytane do modala.", parent=self.window)
 
     def _save_augmentation_profile_to_preset(self):
-        default_name = f"aug_{self.target}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        name = simpledialog.askstring(
-            "Zapisz preset augmentacji",
-            "Nazwa presetu:",
-            initialvalue=default_name,
+        previous_path = getattr(self, "_augmentation_preset_path", None)
+        default_name = Path(previous_path).name if previous_path else f"aug_{self.target}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        selected = filedialog.asksaveasfilename(
             parent=self.window,
+            title="Zapisz profil ustawień jako",
+            initialdir=str(self._augmentation_preset_initial_dir()),
+            initialfile=default_name,
+            defaultextension=".json",
+            filetypes=(("Profile ustawień (JSON)", "*.json"), ("Wszystkie pliki", "*.*")),
+            confirmoverwrite=True,
         )
-        if not name:
+        if not selected:
             return
         try:
             path = save_augmentation_preset(
                 self._profile_from_vars(),
-                name,
+                Path(selected).stem,
                 target=self.target,
+                destination=Path(selected),
             )
         except Exception as exc:
-            messagebox.showerror("Nie mozna zapisac presetu", f"Nie udalo sie zapisac presetu augmentacji:\n{exc}", parent=self.window)
+            messagebox.showerror("Nie można zapisać profilu", f"Nie udało się zapisać profilu ustawień:\n{exc}", parent=self.window)
             return
-        messagebox.showinfo("Preset zapisany", f"Preset zapisano w:\n{path}", parent=self.window)
+        self._augmentation_preset_path = Path(path)
+        messagebox.showinfo("Profil zapisany", f"Profil ustawień zapisano w:\n{path}", parent=self.window)
 
     def _domain_intro_text(self) -> str:
         if self.target != "plate":
@@ -1691,7 +1634,7 @@ class Step4AugmentationModal:
             if key != previous_key:
                 self._toolbox_panel_scroll = 0.0
         scene_visibility_changed = False
-        desired_scene_visible = True
+        desired_scene_visible = self.target != "plate"
         if bool(getattr(self, "_scene_viewport_visible", False)) != desired_scene_visible:
             self._scene_viewport_visible = desired_scene_visible
             scene_visibility_changed = True
@@ -1857,7 +1800,7 @@ class Step4AugmentationModal:
             else:
                 self._add_inspector_spin(shell, row, str(field["label"]), field["var"], field["from"], field["to"], field["step"], field.get("width", 8))
             row += 1
-        if active_toolbox == "illumination":
+        if active_toolbox == "illumination" and self.target != "plate":
             row = self._render_headlight_inspector_section(shell, row)
         self._schedule_pending_inspector_scroll()
         if fields or active_toolbox == "illumination":
@@ -2585,7 +2528,11 @@ class Step4AugmentationModal:
             cursor="sb_h_double_arrow",
         )
         canvas.grid(row=2, column=0, sticky=tk.EW, pady=(3, 0))
-        drag_state = {"handle": None}
+        drag_state = {
+            "handle": None,
+            "origin_x": None,
+            "overlap": False,
+        }
 
         try:
             start = float(from_)
@@ -2658,7 +2605,15 @@ class Step4AugmentationModal:
                 handle = forced_handle or drag_state.get("handle")
                 if handle not in ("min", "max"):
                     click_x = float(getattr(event, "x", 0.0) or 0.0)
-                    handle = "min" if abs(click_x - min_x) <= abs(click_x - max_x) else "max"
+                    handle = _choose_range_slider_handle(
+                        min_x,
+                        max_x,
+                        click_x,
+                        origin_x=drag_state.get("origin_x"),
+                        dragging=bool(drag_state.get("overlap")),
+                    )
+                    if handle not in ("min", "max"):
+                        return "break"
                     drag_state["handle"] = handle
                 value = _x_to_value(float(getattr(event, "x", 0.0) or 0.0), left, right)
                 if handle == "min":
@@ -2687,18 +2642,73 @@ class Step4AugmentationModal:
 
         def press(event):
             begin_live_edit()
-            return set_from_event(event, schedule=False)
+            try:
+                width_px = max(120, int(canvas.winfo_width() or 280))
+                left = 15.0
+                right = float(width_px - 15)
+                low_value, high_value = _read_values()
+                min_x = _value_to_x(low_value, left, right)
+                max_x = _value_to_x(high_value, left, right)
+                click_x = float(getattr(event, "x", 0.0) or 0.0)
+                drag_state["origin_x"] = click_x
+                drag_state["overlap"] = abs(max_x - min_x) <= 3.0
+                drag_state["handle"] = _choose_range_slider_handle(
+                    min_x,
+                    max_x,
+                    click_x,
+                    origin_x=click_x,
+                    dragging=False,
+                )
+                # Przy dokładnie nałożonych uchwytach czekamy na pierwszy ruch,
+                # żeby użytkownik mógł rozsunąć je w dowolną stronę.
+                if drag_state["overlap"] and drag_state["handle"] is None:
+                    return "break"
+                return set_from_event(
+                    event,
+                    forced_handle=drag_state.get("handle"),
+                    schedule=False,
+                )
+            except Exception:
+                return "break"
 
         def drag(event):
             begin_live_edit()
-            return set_from_event(event, schedule=False)
+            if bool(drag_state.get("overlap")) and drag_state.get("handle") not in ("min", "max"):
+                try:
+                    width_px = max(120, int(canvas.winfo_width() or 280))
+                    left = 15.0
+                    right = float(width_px - 15)
+                    low_value, high_value = _read_values()
+                    min_x = _value_to_x(low_value, left, right)
+                    max_x = _value_to_x(high_value, left, right)
+                    click_x = float(getattr(event, "x", 0.0) or 0.0)
+                    drag_state["handle"] = _choose_range_slider_handle(
+                        min_x,
+                        max_x,
+                        click_x,
+                        origin_x=drag_state.get("origin_x"),
+                        dragging=True,
+                    )
+                except Exception:
+                    pass
+            return set_from_event(
+                event,
+                forced_handle=drag_state.get("handle"),
+                schedule=False,
+            )
 
         def release(event=None):
             try:
-                if event is not None:
-                    set_from_event(event, schedule=False)
+                if event is not None and drag_state.get("handle") in ("min", "max"):
+                    set_from_event(
+                        event,
+                        forced_handle=drag_state.get("handle"),
+                        schedule=False,
+                    )
             finally:
                 drag_state["handle"] = None
+                drag_state["origin_x"] = None
+                drag_state["overlap"] = False
                 try:
                     canvas.grab_release()
                 except Exception:
@@ -4931,6 +4941,44 @@ class Step4AugmentationModal:
                 {"label": "Połysk mokrego błota", "type": "slider", "var": self.wet_mud_gloss_var, "from": 0.0, "to": 1.0, "step": 0.01},
             ]
         if key == "illumination":
+            if self.target == "plate":
+                return [
+                    {
+                        "type": "section",
+                        "label": "Oświetlenie pełnej sceny",
+                        "text": (
+                            "MT pracuje na całym zdjęciu pojazdu/sceny. "
+                            "Nie modelujemy tu powierzchni tablicy, reliefu znaków "
+                            "ani reflektorów ustawianych względem płaszczyzny tablicy."
+                        ),
+                        "priority": True,
+                    },
+                    {
+                        "label": "Noc",
+                        "type": "slider",
+                        "var": self.night_var,
+                        "from": 0.0,
+                        "to": 1.0,
+                        "step": 0.01,
+                    },
+                    {
+                        "label": "Światło bazowe",
+                        "type": "slider",
+                        "var": self.night_light_var,
+                        "from": 0.0,
+                        "to": 1.0,
+                        "step": 0.01,
+                        "hint": "Globalne doświetlenie całego obrazu; bez modelu powierzchni tablicy.",
+                    },
+                    {
+                        "label": "Barwa ambientu (zimna -> ciepła)",
+                        "type": "slider",
+                        "var": self.night_warmth_var,
+                        "from": 0.0,
+                        "to": 1.0,
+                        "step": 0.01,
+                    },
+                ]
             return [
                 {
                     "type": "section",
@@ -5016,7 +5064,83 @@ class Step4AugmentationModal:
                 ),
             ]
         if key == "rain":
+            if self.target == "plate":
+                return [
+                    {
+                        "type": "section",
+                        "label": "Pogoda pełnej sceny",
+                        "text": (
+                            "Efekty obejmują cały obraz. Nie używamy konturów znaków tablicy; "
+                            "opcjonalne kolizje deszczu korzystają z krawędzi całej sceny."
+                        ),
+                        "priority": True,
+                    },
+                    {
+                        "label": "Pokaż wykryte kontury sceny",
+                        "type": "check",
+                        "var": self.rain_edge_debug_var,
+                        "priority": True,
+                        "hint": "Podświetla wykryte krawędzie sceny używane do kolizji. Tylko podgląd — kontury nie są zapisywane do syntetyków.",
+                    },
+                    {"label": "Gęstość deszczu", "type": "slider", "var": self.rain_var, "from": 0.0, "to": 1.0, "step": 0.01},
+                    {
+                        "label": "Rozmiar kropli",
+                        "type": "range_slider",
+                        "min_var": self.rain_drop_size_min_var,
+                        "max_var": self.rain_drop_size_max_var,
+                        "from": 0.0,
+                        "to": 1.0,
+                        "step": 0.005,
+                    },
+                    {"label": "Alfa kropli", "type": "slider", "var": self.rain_alpha_var, "from": 0.0, "to": 1.0, "step": 0.01},
+                    {"label": "Soczewka kropli", "type": "slider", "var": self.rain_lens_var, "from": 0.0, "to": 1.0, "step": 0.01},
+                    {"label": "Pole wektorowe", "type": "slider", "var": self.rain_vector_field_var, "from": 0.0, "to": 1.0, "step": 0.01},
+                    {"label": "Wiry lokalne", "type": "slider", "var": self.rain_vortex_var, "from": 0.0, "to": 1.0, "step": 0.01},
+                    {
+                        "type": "section",
+                        "label": "Kolizje deszczu z konturami sceny",
+                        "text": (
+                            "Program wykrywa silne krawędzie całej sceny (pojazd, elementy nadwozia, "
+                            "krawężniki, przeszkody) i używa ich jako 2D-proxy powierzchni, na których "
+                            "krople mogą się rozbijać. To nie są kontury znaków tablicy."
+                        ),
+                    },
+                    {
+                        "label": "Czułość konturów sceny",
+                        "type": "slider",
+                        "var": self.contour_detection_sensitivity_var,
+                        "from": 0.0,
+                        "to": 1.0,
+                        "step": 0.01,
+                        "hint": "Wyższa wartość wykrywa także słabsze krawędzie; niższa zostawia tylko mocne kontury sceny.",
+                    },
+                    {
+                        "label": "Rozbryzg na konturach",
+                        "type": "slider",
+                        "var": self.rain_edge_mist_var,
+                        "from": 0.0,
+                        "to": 1.0,
+                        "step": 0.01,
+                        "hint": "0 wyłącza kolizje. Większa wartość dodaje więcej odprysków. Alfa jest dziedziczona po padającej kropli; nakładające się krople zwiększają lokalną gęstość.",
+                    },
+                    {
+                        "label": "Zasięg rozbryzgu",
+                        "type": "slider",
+                        "var": self.rain_edge_mist_radius_var,
+                        "from": 0.0,
+                        "to": 1.0,
+                        "step": 0.01,
+                        "hint": "Wysokość i szerokość parabolicznych torów odprysków. Krople po odbiciu opadają i zatrzymują się przy kolejnym kontakcie z konturem.",
+                    },
+                ]
             return [
+                {
+                    "label": "Pokaż wykryte kontury i profil",
+                    "type": "check",
+                    "var": self.rain_edge_debug_var,
+                    "priority": True,
+                    "hint": "Podgląd konturów znaków używanych przez reakcję deszczu. To ten sam przełącznik co w sekcji reliefu; nie zmienia zapisywanych obrazów.",
+                },
                 {"label": "Gęstość deszczu", "type": "slider", "var": self.rain_var, "from": 0.0, "to": 1.0, "step": 0.01},
                 {
                     "label": "Rozmiar kropli",
@@ -5039,25 +5163,25 @@ class Step4AugmentationModal:
                     "from": 0.0,
                     "to": 1.0,
                     "step": 0.01,
-                    "hint": "Widocznosc smugi swiatla w deszczu lub mgielce przy konturach. To nie jest samodzielne zrodlo swiatla.",
+                    "hint": "Widoczność smugi światła w padającym deszczu. Wymaga włączonego źródła światła; siła rozbryzgu nie zwiększa zamglenia sceny.",
                 },
                 {
-                    "label": "Mgiełka przy konturach",
+                    "label": "Rozbryzg na konturach",
                     "type": "slider",
                     "var": self.rain_edge_mist_var,
                     "from": 0.0,
                     "to": 1.0,
                     "step": 0.01,
-                    "hint": "To nie jest ogólna mgła sceny. Ten efekt symuluje drobną mgiełkę/rozbryzg tam, gdzie krople uderzają w wykryte kontury znaków lub krawędzi.",
+                    "hint": "0 wyłącza kolizje. Większa wartość dodaje więcej odprysków. Alfa jest dziedziczona po padającej kropli; nakładające się krople zwiększają lokalną gęstość.",
                 },
                 {
-                    "label": "Zasięg mgiełki",
+                    "label": "Zasięg rozbryzgu",
                     "type": "slider",
                     "var": self.rain_edge_mist_radius_var,
                     "from": 0.0,
                     "to": 1.0,
                     "step": 0.01,
-                    "hint": "Odległość rozproszenia od konturu trafionego kroplą. Większa wartość daje szerszą poświatę/mgiełkę wokół uderzonej krawędzi.",
+                    "hint": "Wysokość i szerokość parabolicznych torów odprysków. Krople po odbiciu opadają i zatrzymują się przy kolejnym kontakcie z konturem.",
                 },
             ]
         return []
@@ -5220,13 +5344,23 @@ class Step4AugmentationModal:
         rain_vortex = float(self.rain_vortex_var.get() or 0.0)
         rain_alpha = float(self.rain_alpha_var.get() or 0.0)
         rain_lens = float(self.rain_lens_var.get() or 0.0)
+        # Dla MT to nie jest już "mgiełka przy konturach znaków", tylko
+        # siła reakcji deszczu na wykryte krawędzie całej sceny.
         rain_edge_mist = float(self.rain_edge_mist_var.get() or 0.0)
         rain_edge_mist_radius = float(self.rain_edge_mist_radius_var.get() or 0.0)
-        tyndall_strength = float(self.tyndall_var.get() or 0.0)
+        tyndall_strength = (
+            0.0
+            if is_plate_dataset
+            else float(self.tyndall_var.get() or 0.0)
+        )
         if rain_drop_size_min > rain_drop_size_max:
             rain_drop_size_min, rain_drop_size_max = rain_drop_size_max, rain_drop_size_min
         rain_drop_size = (rain_drop_size_min + rain_drop_size_max) / 2.0
-        relief_strength = float(self.dark_relief_var.get() or 0.0)
+        relief_strength = (
+            0.0
+            if is_plate_dataset
+            else float(self.dark_relief_var.get() or 0.0)
+        )
         relief_profile_preset = normalize_relief_profile_preset(self.relief_profile_preset_var.get())
         relief_profile_curve = relief_profile_curve_for_preset(
             relief_profile_preset,
@@ -5238,7 +5372,11 @@ class Step4AugmentationModal:
         camera_z = max(0.35, min(4.0, self._read_float_var(self.scene_camera_z_var, 1.65)))
         camera_target_x = 0.0
         camera_target_y = 0.0
-        light_normal = self._camera_axis_strength_from_distance(camera_z, camera_target_x, camera_target_y)
+        light_normal = (
+            0.0
+            if is_plate_dataset
+            else self._camera_axis_strength_from_distance(camera_z, camera_target_x, camera_target_y)
+        )
         overhang_shadow = 0.0 if is_plate_dataset else float(self.overhang_shadow_var.get() or 0.0)
         overhang_shadow_depth = 0.60 if is_plate_dataset else float(self.overhang_shadow_depth_var.get() or 0.0)
         overhang_shadow_skew = 0.0 if is_plate_dataset else float(self.overhang_shadow_skew_var.get() or 0.0)
@@ -5250,7 +5388,11 @@ class Step4AugmentationModal:
         night_iso_noise = float(self.night_iso_noise_var.get() or 0.0)
         night_warmth = float(self.night_warmth_var.get() or 0.0)
         traffic_headlight_raw = float(self.traffic_headlight_var.get() or 0.0)
-        traffic_headlight = traffic_headlight_raw if self._headlight_effect_enabled(1) else 0.0
+        traffic_headlight = (
+            0.0
+            if is_plate_dataset
+            else (traffic_headlight_raw if self._headlight_effect_enabled(1) else 0.0)
+        )
         traffic_headlight_1_warmth = float(self.traffic_headlight_1_warmth_var.get() or 0.0)
         traffic_headlight_1_r = float(self.traffic_headlight_1_r_var.get() or 0.0)
         traffic_headlight_1_g = float(self.traffic_headlight_1_g_var.get() or 0.0)
@@ -5258,7 +5400,11 @@ class Step4AugmentationModal:
         traffic_headlight_1_cone = float(self.traffic_headlight_1_cone_var.get() or 0.45)
         traffic_headlight_1_source_radius = float(self.traffic_headlight_1_source_radius_var.get() or 0.0)
         traffic_headlight_2_raw = float(self.traffic_headlight_2_var.get() or 0.0)
-        traffic_headlight_2 = traffic_headlight_2_raw if self._headlight_effect_enabled(2) else 0.0
+        traffic_headlight_2 = (
+            0.0
+            if is_plate_dataset
+            else (traffic_headlight_2_raw if self._headlight_effect_enabled(2) else 0.0)
+        )
         traffic_headlight_2_warmth = float(self.traffic_headlight_2_warmth_var.get() or 0.0)
         traffic_headlight_2_r = float(self.traffic_headlight_2_r_var.get() or 0.0)
         traffic_headlight_2_g = float(self.traffic_headlight_2_g_var.get() or 0.0)
@@ -5266,7 +5412,11 @@ class Step4AugmentationModal:
         traffic_headlight_2_cone = float(self.traffic_headlight_2_cone_var.get() or 0.45)
         traffic_headlight_2_source_radius = float(self.traffic_headlight_2_source_radius_var.get() or 0.0)
         traffic_headlight_3_raw = float(self.traffic_headlight_3_var.get() or 0.0)
-        traffic_headlight_3 = traffic_headlight_3_raw if self._headlight_effect_enabled(3) else 0.0
+        traffic_headlight_3 = (
+            0.0
+            if is_plate_dataset
+            else (traffic_headlight_3_raw if self._headlight_effect_enabled(3) else 0.0)
+        )
         traffic_headlight_3_warmth = float(self.traffic_headlight_3_warmth_var.get() or 0.0)
         traffic_headlight_3_r = float(self.traffic_headlight_3_r_var.get() or 0.0)
         traffic_headlight_3_g = float(self.traffic_headlight_3_g_var.get() or 0.0)
@@ -5290,7 +5440,9 @@ class Step4AugmentationModal:
         # no longer control the night effect.
         night_luma_min = 0.56
         night_luma_max = 0.92
-        wet_reflection_strength = max(0.0, min(1.0, rain_strength * active_light_strength * (0.80 + 0.60 * light_normal))) if is_plate_dataset else 0.0
+        # Dotychczas target=plate uruchamiał model odbić powierzchni tablicy
+        # na całym zdjęciu. MT jest pełną sceną, więc ten efekt musi być wyłączony.
+        wet_reflection_strength = 0.0
         flare_strength = max(0.0, min(1.0, (active_light_strength - 0.58) * light_normal * 0.36))
         overexposure_strength = max(0.0, min(1.0, (active_light_strength - 0.62) * light_normal * 0.46))
         dirt_flow_points = 0 if is_plate_dataset else int(float(self.dirt_flow_points_var.get() or 0))
@@ -5442,7 +5594,9 @@ class Step4AugmentationModal:
             scene_view_yaw=self._read_float_var(self.scene_view_yaw_var, 35.0),
             scene_view_pitch=self._read_float_var(self.scene_view_pitch_var, -24.0),
             scene_view_roll=self._read_float_var(self.scene_view_roll_var, 0.0),
-            scene_plate_texture_enabled=bool(self.scene_plate_texture_var.get()),
+            scene_plate_texture_enabled=(
+                False if is_plate_dataset else bool(self.scene_plate_texture_var.get())
+            ),
             traffic_headlight_strength=traffic_headlight,
             traffic_headlight_count=traffic_headlight_count,
             traffic_headlight_source_x=headlight_1_source_x,
@@ -5586,13 +5740,13 @@ class Step4AugmentationModal:
         self.scene_camera_target_z_var.set(0.0)
         self._scene_projection_active = "xy"
         self._scene_viewport_mode = "xy"
-        self._scene_viewport_visible = True
+        self._scene_viewport_visible = self.target != "plate"
         self._scene_view_pan_x = 0.0
         self._scene_view_pan_y = 0.0
         self._scene_view_zoom = 1.0
         self._scene_pan_drag = None
         self._apply_scene_view_preset("xy")
-        self.scene_plate_texture_var.set(True)
+        self.scene_plate_texture_var.set(self.target != "plate")
         self.traffic_headlight_var.set(0.0)
         self.traffic_headlight_count_var.set(1)
         self.traffic_headlight_1_warmth_var.set(0.35)
@@ -5932,7 +6086,7 @@ class Step4AugmentationModal:
         except Exception:
             pass
 
-    def _schedule_preview_refresh(self, delay_ms: int = 180):
+    def _schedule_preview_refresh(self, delay_ms: int = 260):
         self._refresh_scene_summary()
         if bool(getattr(self, "_preview_refresh_suspended", False)):
             if self._preview_live_edit_active():
@@ -6188,6 +6342,136 @@ class Step4AugmentationModal:
             f"wolne {snapshot.get('system_free_gb', 0.0):.1f} GB"
         )
 
+    def _request_effect_preview(self) -> None:
+        """Renderuj efekt poza wątkiem Tk i zachowuj tylko najnowsze żądanie."""
+        sample = getattr(self, "_current_sample", None)
+        if sample is None:
+            return
+
+        try:
+            profile = self._profile_from_vars()
+        except Exception as exc:
+            try:
+                self.preview_status_lbl.configure(
+                    text=f"Nie udało się odczytać ustawień podglądu: {exc}"
+                )
+            except Exception:
+                pass
+            return
+
+        self._effect_preview_request_id += 1
+        request_id = int(self._effect_preview_request_id)
+        sample_path = Path(sample)
+        self._effect_preview_pending_job = (request_id, sample_path, profile, bool(self.rain_edge_debug_var.get()))
+        self._effect_preview_pending = True
+
+        if bool(getattr(self, "_effect_preview_worker_running", False)):
+            try:
+                self.preview_status_lbl.configure(
+                    text=(
+                        f"{sample_path.name} | Parametry zmienione — "
+                        "pokażę najnowszy efekt po zakończeniu bieżącego renderu."
+                    )
+                )
+            except Exception:
+                pass
+            return
+
+        self._start_effect_preview_worker()
+
+    def _start_effect_preview_worker(self) -> None:
+        if bool(getattr(self, "_effect_preview_worker_running", False)):
+            return
+        job = getattr(self, "_effect_preview_pending_job", None)
+        if not job:
+            return
+
+        request_id, sample_path, profile, include_contours = job
+        self._effect_preview_pending_job = None
+        self._effect_preview_pending = False
+        self._effect_preview_worker_running = True
+
+        self._capture_memory_snapshot("przed renderem")
+        try:
+            self.preview_status_lbl.configure(
+                text=f"{Path(sample_path).name} | Renderuję efekt w tle..."
+            )
+        except Exception:
+            pass
+
+        def _worker():
+            try:
+                ok, msg, payload = preview_augmentation_image(sample_path, profile, include_contours=include_contours)
+            except Exception as exc:
+                ok, msg, payload = False, f"Błąd renderu podglądu: {exc}", {}
+
+            def _finish():
+                self._finish_effect_preview_worker(
+                    request_id,
+                    sample_path,
+                    bool(ok),
+                    str(msg or ""),
+                    payload if isinstance(payload, dict) else {},
+                )
+
+            try:
+                self.window.after(0, _finish)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="z4-augmentation-preview",
+        ).start()
+
+    def _finish_effect_preview_worker(
+        self,
+        request_id: int,
+        sample_path: Path,
+        ok: bool,
+        msg: str,
+        payload: dict,
+    ) -> None:
+        self._effect_preview_worker_running = False
+
+        try:
+            if not bool(self.window.winfo_exists()):
+                return
+        except Exception:
+            return
+
+        self._capture_memory_snapshot("po renderze")
+        current = Path(getattr(self, "_current_sample", ""))
+        latest = int(getattr(self, "_effect_preview_request_id", 0) or 0)
+
+        if current == Path(sample_path) and int(request_id) == latest:
+            try:
+                self.preview_status_lbl.configure(
+                    text=f"{Path(sample_path).name} | {msg}"
+                )
+            except Exception:
+                pass
+
+            if ok:
+                self._last_preview_payload = payload
+                self._draw_preview_images(payload)
+                try:
+                    self.augmented_canvas.update_idletasks()
+                    self.window.update_idletasks()
+                except Exception:
+                    pass
+            else:
+                original_canvas = getattr(self, "original_canvas", None)
+                if original_canvas is not None:
+                    self._draw_canvas_message(original_canvas, Path(sample_path).name)
+                self._draw_canvas_message(self.augmented_canvas, msg)
+
+        if bool(getattr(self, "_effect_preview_pending", False)) or getattr(
+            self, "_effect_preview_pending_job", None
+        ):
+            self._start_effect_preview_worker()
+
     def _refresh_preview(self, redraw_only: bool = False):
         if not redraw_only:
             self._raw_preview_request_id += 1
@@ -6217,23 +6501,11 @@ class Step4AugmentationModal:
             self._draw_preview_images(payload)
             return
 
-        self._capture_memory_snapshot("przed renderem")
         try:
             self._draw_vector_overlay()
-            self.window.update_idletasks()
         except Exception:
             pass
-        ok, msg, payload = preview_augmentation_image(self._current_sample, self._profile_from_vars())
-        self._capture_memory_snapshot("po renderze")
-        self.preview_status_lbl.configure(text=f"{Path(self._current_sample).name} | {msg}")
-        if ok:
-            self._last_preview_payload = payload
-            self._draw_preview_images(payload)
-        else:
-            original_canvas = getattr(self, "original_canvas", None)
-            if original_canvas is not None:
-                self._draw_canvas_message(original_canvas, Path(self._current_sample).name)
-            self._draw_canvas_message(self.augmented_canvas, msg)
+        self._request_effect_preview()
 
     def _draw_preview_images(self, payload: dict):
         original = payload.get("original_rgb")
@@ -6256,28 +6528,34 @@ class Step4AugmentationModal:
         if np is None:
             return array
         try:
-            try:
-                from ..training.dataset_augmentation import build_contour_profile_debug_overlay
+            if self.target == "plate":
+                # Full-scene edges come from the pre-rain preview image, never
+                # from plate-symbol geometry or from the rendered rain streaks.
+                if mask is None:
+                    return array
+            else:
+                try:
+                    from ..training.dataset_augmentation import build_contour_profile_debug_overlay
 
-                profile_overlay = build_contour_profile_debug_overlay(array, self._profile_from_vars())
-                if profile_overlay is not None:
-                    profile_overlay = np.asarray(profile_overlay)
-                    if profile_overlay.shape[:2] == array.shape[:2]:
-                        try:
-                            diff = float(
-                                np.mean(
-                                    np.abs(
-                                        profile_overlay.astype("float32")
-                                        - np.asarray(array).astype("float32")
+                    profile_overlay = build_contour_profile_debug_overlay(array, self._profile_from_vars())
+                    if profile_overlay is not None:
+                        profile_overlay = np.asarray(profile_overlay)
+                        if profile_overlay.shape[:2] == array.shape[:2]:
+                            try:
+                                diff = float(
+                                    np.mean(
+                                        np.abs(
+                                            profile_overlay.astype("float32")
+                                            - np.asarray(array).astype("float32")
+                                        )
                                     )
                                 )
-                            )
-                        except Exception:
-                            diff = 1.0
-                        if diff > 0.003:
-                            return np.clip(profile_overlay, 0, 255).astype("uint8")
-            except Exception:
-                pass
+                            except Exception:
+                                diff = 1.0
+                            if diff > 0.003:
+                                return np.clip(profile_overlay, 0, 255).astype("uint8")
+                except Exception:
+                    pass
             if mask is None:
                 try:
                     from ..training.dataset_augmentation import build_rain_edge_debug_mask
@@ -6296,6 +6574,8 @@ class Step4AugmentationModal:
             edge_max = float(edge_mask.max() or 0.0)
             edge_scale = edge_peak if edge_peak > 0.0001 else edge_max
             if edge_scale <= 0.0001:
+                if self.target == "plate":
+                    return array
                 try:
                     from ..training.dataset_augmentation import build_rain_edge_debug_mask
 
@@ -6870,10 +7150,18 @@ class Step4AugmentationModal:
             actions = (("dice", "obraz"), ("layout", "układ"), ("reset", "zero"), ("zoom", "zoom"), ("fullscreen", "ent"))
             actions_left = max(10, width - (len(actions) * 44 - 6))
             mode_icons_right = max(x + 150, actions_left - 118)
-            try:
-                self._draw_scene_viewport_mode_icons(canvas, width, height, start_x=x + 4, start_y=10, max_right=mode_icons_right)
-            except Exception:
-                pass
+            if scene_visible:
+                try:
+                    self._draw_scene_viewport_mode_icons(
+                        canvas,
+                        width,
+                        height,
+                        start_x=x + 4,
+                        start_y=10,
+                        max_right=mode_icons_right,
+                    )
+                except Exception:
+                    pass
             action_x = actions_left
             for action, label in actions:
                 self._draw_canvas_action_icon(canvas, action, label, action_x, 10)
@@ -6915,7 +7203,7 @@ class Step4AugmentationModal:
                 or self._vector_drag_start is not None
             ):
                 self._draw_memory_overlay(canvas, width, height)
-            if (
+            if self.target != "plate" and (
                 self._normalize_toolbox_key(getattr(self, "_active_toolbox", "")) == "illumination"
                 or self._headlight_cones_are_visible()
                 or active_headlight is not None
@@ -10411,6 +10699,9 @@ class Step4AugmentationModal:
     def _cancel_pending_preview(self):
         self._raw_preview_request_id += 1
         self._raw_preview_pending = False
+        self._effect_preview_request_id += 1
+        self._effect_preview_pending = False
+        self._effect_preview_pending_job = None
         if self._preview_after_id is not None:
             try:
                 self.window.after_cancel(self._preview_after_id)

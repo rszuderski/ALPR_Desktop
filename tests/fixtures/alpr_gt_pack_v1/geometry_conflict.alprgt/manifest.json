@@ -1,0 +1,18 @@
+{
+  "image_identity": "source_file_sha256.v1",
+  "normalization_policy": "uppercase_alphanumeric.v1",
+  "producers": [
+    "fixture-base",
+    "fixture-merge"
+  ],
+  "record_counts": {
+    "blobs": 0,
+    "conflicts": 0,
+    "geometries": 3,
+    "images": 1,
+    "plates": 1,
+    "revisions": 1
+  },
+  "schema": "alpr.gt.pack.v1",
+  "version": 1
+}

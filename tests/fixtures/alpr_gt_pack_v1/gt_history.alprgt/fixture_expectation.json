@@ -1,0 +1,7 @@
+{
+  "ground_truth": "ABC124",
+  "plate_id": "plate-ann-fixture-history",
+  "revision_heads": [
+    "rev-sha256-a15bdfce352fba9076797efdc7584486499f9b4d20e410b80bdf7211f516474c"
+  ]
+}

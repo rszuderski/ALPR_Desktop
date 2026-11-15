@@ -19,8 +19,13 @@ class PreviewDrawerSlide:
         self._geometry = None
         self._destroyed = False
         self.button = ProjectSidebarToggle(
-            self.host, get_runtime_palette(owner), self.toggle,
-            collapsed_text="Szuflada", expanded_text="Ukryj szufladę",
+            self.host,
+            get_runtime_palette(owner),
+            self.toggle,
+            collapsed_text="Narzędzia",
+            expanded_text="Narzędzia",
+            orientation="vertical",
+            side="right",
         )
         self.button.place_forget()
         self.panel.bind("<Destroy>", self._destroy, add="+")
@@ -33,7 +38,7 @@ class PreviewDrawerSlide:
     def place(self, frame_width, x, y, width, height, *, fullscreen, toggle_y=6):
         if self._destroyed:
             return
-        if fullscreen:
+        if fullscreen and getattr(self.button, "orientation", "horizontal") != "vertical":
             y = max(y, toggle_y + 6 + self.button._height)
         self._geometry = (frame_width, x, y, width, height)
         if fullscreen != self.active:
@@ -45,7 +50,14 @@ class PreviewDrawerSlide:
             self.button.set_palette(palette)
         if fullscreen:
             self.button.set_collapsed(self.hidden)
-            self.button.place(relx=1, x=-10, y=toggle_y, anchor="ne")
+            if getattr(self.button, "orientation", "horizontal") == "vertical":
+                self.button.place(
+                    x=max(2, int(round(x)) - 4),
+                    y=max(4, int(round(y)) + 8),
+                    anchor="ne",
+                )
+            else:
+                self.button.place(relx=1, x=-10, y=toggle_y, anchor="ne")
             self.button.lift()
         else:
             self.button.place_forget()
@@ -67,14 +79,28 @@ class PreviewDrawerSlide:
         if self._geometry is None:
             return
         frame_width, x, y, width, height = self._geometry
+        offset = (frame_width - x + 1) * (1 - self.visible)
+        panel_x = round(x + offset)
+
         if self.visible <= 0:
             self.panel.place_forget()
         else:
-            offset = (frame_width - x + 1) * (1 - self.visible)
-            self.panel.place(x=round(x + offset), y=y, width=width, height=height, anchor="nw")
+            self.panel.place(x=panel_x, y=y, width=width, height=height, anchor="nw")
             self.panel.lift()
+
         if self.active:
+            if getattr(self.button, "orientation", "horizontal") == "vertical":
+                tab_x = max(4, min(int(frame_width) - 4, int(panel_x) - 4))
+                self.button.place(
+                    x=tab_x,
+                    y=max(4, int(round(y)) + 8),
+                    anchor="ne",
+                )
             self.button.lift()
+        drawers = getattr(self.owner, "_preview_workspace_drawers", None)
+        place_status_toggle = getattr(drawers, "place_status_toggle", None)
+        if callable(place_status_toggle):
+            place_status_toggle()
 
     def _tick(self):
         self._job = None
@@ -109,7 +135,8 @@ def place_drawer(owner, frame_width, x, y, width, height):
     if slide is None:
         slide = owner._preview_drawer_slide = PreviewDrawerSlide(owner)
     slide.place(frame_width, x, y, width, height,
-                fullscreen=bool(getattr(owner, "_preview_fullscreen_active", False)))
+                fullscreen=bool(getattr(owner, "_preview_fullscreen_active", False)),
+                toggle_y=max(68, int(getattr(owner, "_preview_hud_bottom_in_view", 60)) + 8))
 
 
 def suspend_drawer(owner):

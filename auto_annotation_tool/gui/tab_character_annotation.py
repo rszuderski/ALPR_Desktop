@@ -50,10 +50,14 @@ from . import z3_init_runtime
 from . import z3_navigation_runtime
 from . import z3_preview_typing_runtime
 from . import z3_preview_metadata_runtime
+from . import z3_gt_assist_runtime
+from . import z3_list_review
+from . import z3_review_runtime
 from . import z3_plate_layout_runtime
 from . import z3_character_geometry
 from . import z3_preview_editor_runtime
 from . import z3_preview_overlay_runtime
+from .z3_preview_sort_modal import open_preview_sort_modal
 from .free_mode_assistant import get_step3_free_mode_assistant_context
 from .z3_campaign_flow import (
     auto_progress_campaign_step3_entry,
@@ -616,6 +620,8 @@ except ImportError:
 
 PREVIEW_BOX_MODE_OPTIONS = [
     ("AUTO", "Auto (wg etapu)"),
+    ("GT_RESULT", "Wynik do korekty (limit GT)"),
+    ("RAW_RESULT", "RAW wynik eksperymentu"),
     ("FINAL", "Końcowe ramki treningowe"),
     ("YOLO_FILTERED", "YOLO po filtrze sekwencji"),
     ("YOLO_NMS", "YOLO po usunięciu dubli (NMS)"),
@@ -625,6 +631,9 @@ PREVIEW_BOX_MODE_LABELS = {key: label for key, label in PREVIEW_BOX_MODE_OPTIONS
 PREVIEW_BOX_MODE_BY_LABEL = {label: key for key, label in PREVIEW_BOX_MODE_OPTIONS}
 PREVIEW_BOX_MODE_BY_LABEL.update({
     "Auto (wg metody)": "AUTO",
+    "RAW": "RAW_RESULT",
+    "Wynik RAW": "RAW_RESULT",
+    "RAW wynik": "RAW_RESULT",
     "Wynik końcowy": "FINAL",
     "YOLO po NMS": "YOLO_NMS",
     "YOLO surowe": "YOLO_RAW",
@@ -632,7 +641,9 @@ PREVIEW_BOX_MODE_BY_LABEL.update({
 
 PREVIEW_SORT_OPTIONS = [
     ("DEFAULT", "Domyślne"),
+    ("PLATE_ID", "Po plate_id"),
     ("OK", "Po OK"),
+    ("GT_Z2", "Po GT z Z2"),
     ("1R", "Po 1R"),
     ("2R", "Po 2R"),
     ("M", "Po M"),
@@ -643,7 +654,9 @@ PREVIEW_SORT_OPTIONS = [
 PREVIEW_SORT_LABELS = {key: label for key, label in PREVIEW_SORT_OPTIONS}
 PREVIEW_SORT_COLOR_KEYS = {
     "DEFAULT": "muted",
+    "PLATE_ID": "info",
     "OK": "success",
+    "GT_Z2": "info",
     "1R": "success",
     "2R": "warning",
     "M": "warning",
@@ -1151,7 +1164,13 @@ class CharacterAnnotationTab:
         except Exception:
             self._preview_char_drag_window_bindings = []
 
-    def _preview_canvas_to_image_point(self, canvas_x: float, canvas_y: float):
+    def _preview_canvas_to_image_point(
+        self,
+        canvas_x: float,
+        canvas_y: float,
+        *,
+        clamp: bool = True,
+    ):
         state = getattr(self, "_preview_render_state", None) or {}
         scale = max(0.001, float(state.get("scale", 0.0) or 0.0))
         image_left = float(state.get("image_left", 0.0))
@@ -1161,8 +1180,9 @@ class CharacterAnnotationTab:
 
         img_x = (float(canvas_x) - image_left) / scale
         img_y = (float(canvas_y) - image_top) / scale
-        img_x = max(0.0, min(orig_w, img_x))
-        img_y = max(0.0, min(orig_h, img_y))
+        if clamp:
+            img_x = max(0.0, min(orig_w, img_x))
+            img_y = max(0.0, min(orig_h, img_y))
         return float(img_x), float(img_y)
 
     def _preview_image_to_canvas_point(self, img_x: float, img_y: float):
@@ -1258,10 +1278,36 @@ class CharacterAnnotationTab:
 
     _derive_preview_status_from_characters = z3_preview_metadata_runtime._derive_preview_status_from_characters
     _preview_has_reference_text_source = z3_preview_metadata_runtime._preview_has_reference_text_source
+    _get_preview_ground_truth_text = z3_preview_metadata_runtime._get_preview_ground_truth_text
+    _preview_uses_plate_gt_contract = z3_preview_metadata_runtime._preview_uses_plate_gt_contract
     _get_preview_reference_text_values = z3_preview_metadata_runtime._get_preview_reference_text_values
     _get_preview_filename_expected_texts = z3_preview_metadata_runtime._get_preview_filename_expected_texts
     _get_preview_expected_texts = z3_preview_metadata_runtime._get_preview_expected_texts
     _resolve_preview_expected_text_for_crop = z3_preview_metadata_runtime._resolve_preview_expected_text_for_crop
+    _build_raw_detection_validation = z3_preview_metadata_runtime._build_raw_detection_validation
+    _get_review_state_status = staticmethod(z3_review_runtime.get_review_state_status)
+    _build_review_reference_snapshot = staticmethod(z3_review_runtime.build_review_reference_snapshot)
+    _review_approval_is_current = staticmethod(z3_review_runtime.review_approval_is_current)
+    _reconcile_review_approval = staticmethod(z3_review_runtime.reconcile_review_approval)
+    _reconcile_review_gold_integrity = staticmethod(z3_review_runtime.reconcile_review_gold_integrity)
+    _start_review_from_raw = z3_review_runtime.start_review_from_raw
+    _open_or_restore_review = z3_review_runtime.open_or_restore_review
+    _mark_review_edit_started = z3_review_runtime.mark_review_edit_started
+    _confirm_review_gold = z3_review_runtime.confirm_review_gold
+    _reopen_review_gold = z3_review_runtime.reopen_review_gold
+    _toggle_review_excluded = z3_review_runtime.toggle_review_excluded
+    _get_review_quality_status = z3_review_runtime.get_review_quality_status
+    _prepare_active_preview_review = z3_review_runtime.prepare_active_preview_review
+    _apply_live_gt_assist = z3_gt_assist_runtime.apply_live_gt_assist
+    _build_gt_assist_suggestion = z3_gt_assist_runtime.build_gt_assist_suggestion
+    _store_gt_assist_suggestion = z3_gt_assist_runtime.store_gt_assist_suggestion
+    _gt_assist_is_current = z3_gt_assist_runtime.gt_assist_is_current
+    _accept_gt_assist_suggestion = z3_gt_assist_runtime.accept_gt_assist_suggestion
+    _reject_gt_assist_suggestion = z3_gt_assist_runtime.reject_gt_assist_suggestion
+    _get_gt_assist_presentation = z3_gt_assist_runtime.get_live_gt_assist_presentation
+    _refresh_gt_assist_controls = z3_gt_assist_runtime.refresh_gt_assist_controls
+    _apply_active_gt_assist = z3_gt_assist_runtime.apply_active_gt_assist
+    _reject_active_gt_assist = z3_gt_assist_runtime.reject_active_gt_assist
     _derive_preview_status_from_data = z3_preview_metadata_runtime._derive_preview_status_from_data
     _get_preview_live_status = z3_preview_metadata_runtime._get_preview_live_status
 
@@ -1294,6 +1340,9 @@ class CharacterAnnotationTab:
     _clear_listbox_selection_fast = staticmethod(z3_preview_metadata_runtime._clear_listbox_selection_fast)
 
     _on_preview_list_mouse_primary = on_preview_list_mouse_primary
+    _on_preview_list_context_menu = z3_list_review.show_context_menu
+    _select_all_preview_plates = z3_list_review.select_all
+    _run_selected_review_action = z3_list_review.run_selected_review_action
 
     _handle_preview_list_arrow_nav = z3_preview_metadata_runtime._handle_preview_list_arrow_nav
     _select_preview_relative = z3_preview_metadata_runtime._select_preview_relative
@@ -1400,6 +1449,9 @@ class CharacterAnnotationTab:
 
     def _init_preview_vertical_split(self):
         pane = getattr(self, "preview_vertical_split", None)
+        drawers = getattr(self, "_preview_workspace_drawers", None)
+        if drawers is not None and drawers.detached:
+            return
         if pane is None or self._preview_vertical_split_ready:
             return
 
@@ -1576,6 +1628,10 @@ class CharacterAnnotationTab:
 
         def _rerender_after_layout_settles():
             self._preview_stabilized_render_after_id = None
+            drawers = getattr(self, "_preview_workspace_drawers", None)
+            if drawers is not None and drawers.mode_transition:
+                # The animation completion schedules one render after docking.
+                return
             if getattr(self, "_preview_fullscreen_transition_active", False):
                 old_size = getattr(self, "_preview_fullscreen_old_canvas_size", None)
                 current_size = (canvas.winfo_width(), canvas.winfo_height())
@@ -1647,8 +1703,15 @@ class CharacterAnnotationTab:
     _refresh_preview_character_selection_visual = z3_preview_editor_runtime._refresh_preview_character_selection_visual
     _refresh_preview_editor_toolbar = z3_preview_editor_runtime._refresh_preview_editor_toolbar
     def _ensure_preview_final_box_mode(self, *, render_preview: bool = True):
+        prepare = getattr(self, "_prepare_active_preview_review", None)
+        if callable(prepare):
+            prepare()
         if self._get_preview_box_mode_key() == "FINAL":
             return
+        if self._get_preview_box_mode_key() == "AUTO":
+            data = self._get_preview_active_data(create=False)
+            if self._get_preview_box_records(data)[1] == "FINAL":
+                return
         try:
             self.preview_box_mode_var.set(PREVIEW_BOX_MODE_LABELS["FINAL"])
         except Exception:
@@ -2499,6 +2562,13 @@ class CharacterAnnotationTab:
             sort_color_keys=PREVIEW_SORT_COLOR_KEYS,
         )
 
+    def _open_preview_sort_modal(self):
+        return open_preview_sort_modal(
+            self,
+            sort_options=PREVIEW_SORT_OPTIONS,
+            sort_color_keys=PREVIEW_SORT_COLOR_KEYS,
+        )
+
     def _on_preview_sort_mode_change(self, mode_key: str = None):
         normalized_key = self._normalize_preview_sort_mode_key(
             mode_key or self._get_preview_sort_mode_key()
@@ -2820,7 +2890,8 @@ class CharacterAnnotationTab:
             self._save_local_setting("char_preview_box_mode", self._get_preview_box_mode_key())
         except Exception:
             pass
-        if self._get_preview_box_mode_key() != "FINAL" and (
+        data = self._get_preview_active_data(create=False)
+        if self._get_preview_box_records(data)[1] != "FINAL" and (
             bool(getattr(self, "_preview_char_edit_mode", False))
             or bool(getattr(self, "_preview_char_add_mode", False))
         ):
@@ -3757,6 +3828,8 @@ class CharacterAnnotationTab:
             "btn_rank_presets",
             "btn_ocr_lab",
             "btn_undo_detection_result",
+            "btn_start_review_from_raw",
+            "btn_confirm_review_gold",
             "btn_confirm_detection_result",
         ):
             widget = getattr(self, attr_name, None)

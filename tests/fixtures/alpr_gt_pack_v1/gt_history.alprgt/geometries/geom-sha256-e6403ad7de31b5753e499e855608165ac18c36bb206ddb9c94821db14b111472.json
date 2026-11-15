@@ -1,0 +1,25 @@
+{
+  "geometry_id": "geom-sha256-e6403ad7de31b5753e499e855608165ac18c36bb206ddb9c94821db14b111472",
+  "parents": [],
+  "plate_id": "plate-ann-fixture-history",
+  "points": [
+    [
+      0.1,
+      0.2
+    ],
+    [
+      0.75,
+      0.2
+    ],
+    [
+      0.75,
+      0.7
+    ],
+    [
+      0.1,
+      0.7
+    ]
+  ],
+  "schema": "alpr.gt.geometry.v1",
+  "type": "polygon4-normalized"
+}

@@ -396,6 +396,9 @@ def on_root_unmap(app, event=None):
     if root_state != "iconic":
         return None
     app._window_restore_pending = True
+    # Samo zminimalizowanie NIE jest żądaniem przywrócenia. Ta flaga zostanie
+    # ustawiona dopiero przez <Map>, czyli przy jawnej próbie powrotu okna.
+    app._window_restore_requested_by_map = False
     close_floating_overlays_for_window_state(app)
     release_window_grabs_for_recovery(app)
     try:
@@ -413,6 +416,9 @@ def on_root_map(app, event=None):
     if getattr(event, "widget", None) is not app.root:
         return None
     app._window_restore_pending = True
+    # <Map> oznacza próbę przywrócenia okna przez system/użytkownika.
+    # Na Windows Tk potrafi jeszcze przez chwilę raportować "iconic".
+    app._window_restore_requested_by_map = True
     schedule_root_recovery(app, delay_ms=60, reset_attempts=True)
     return None
 
@@ -467,13 +473,27 @@ def recover_root_after_map(app):
         root_state = ""
     if root_state == "iconic":
         close_floating_overlays_for_window_state(app)
-        app._window_restore_attempts = int(getattr(app, "_window_restore_attempts", 0) or 0) + 1
-        if app._window_restore_attempts <= 24:
-            delay_ms = min(900, 90 + (app._window_restore_attempts * 45))
-            schedule_root_recovery(app, delay_ms=delay_ms)
-        return
+
+        # Nie podnoś okna po zwykłym Minimize. Jeżeli jednak dostaliśmy <Map>,
+        # użytkownik/system właśnie poprosił o przywrócenie.
+        if bool(getattr(app, "_window_restore_requested_by_map", False)):
+            try:
+                app.root.deiconify()
+                app.root.update_idletasks()
+                root_state = str(app.root.state())
+            except Exception:
+                root_state = "iconic"
+
+        if root_state == "iconic":
+            app._window_restore_attempts = int(getattr(app, "_window_restore_attempts", 0) or 0) + 1
+            if app._window_restore_attempts <= 24:
+                delay_ms = min(900, 90 + (app._window_restore_attempts * 45))
+                schedule_root_recovery(app, delay_ms=delay_ms)
+            return
+
     app._window_restore_attempts = 0
     app._window_restore_pending = False
+    app._window_restore_requested_by_map = False
 
     release_window_grabs_for_recovery(app)
     try:

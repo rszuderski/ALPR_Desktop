@@ -12,6 +12,17 @@ from types import SimpleNamespace
 from ..campaign_manager import CAMPAIGN
 from ..config import CONFIG, logger
 from ..project_cache import PROJECT_CACHE
+from ..gt_resource_companions import (
+    collect_image_resource_gt_pack_paths,
+    open_gt_pack_sources,
+    resolve_plate_revision_provenance,
+)
+from ..plate_ground_truth import (
+    PLATE_LAYOUT_GT_ATTR,
+    ensure_plate_detection_contract,
+    normalize_plate_layout_gt,
+    normalize_plate_ground_truth_text,
+)
 
 
 def normalize_xml_image_relpath(raw_name: str) -> str:
@@ -28,6 +39,25 @@ def xml_relpath_to_path(rel_path: str) -> Path:
     return Path(*parts) if parts else Path()
 
 
+def read_xml_plate_attributes(poly_element) -> tuple[float, dict[str, str]]:
+    """Read CVAT polygon attributes without losing GT/annotation identity."""
+    confidence = 1.0
+    attributes: dict[str, str] = {}
+    for attr_el in poly_element.findall("attribute"):
+        name = str(attr_el.get("name", "") or "").strip()
+        value = str(attr_el.text or "").strip()
+        if not name:
+            continue
+        if name == "confidence":
+            try:
+                confidence = float(value)
+            except (TypeError, ValueError):
+                confidence = 1.0
+            continue
+        attributes[name] = value
+    return confidence, attributes
+
+
 def read_xml_image_names(xml_path: Path) -> list[str]:
     tree = ET.parse(xml_path)
     names = []
@@ -40,6 +70,74 @@ def read_xml_image_names(xml_path: Path) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def _stable_sha256_text(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def build_plate_source_geometry_hash(
+    image_name: str,
+    detection,
+) -> str:
+    attributes = dict(getattr(detection, "attributes", {}) or {})
+    plate_id = str(attributes.get("plate_annotation_id") or "").strip()
+    points = list(getattr(detection, "polygon", None) or [])
+    if not points:
+        try:
+            x1, y1, x2, y2 = [
+                float(value)
+                for value in list(getattr(detection, "bbox", []) or [])[:4]
+            ]
+            points = [
+                (x1, y1),
+                (x2, y1),
+                (x2, y2),
+                (x1, y2),
+            ]
+        except Exception:
+            points = []
+
+    geometry = ";".join(
+        f"{float(x):.6f},{float(y):.6f}"
+        for x, y in points[:4]
+    )
+    core = "|".join(
+        (
+            normalize_xml_image_relpath(image_name),
+            plate_id,
+            geometry,
+        )
+    )
+    return _stable_sha256_text(core)
+
+
+def build_plate_source_gt_hash(
+    image_name: str,
+    attributes: dict,
+) -> str:
+    attrs = dict(attributes or {})
+    plate_id = str(attrs.get("plate_annotation_id") or "").strip()
+    gt_text = normalize_plate_ground_truth_text(
+        attrs.get("ground_truth_text")
+    )
+    gt_source = str(
+        attrs.get("ground_truth_source") or ""
+    ).strip()
+    layout_gt = normalize_plate_layout_gt(
+        attrs.get(PLATE_LAYOUT_GT_ATTR),
+        default="",
+    )
+    core = "|".join(
+        (
+            normalize_xml_image_relpath(image_name),
+            plate_id,
+            gt_text,
+            gt_source,
+            layout_gt,
+        )
+    )
+    return _stable_sha256_text(core)
+
+
 def count_xml_plate_cut_targets(xml_path: Path) -> dict:
     tree = ET.parse(xml_path)
     image_elements = {
@@ -50,10 +148,12 @@ def count_xml_plate_cut_targets(xml_path: Path) -> dict:
     plate_count = 0
     images_with_plates = 0
     geometry_parts: list[str] = []
+    gt_parts: list[str] = []
 
     for raw_image_name, image_el in image_elements.items():
         image_plate_count = 0
         image_geometry_parts: list[str] = []
+        image_gt_parts: list[str] = []
         for poly in image_el.findall(".//polygon[@label='plate']"):
             try:
                 points = [
@@ -63,22 +163,62 @@ def count_xml_plate_cut_targets(xml_path: Path) -> dict:
                 ]
             except Exception:
                 continue
-            if len(points) >= 4:
-                image_plate_count += 1
-                image_geometry_parts.append(
-                    ";".join(f"{float(x):.3f},{float(y):.3f}" for x, y in points[:4])
+            if len(points) < 4:
+                continue
+
+            image_plate_count += 1
+            geometry_key = ";".join(
+                f"{float(x):.3f},{float(y):.3f}"
+                for x, y in points[:4]
+            )
+            image_geometry_parts.append(geometry_key)
+
+            _confidence, attributes = read_xml_plate_attributes(poly)
+            plate_id = str(
+                attributes.get("plate_annotation_id") or ""
+            ).strip()
+            gt_text = normalize_plate_ground_truth_text(
+                attributes.get("ground_truth_text")
+            )
+            gt_source = str(
+                attributes.get("ground_truth_source") or ""
+            ).strip()
+            layout_gt = normalize_plate_layout_gt(
+                attributes.get(PLATE_LAYOUT_GT_ATTR),
+                default="",
+            )
+
+            identity_key = plate_id or f"geom:{geometry_key}"
+            image_gt_parts.append(
+                "|".join(
+                    (
+                        identity_key,
+                        gt_text,
+                        gt_source,
+                        layout_gt,
+                    )
                 )
+            )
 
         if image_plate_count > 0:
             images_with_plates += 1
             plate_count += image_plate_count
+            image_name = normalize_xml_image_relpath(raw_image_name)
             geometry_parts.append(
                 "|".join(
                     (
-                        normalize_xml_image_relpath(raw_image_name),
+                        image_name,
                         str(image_el.get("width") or ""),
                         str(image_el.get("height") or ""),
-                        "#".join(image_geometry_parts),
+                        "#".join(sorted(image_geometry_parts)),
+                    )
+                )
+            )
+            gt_parts.append(
+                "|".join(
+                    (
+                        image_name,
+                        "#".join(sorted(image_gt_parts)),
                     )
                 )
             )
@@ -87,8 +227,15 @@ def count_xml_plate_cut_targets(xml_path: Path) -> dict:
         "plate_count": int(plate_count),
         "images_with_plates": int(images_with_plates),
         "xml_images_total": int(len(image_elements)),
-        "xml_plate_geometry_hash": hashlib.sha1("\n".join(geometry_parts).encode("utf-8")).hexdigest()
+        "xml_plate_geometry_hash": hashlib.sha1(
+            "\n".join(sorted(geometry_parts)).encode("utf-8")
+        ).hexdigest()
         if geometry_parts
+        else "",
+        "xml_plate_gt_hash": hashlib.sha256(
+            "\n".join(sorted(gt_parts)).encode("utf-8")
+        ).hexdigest()
+        if gt_parts
         else "",
     }
 
@@ -141,6 +288,7 @@ def current_extract_source_signature(host: "CharacterAnnotationTab") -> dict:
         "xml_images_with_plates": 0,
         "xml_images_total": 0,
         "xml_plate_geometry_hash": "",
+        "xml_plate_gt_hash": "",
     }
     if not xml_path_raw:
         return signature
@@ -175,6 +323,7 @@ def current_extract_source_signature(host: "CharacterAnnotationTab") -> dict:
             "xml_images_with_plates": int(counts.get("images_with_plates", 0) or 0),
             "xml_images_total": int(counts.get("xml_images_total", 0) or 0),
             "xml_plate_geometry_hash": str(counts.get("xml_plate_geometry_hash") or "").strip(),
+            "xml_plate_gt_hash": str(counts.get("xml_plate_gt_hash") or "").strip(),
         }
         signature.update(counted)
         try:
@@ -207,7 +356,21 @@ def extract_manifest_matches_current_source(
     current_signature = current_extract_source_signature(host)
     saved_hash = str(source.get("xml_plate_geometry_hash") or "").strip()
     current_hash = str(current_signature.get("xml_plate_geometry_hash") or "").strip()
-    geometry_hash_matches = bool(saved_hash and current_hash and saved_hash == current_hash)
+    geometry_hash_matches = bool(
+        saved_hash
+        and current_hash
+        and saved_hash == current_hash
+    )
+
+    saved_gt_hash = str(source.get("xml_plate_gt_hash") or "").strip()
+    current_gt_hash = str(
+        current_signature.get("xml_plate_gt_hash") or ""
+    ).strip()
+    gt_hash_matches = bool(
+        saved_gt_hash
+        and current_gt_hash
+        and saved_gt_hash == current_gt_hash
+    )
 
     def _saved_current_int_match(key: str) -> bool:
         saved_value = int(source.get(key, 0) or 0)
@@ -221,7 +384,10 @@ def extract_manifest_matches_current_source(
         and _saved_current_int_match("xml_images_with_plates")
         and _saved_current_int_match("xml_images_total")
     )
-    source_semantics_match = bool(geometry_hash_matches or legacy_signature_matches)
+    source_semantics_match = bool(
+        geometry_hash_matches
+        or legacy_signature_matches
+    )
 
     for key in ("images_dir", "xml_path", "annotation_run_dir"):
         saved_value = str(source.get(key) or "").strip()
@@ -261,6 +427,392 @@ def extract_manifest_matches_current_source(
     return True
 
 
+def extract_manifest_freshness(
+    host: "CharacterAnnotationTab",
+    manifest: dict,
+) -> dict:
+    """Classify PZ1 freshness without conflating crop pixels with GT semantics."""
+    if not isinstance(manifest, dict):
+        return {
+            "geometry_current": True,
+            "gt_current": None,
+            "gt_comparable": False,
+            "gt_metadata_stale": False,
+            "recrop_required": False,
+        }
+
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    current_signature = current_extract_source_signature(host)
+
+    geometry_current = bool(
+        extract_manifest_matches_current_source(
+            host,
+            manifest,
+        )
+    )
+    saved_gt_hash = str(source.get("xml_plate_gt_hash") or "").strip()
+    current_gt_hash = str(
+        current_signature.get("xml_plate_gt_hash") or ""
+    ).strip()
+    gt_comparable = bool(saved_gt_hash and current_gt_hash)
+    gt_current = (
+        bool(saved_gt_hash == current_gt_hash)
+        if gt_comparable
+        else None
+    )
+    gt_metadata_stale = bool(
+        geometry_current
+        and gt_comparable
+        and not bool(gt_current)
+    )
+    return {
+        "geometry_current": bool(geometry_current),
+        "gt_current": gt_current,
+        "gt_comparable": bool(gt_comparable),
+        "gt_metadata_stale": bool(gt_metadata_stale),
+        "recrop_required": not bool(geometry_current),
+        "saved_gt_hash": saved_gt_hash,
+        "current_gt_hash": current_gt_hash,
+    }
+
+
+def _xml_plate_gt_contracts(xml_path: Path) -> dict[str, dict]:
+    tree = ET.parse(xml_path)
+    contracts: dict[str, dict] = {}
+    duplicates: set[str] = set()
+
+    for image_el in tree.getroot().findall(".//image"):
+        image_name = normalize_xml_image_relpath(
+            image_el.get("name") or ""
+        )
+        try:
+            image_width = int(float(image_el.get("width") or 0))
+            image_height = int(float(image_el.get("height") or 0))
+        except Exception:
+            image_width = image_height = 0
+
+        for poly in image_el.findall(".//polygon[@label='plate']"):
+            _confidence, attributes = read_xml_plate_attributes(poly)
+            plate_id = str(
+                attributes.get("plate_annotation_id") or ""
+            ).strip()
+            if not plate_id:
+                continue
+
+            if plate_id in contracts:
+                duplicates.add(plate_id)
+                continue
+
+            gt_text = normalize_plate_ground_truth_text(
+                attributes.get("ground_truth_text")
+            )
+            gt_source = str(
+                attributes.get("ground_truth_source") or ""
+            ).strip()
+            layout_gt = normalize_plate_layout_gt(
+                attributes.get(PLATE_LAYOUT_GT_ATTR),
+                default="",
+            )
+
+            contracts[plate_id] = {
+                "plate_id": plate_id,
+                "image_name": image_name,
+                "image_width": image_width,
+                "image_height": image_height,
+                "ground_truth_text": gt_text,
+                "ground_truth_source": gt_source,
+                "plate_layout_gt": layout_gt,
+                "source_gt_hash": build_plate_source_gt_hash(
+                    image_name,
+                    attributes,
+                ),
+            }
+
+    for plate_id in duplicates:
+        contracts.pop(plate_id, None)
+    return contracts
+
+
+def _write_json_atomic_for_refresh(host, path: Path, payload: dict) -> None:
+    writer = getattr(host, "_atomic_write_json", None)
+    if callable(writer):
+        writer(path, payload)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    temp.replace(path)
+
+
+def refresh_preview_gt_metadata_from_current_xml(
+    host: "CharacterAnnotationTab",
+    preview_dir: Path | str,
+) -> dict:
+    """Refresh GT semantics in PZ1 metadata without regenerating crop pixels.
+
+    This is valid only when geometry is current. ``raw_detection`` is never
+    modified; validation/status may be recalculated from the existing raw result.
+    """
+    preview_path = Path(preview_dir)
+    manifest_path = preview_path / "extract_manifest.json"
+    metadata_path = preview_path / "metadata.json"
+    report = {
+        "changed": False,
+        "complete": False,
+        "updated_records": 0,
+        "matched_records": 0,
+        "unmatched_records": 0,
+        "legacy_records": 0,
+        "raw_detection_preserved": True,
+        "reason": "",
+    }
+
+    if not manifest_path.is_file() or not metadata_path.is_file():
+        report["reason"] = "missing_manifest_or_metadata"
+        return report
+
+    manifest = PROJECT_CACHE.load_json(manifest_path, default={})
+    if not isinstance(manifest, dict):
+        report["reason"] = "invalid_manifest"
+        return report
+
+    freshness = extract_manifest_freshness(host, manifest)
+    report["freshness_before"] = dict(freshness)
+    if not freshness.get("geometry_current"):
+        report["reason"] = "geometry_stale"
+        return report
+    if not freshness.get("gt_metadata_stale"):
+        report["complete"] = True
+        report["reason"] = "already_current"
+        return report
+
+    source = current_extract_source_payload(host)
+    xml_raw = str(source.get("xml_path") or "").strip()
+    images_raw = str(source.get("images_dir") or "").strip()
+    if not xml_raw:
+        report["reason"] = "missing_xml"
+        return report
+
+    try:
+        contracts = _xml_plate_gt_contracts(Path(xml_raw))
+    except Exception as exc:
+        report["reason"] = "xml_parse_failed"
+        report["error"] = str(exc)
+        return report
+
+    metadata = PROJECT_CACHE.load_json(metadata_path, default={})
+    if not isinstance(metadata, dict):
+        report["reason"] = "invalid_metadata"
+        return report
+
+    pack_paths = []
+    if images_raw:
+        try:
+            pack_paths = collect_image_resource_gt_pack_paths(
+                Path(images_raw),
+                campaign=CAMPAIGN,
+            )
+        except Exception:
+            pack_paths = []
+    opened_packs = open_gt_pack_sources(pack_paths)
+
+    changed_ids: list[str] = []
+
+    for crop_id, record in list(metadata.items()):
+        if not isinstance(record, dict):
+            continue
+        if record.get("working_gt_pack_path"):
+            # PZ2 owns a newer canonical revision. An older source XML cannot
+            # overwrite it; load reads the current working pack revision heads.
+            continue
+        attrs = dict(record.get("plate_attributes") or {})
+        plate_id = str(
+            record.get("source_annotation_id")
+            or attrs.get("plate_annotation_id")
+            or ""
+        ).strip()
+        if not plate_id:
+            report["legacy_records"] += 1
+            continue
+
+        contract = contracts.get(plate_id)
+        if not isinstance(contract, dict):
+            report["unmatched_records"] += 1
+            continue
+        report["matched_records"] += 1
+
+        before = json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+        gt_text = normalize_plate_ground_truth_text(
+            contract.get("ground_truth_text")
+        )
+        gt_source = str(
+            contract.get("ground_truth_source") or ""
+        ).strip()
+        layout_gt = normalize_plate_layout_gt(
+            contract.get("plate_layout_gt"),
+            default="",
+        )
+
+        record["ground_truth_text"] = gt_text or None
+        record["ground_truth_source"] = gt_source or None
+        record["source_gt_hash"] = str(
+            contract.get("source_gt_hash") or ""
+        ).strip() or None
+        record["plate_layout_gt"] = layout_gt or None
+        record["plate_layout_override"] = layout_gt or None
+
+        attrs["plate_annotation_id"] = plate_id
+        attrs["source_gt_hash"] = str(
+            contract.get("source_gt_hash") or ""
+        ).strip()
+        if gt_text:
+            attrs["ground_truth_text"] = gt_text
+            if gt_source:
+                attrs["ground_truth_source"] = gt_source
+            else:
+                attrs.pop("ground_truth_source", None)
+        else:
+            attrs.pop("ground_truth_text", None)
+            attrs.pop("ground_truth_source", None)
+
+        if layout_gt:
+            attrs[PLATE_LAYOUT_GT_ATTR] = layout_gt
+        else:
+            attrs.pop(PLATE_LAYOUT_GT_ATTR, None)
+
+        if opened_packs:
+            provenance = resolve_plate_revision_provenance(
+                opened_packs,
+                image_id=str(
+                    record.get("source_image_id") or ""
+                ).strip(),
+                plate_id=plate_id,
+                polygon=list(record.get("source_polygon") or []),
+                image_width=int(contract.get("image_width", 0) or 0),
+                image_height=int(contract.get("image_height", 0) or 0),
+                ground_truth_text=gt_text,
+            )
+            geom_ids = list(
+                provenance.get("geometry_revision_ids", []) or []
+            )
+            gt_ids = list(
+                provenance.get("ground_truth_revision_ids", []) or []
+            )
+            record["source_geometry_revision_ids"] = geom_ids
+            record["source_gt_revision_ids"] = gt_ids
+            record["source_geometry_revision_id"] = (
+                provenance.get("source_geometry_revision_id")
+            )
+            record["source_gt_revision_id"] = (
+                provenance.get("source_gt_revision_id")
+            )
+
+            if provenance.get("source_geometry_revision_id"):
+                attrs["source_geometry_revision_id"] = str(
+                    provenance["source_geometry_revision_id"]
+                )
+            else:
+                attrs.pop("source_geometry_revision_id", None)
+
+            if provenance.get("source_gt_revision_id"):
+                attrs["source_gt_revision_id"] = str(
+                    provenance["source_gt_revision_id"]
+                )
+            else:
+                attrs.pop("source_gt_revision_id", None)
+        else:
+            # Geometry did not change, so an existing geometry revision remains
+            # meaningful. GT changed and cannot be re-resolved without a pack:
+            # never retain the old GT revision as if it described the new value.
+            record["source_gt_revision_id"] = None
+            record["source_gt_revision_ids"] = []
+            attrs.pop("source_gt_revision_id", None)
+
+        record["plate_attributes"] = attrs
+
+        after = json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if after != before:
+            changed_ids.append(str(crop_id))
+            report["updated_records"] += 1
+
+    complete = bool(
+        report["matched_records"] > 0
+        and report["unmatched_records"] == 0
+        and report["legacy_records"] == 0
+    )
+
+    if changed_ids:
+        recalculator = getattr(
+            host,
+            "_recalculate_preview_statuses_in_metadata",
+            None,
+        )
+        if callable(recalculator):
+            try:
+                recalculator(metadata)
+            except Exception:
+                recalculator = None
+        if not callable(recalculator):
+            for crop_id in changed_ids:
+                record = metadata.get(crop_id)
+                if not isinstance(record, dict):
+                    continue
+                record.pop("raw_validation", None)
+                if isinstance(record.get("raw_detection"), dict):
+                    record["status"] = "needs_fix"
+
+        _write_json_atomic_for_refresh(
+            host,
+            metadata_path,
+            metadata,
+        )
+        report["changed"] = True
+
+    if complete:
+        manifest["source"] = (
+            current_extract_source_payload_with_signature(host)
+        )
+        manifest["semantic_refresh_policy"] = (
+            "pz1.gt_metadata_without_recrop.v1"
+        )
+        _write_json_atomic_for_refresh(
+            host,
+            manifest_path,
+            manifest,
+        )
+        report["complete"] = True
+        report["reason"] = "refreshed"
+    else:
+        report["complete"] = False
+        report["reason"] = (
+            "partial_refresh"
+            if changed_ids
+            else "no_matching_records"
+        )
+
+    return report
+
+
 def get_extract_preview_manifest_state(host: "CharacterAnnotationTab", preview_dir=None) -> dict:
     preview_dir_raw = str(
         preview_dir
@@ -273,6 +825,10 @@ def get_extract_preview_manifest_state(host: "CharacterAnnotationTab", preview_d
         "manifest_exists": False,
         "plate_count": 0,
         "source_matches": False,
+        "geometry_current": False,
+        "gt_current": None,
+        "gt_metadata_stale": False,
+        "recrop_required": False,
         "meets_minimum": False,
     }
     if not preview_dir_raw:
@@ -281,18 +837,59 @@ def get_extract_preview_manifest_state(host: "CharacterAnnotationTab", preview_d
     try:
         preview_path = Path(preview_dir_raw)
         manifest_path = preview_path / "extract_manifest.json"
+        acquisition_manifest = preview_path / "acquisition_import.json"
+        is_acquisition = acquisition_manifest.is_file()
+        if is_acquisition:
+            manifest_path = acquisition_manifest
         if not manifest_path.exists():
             return state
         state["manifest_exists"] = True
         manifest = PROJECT_CACHE.load_json(manifest_path, default={})
         if not isinstance(manifest, dict):
             return state
+        if is_acquisition and manifest.get("schema") != "alpr.desktop_crop_import.v1":
+            return state
         plate_count = int(manifest.get("plate_count", 0) or 0)
         state["plate_count"] = max(0, plate_count)
         if plate_count <= 0:
             return state
 
-        source_matches = extract_manifest_matches_current_source(host, manifest)
+        if is_acquisition:
+            source_matches = preview_matches_current_extract_source(
+                host,
+                preview_path,
+            )
+            source_matches = source_matches and host._is_usable_step3_preview_dir(
+                preview_path,
+                require_plates=True,
+            )
+            freshness = {
+                "geometry_current": bool(source_matches),
+                "gt_current": None,
+                "gt_metadata_stale": False,
+                "recrop_required": not bool(source_matches),
+            }
+        else:
+            freshness = extract_manifest_freshness(
+                host,
+                manifest,
+            )
+            if freshness.get("gt_metadata_stale"):
+                refresh_preview_gt_metadata_from_current_xml(
+                    host,
+                    preview_path,
+                )
+                manifest = PROJECT_CACHE.load_json(
+                    manifest_path,
+                    default=manifest,
+                )
+                freshness = extract_manifest_freshness(
+                    host,
+                    manifest,
+                )
+            source_matches = bool(
+                freshness.get("geometry_current")
+            )
 
         meets_minimum = True
         try:
@@ -302,6 +899,16 @@ def get_extract_preview_manifest_state(host: "CharacterAnnotationTab", preview_d
             meets_minimum = True
 
         state["source_matches"] = bool(source_matches)
+        state["geometry_current"] = bool(
+            freshness.get("geometry_current")
+        )
+        state["gt_current"] = freshness.get("gt_current")
+        state["gt_metadata_stale"] = bool(
+            freshness.get("gt_metadata_stale")
+        )
+        state["recrop_required"] = bool(
+            freshness.get("recrop_required")
+        )
         state["meets_minimum"] = bool(meets_minimum)
         state["ready"] = bool(source_matches and meets_minimum)
         return state
@@ -312,6 +919,13 @@ def get_extract_preview_manifest_state(host: "CharacterAnnotationTab", preview_d
 def preview_matches_current_extract_source(host: "CharacterAnnotationTab", preview_dir=None) -> bool:
     manifest_path = extract_source_manifest_path(host, preview_dir)
     current = current_extract_source_payload(host)
+    if manifest_path is not None:
+        acquisition_manifest = manifest_path.parent / "acquisition_import.json"
+        if acquisition_manifest.is_file():
+            payload = PROJECT_CACHE.load_json(acquisition_manifest, default={})
+            return bool(isinstance(payload, dict)
+                        and payload.get("schema") == "alpr.desktop_crop_import.v1"
+                        and not any(current.values()))
     try:
         binding_result = dict(getattr(host, "_extract_last_source_binding_result", {}) or {})
         expected_plate_count = int(binding_result.get("plate_count") or 0)
@@ -360,7 +974,16 @@ def preview_matches_current_extract_source(host: "CharacterAnnotationTab", previ
     if not isinstance(manifest, dict):
         return True
 
-    return extract_manifest_matches_current_source(host, manifest)
+    freshness = extract_manifest_freshness(host, manifest)
+    if freshness.get("gt_metadata_stale"):
+        try:
+            refresh_preview_gt_metadata_from_current_xml(
+                host,
+                manifest_path.parent,
+            )
+        except Exception:
+            pass
+    return bool(freshness.get("geometry_current"))
 
 
 def find_latest_extract_preview_run_dir(host: "CharacterAnnotationTab", require_plates: bool = False) -> str:
@@ -918,21 +1541,35 @@ def prepare_plate_cut_detections_for_source(host, image_name: str, plates: list)
         key=host._plate_cut_reading_order_key,
     )
     ordered_plates = [detection for _, detection in ordered_pairs]
-    expected_tokens = host._extract_source_plate_tokens_from_filename(image_name)
-    has_direct_mapping = bool(len(expected_tokens) == 1 and len(ordered_plates) == 1)
-    expected_tokens_json = json.dumps(expected_tokens, ensure_ascii=False) if expected_tokens else "[]"
 
+    # Bieżący workflow PZ1 nie wyprowadza już GT z nazwy pliku.
+    # Każdy polygon dostaje trwałą tożsamość kontraktu GT. Brak GT oznacza
+    # po prostu brak GT i musi zostać uzupełniony w Z2.
     for sorted_index, detection in enumerate(ordered_plates):
-        attributes = dict(getattr(detection, "attributes", {}) or {})
+        attributes = ensure_plate_detection_contract(detection)
         attributes["source_plate_index"] = str(sorted_index)
         attributes["source_plate_count"] = str(len(ordered_plates))
-        attributes["source_expected_texts"] = expected_tokens_json
-        if has_direct_mapping:
-            attributes["source_expected_text"] = expected_tokens[sorted_index]
-            attributes["source_expected_text_source"] = "filename_order"
-        elif expected_tokens:
-            attributes.pop("source_expected_text", None)
-            attributes["source_expected_text_source"] = "ambiguous_filename_tokens"
+
+        gt_text = normalize_plate_ground_truth_text(
+            attributes.get("ground_truth_text")
+        )
+        if gt_text:
+            attributes["ground_truth_text"] = gt_text
+            attributes.setdefault("ground_truth_source", "manual_z2")
+
+        attributes["source_geometry_hash"] = build_plate_source_geometry_hash(
+            image_name,
+            detection,
+        )
+        attributes["source_gt_hash"] = build_plate_source_gt_hash(
+            image_name,
+            attributes,
+        )
+
+        # Usuwamy historyczne heurystyki filename-derived z nowego cropa.
+        attributes.pop("source_expected_text", None)
+        attributes.pop("source_expected_texts", None)
+        attributes.pop("source_expected_text_source", None)
         detection.attributes = attributes
 
     return ordered_plates
@@ -946,6 +1583,27 @@ def backfill_preview_expected_texts_from_sources(host, metadata_map: dict) -> bo
     changed = False
     for plate_id, data in metadata_map.items():
         if not isinstance(data, dict):
+            continue
+        if data.get("source_expected_text_source") == "mobile_crop_human_review":
+            continue
+        attrs = data.get("plate_attributes")
+        explicit_gt = normalize_plate_ground_truth_text(
+            data.get("ground_truth_text")
+            or (attrs.get("ground_truth_text") if isinstance(attrs, dict) else "")
+        )
+        uses_gt_contract = bool(
+            explicit_gt
+            or str(data.get("source_annotation_id") or "").strip()
+            or str(data.get("ground_truth_source") or "").strip()
+            or (
+                isinstance(attrs, dict)
+                and (
+                    str(attrs.get("plate_annotation_id") or "").strip()
+                    or str(attrs.get("ground_truth_source") or "").strip()
+                )
+            )
+        )
+        if uses_gt_contract:
             continue
         source_image = str(
             data.get("source_image")

@@ -109,6 +109,9 @@ from . import z4_dataset_sources
 from . import z4_training_metrics
 from . import z4_dataset_builder
 from . import z4_analysis_ranking
+from . import z4_mz_experiment
+from . import z4_history_runtime
+from . import z4_fine_tune_protocol
 from .z4_view_models import (
     Step4CampaignNavigationViewModel,
     Step4DatasetWorkflowViewModel,
@@ -183,6 +186,8 @@ def _set_training_preparing_ui_state(self, *, text: str = "Przygotowanie trening
     except Exception:
         pass
 
+    z4_mz_experiment.refresh_controls(self)
+
 def _update_training_preflight_progress(self, stage: str, progress: float, detail: str = ""):
     stage_text = str(stage or "Przygotowanie treningu").strip()
     detail_text = str(detail or "").strip()
@@ -226,8 +231,8 @@ def _finish_training_preflight_failure(self, *, title: str, message: str):
     except Exception:
         pass
 
-def _start_training(self):
-    if bool(getattr(self, "_training_start_in_progress", False)):
+def _start_training(self, _mz_selection=None):
+    if bool(getattr(self, "_training_start_in_progress", False) or getattr(self, "_mz_validation_in_progress", False)):
         return
     if not YOLO_AVAILABLE:
         return messagebox.showerror("Błąd", "Brak ultralytics.")
@@ -244,6 +249,19 @@ def _start_training(self):
                 "Aby uruchomić nowy trening albo zmienić konfigurację, najpierw użyj `Odepnij wynik`."
             ),
         )
+
+    strict_request = None
+    if z4_mz_experiment.is_active(self):
+        if _mz_selection is None:
+            return z4_mz_experiment.verify_before_start(self,
+                lambda selection: _start_training(self, _mz_selection=selection))
+        try:
+            z4_mz_experiment.validate_gui_context(self, _mz_selection.protocol)
+        except ValueError as exc:
+            return messagebox.showerror("Eksperyment kontrolowany", str(exc))
+        strict_request = _mz_selection.request
+    elif _mz_selection is not None:
+        return messagebox.showerror("Eksperyment kontrolowany", "Tryb kontrolowany został zmieniony podczas weryfikacji.")
 
     try:
         self._clear_step4_guidance()
@@ -265,7 +283,9 @@ def _start_training(self):
         pass
 
     light_started = time.perf_counter()
-    source_state = z4_training_metrics._validate_training_source_lightweight(self)
+    source_state = ({"ok":True, "yaml_path":str(Path(strict_request["dataset_path"])/"data.yaml"),
+                     "dataset_root":strict_request["dataset_path"]} if strict_request is not None
+                    else z4_training_metrics._validate_training_source_lightweight(self))
     logger.info("[PREFLIGHT] gui_light_validation %.3f s", time.perf_counter() - light_started)
     if not bool(source_state.get("ok")):
         validation_msg = str(source_state.get("message") or "Dataset niegotowy do treningu.")
@@ -286,7 +306,7 @@ def _start_training(self):
 
         self._current_training_dataset_is_pose = bool(is_pose_dataset)
         inferred_target = self._infer_dataset_target(str(dataset_root)) or ("plate" if is_pose_dataset else "char")
-        selected_target = self._get_selected_training_target()
+        selected_target = "char" if strict_request is not None else self._get_selected_training_target()
 
         if not CAMPAIGN.get_active_project_name():
             if inferred_target != selected_target:
@@ -310,13 +330,14 @@ def _start_training(self):
         return messagebox.showerror("Błąd", f"Nie udało się odczytać data.yaml:\n{e}")
 
     dataset_path = str(dataset_root)
-    base_key = self.base_model_var.get().strip()
-    base_model = self.base_custom_var.get().strip() if self._is_custom_base_model_key(base_key) else base_key
+    base_key = Path(strict_request["base_model"]).name if strict_request is not None else self.base_model_var.get().strip()
+    base_model = strict_request["base_model"] if strict_request is not None else (
+        self.base_custom_var.get().strip() if self._is_custom_base_model_key(base_key) else base_key)
     base_model_display = self._resolve_selected_training_base_model_display()
     _base_model_info_path, base_model_info = self._resolve_selected_training_base_model_info(lightweight=True)
-    device = self._device_to_ultralytics(self.device_var.get())
+    device = strict_request["device"] if strict_request is not None else self._device_to_ultralytics(self.device_var.get())
 
-    selection_ok, _selection_message = self._validate_training_base_model_target_compatibility(
+    selection_ok, _selection_message = (True, "") if strict_request is not None else self._validate_training_base_model_target_compatibility(
         target=selected_target,
         show_dialog=True,
         lightweight=True,
@@ -325,7 +346,7 @@ def _start_training(self):
         return
 
     # Rozpoznaj, czy wybrany model jest modelem pose.
-    model_task = z4_training_metrics._training_base_model_task_lightweight(self, base_key, base_model)
+    model_task = "detect" if strict_request is not None else z4_training_metrics._training_base_model_task_lightweight(self, base_key, base_model)
 
     # Zablokuj niezgodne pary dataset-model przed startem treningu.
     if model_task is not None and is_pose_dataset and model_task != "pose":
@@ -346,7 +367,7 @@ def _start_training(self):
     fine_tune_run_label = ""
     fine_tune_metadata = {}
     try:
-        fine_tune_parent_run = self._resolve_step4_fine_tune_parent_run()
+        fine_tune_parent_run = None if strict_request is not None else self._resolve_step4_fine_tune_parent_run()
     except Exception:
         fine_tune_parent_run = None
     if fine_tune_parent_run is not None:
@@ -368,9 +389,16 @@ def _start_training(self):
             }
 
     try:
-        requested_imgsz = self._safe_training_int_value("imgsz_var", default=640, minimum=0)
+        requested_imgsz = strict_request["img_size"] if strict_request is not None else self._safe_training_int_value("imgsz_var", default=640, minimum=0)
     except Exception:
         requested_imgsz = 0
+    # Z4FTGUI001-FIX02 runtime protocol
+    fine_tune_protocol = (
+        z4_fine_tune_protocol.collect(self)
+        if fine_tune_metadata and strict_request is None
+        else {}
+    )
+
     if is_pose_dataset and requested_imgsz < 256:
         return messagebox.showerror(
             "Zbyt mała rozdzielczość wejściowa",
@@ -379,7 +407,7 @@ def _start_training(self):
         )
 
     # Zapisz czytelny nagłówek sesji w terminalu procesu.
-    selected_device_display = self._normalize_training_device_choice(self.device_var.get())
+    selected_device_display = ("cpu" if device == "cpu" else "cuda:" + str(device).removeprefix("cuda:")) if strict_request is not None else self._normalize_training_device_choice(self.device_var.get())
     effective_device_raw, effective_device_profile = self._get_effective_training_device_profile(selected_device_display)
     if effective_device_profile is not None:
         effective_device_desc = (
@@ -406,7 +434,14 @@ def _start_training(self):
         )
 
     self._append_train_log("=" * 70)
-    self._append_train_log(f"START TRENINGU | Nazwa: {self.name_var.get()}")
+    self._append_train_log(f"START TRENINGU | Nazwa: {strict_request['name'] if strict_request is not None else self.name_var.get()}")
+    if strict_request is not None:
+        protocol = _mz_selection.protocol
+        self._append_train_log("Tryb: eksperyment kontrolowany • STRICT")
+        for label, value in (("Experiment ID", protocol["experiment_id"]), ("Wariant", _mz_selection.variant),
+            ("Dataset ID", protocol["dataset"]["dataset_id"]), ("Protocol SHA", protocol["protocol_sha256"]),
+            ("Assignment SHA", protocol["dataset"]["assignment_sha256"]), ("Split SHA", protocol["dataset"]["split_sha256"])):
+            self._append_train_log(f"{label}: {value}")
     self._append_train_log(f"Dataset: {dataset_path}")
     self._append_train_log(f"Wybór w polu 'Model startowy treningu (.pt)': {base_model_display}")
     self._append_train_log(f"Model przekazany do treningu: {base_model}")
@@ -418,18 +453,27 @@ def _start_training(self):
         f"Urządzenie: {selected_device_display} -> {effective_device_desc} | backend Ultralytics: {device}"
     )
     self._append_train_log(
-        f"Epoki: {self._safe_training_int_value('epochs_var', default=100, minimum=1)} | "
-        f"Rozmiar partii: {self._safe_training_int_value('batch_var', default=16, minimum=1)} | "
-        f"Rozdzielczość wejściowa: {self._safe_training_int_value('imgsz_var', default=640, minimum=32)} | "
-        f"Współczynnik uczenia: {self._safe_training_float_value('lr0_var', default=0.01, minimum=0.0001)}"
+        f"Epoki: {strict_request['epochs'] if strict_request is not None else self._safe_training_int_value('epochs_var', default=100, minimum=1)} | "
+        f"Rozmiar partii: {strict_request['batch_size'] if strict_request is not None else self._safe_training_int_value('batch_var', default=16, minimum=1)} | "
+        f"Rozdzielczość wejściowa: {strict_request['img_size'] if strict_request is not None else self._safe_training_int_value('imgsz_var', default=640, minimum=32)} | "
+        f"Współczynnik uczenia: {strict_request['lr0'] if strict_request is not None else self._safe_training_float_value('lr0_var', default=0.01, minimum=0.0001)}"
     )
+    if fine_tune_protocol:
+        self._append_train_log(
+            "Fine-tuning runtime: "
+            f"polityka={fine_tune_protocol.get('memory_policy')} | "
+            f"AMP={fine_tune_protocol.get('amp')} | mosaic={fine_tune_protocol.get('mosaic')} | "
+            f"cache={fine_tune_protocol.get('cache')} | workers={fine_tune_protocol.get('workers')} | "
+            f"plots={fine_tune_protocol.get('plots')} | seed={fine_tune_protocol.get('seed')} | "
+            f"optimizer={fine_tune_protocol.get('optimizer')}"
+        )
     self._append_train_log("Liczebność zbiorów train/val/test zostanie sprawdzona w tle.")
     self._append_train_log("=" * 70)
 
     if not self._begin_step4_operation("z4.training.run", "Z4: przygotowanie treningu"):
         return
 
-    request = {
+    request = dict(strict_request, validate_custom_model=False) if strict_request is not None else {
         "name": str(self.name_var.get() or ""),
         "dataset_path": dataset_path,
         "base_model": base_model,
@@ -442,6 +486,19 @@ def _start_training(self):
         "validate_custom_model": model_task is None,
         **dict(fine_tune_metadata or {}),
     }
+    if fine_tune_protocol:
+        protocol_request = dict(fine_tune_protocol)
+        protocol_request.update({
+            "epochs": int(request.get("epochs", 0) or 0),
+            "batch": int(request.get("batch_size", 0) or 0),
+            "imgsz": int(request.get("img_size", 0) or 0),
+            "lr0": float(request.get("lr0", 0.0) or 0.0),
+            "device": request.get("device"),
+        })
+        # YOLOPoseTrainer ma istniejący kontrakt `training_protocol`; worker
+        # odczyta go z TrainingRun po zapisaniu przez start_training().
+        request["training_protocol"] = protocol_request
+
     _set_training_preparing_ui_state(self, text="Przygotowanie treningu: waliduję i zamrażam dane...", progress=5.0)
     detached_models = _detach_gpu_resources_before_training(self)
     trainer = self.trainer
@@ -706,7 +763,7 @@ def _bind_trainer_callbacks(self):
 
         # Aktualizacja UI w głównym wątku
         def update_ui():
-            _update_training_history_progress(self, run_id=run.id, epoch=epoch, total_epochs=run.epochs)
+            _update_training_history_progress(self, run_id=run.id, epoch=epoch, total_epochs=run.epochs, metrics=epoch_metrics)
             self._set_train_progress_values(overall=pct, epoch=100.0)
             self._update_training_progress_meta(
                 epoch=int(epoch),
@@ -831,13 +888,19 @@ def _bind_trainer_callbacks(self):
     self.trainer.on_resource_report = on_resource_report
 
 def _reload_history_snapshot_from_disk(self) -> bool:
+    trainer = getattr(self, "trainer", None)
+    if bool(getattr(trainer, "is_training", False)):
+        live_history = getattr(trainer, "history", None)
+        if isinstance(live_history, TrainingHistory) and Path(live_history.history_dir).resolve() == Path(self.history.history_dir).resolve():
+            self.history = live_history
+        return False
     history_obj = getattr(self, "history", None)
     history_dir = getattr(history_obj, "history_dir", None)
     if not history_dir:
         return False
 
     try:
-        refreshed = TrainingHistory(history_dir=Path(history_dir))
+        refreshed = TrainingHistory(history_dir=Path(history_dir), reconcile_on_load=False)
     except Exception as e:
         logger.debug(f"Nie udało się przeładować historii treningu z dysku: {e}")
         return False
@@ -976,24 +1039,27 @@ def _set_training_running_ui_state(self, run_id: str | None = None, *, status_te
     if tree is None:
         return
     try:
-        if tree.exists(resolved_run_id):
-            tree.selection_set(resolved_run_id)
-            tree.focus(resolved_run_id)
-            tree.see(resolved_run_id)
+        run = self.history.get_run(resolved_run_id)
+        row_id = z4_history_runtime._history_row_id_for_run(self, run, history=self.history) if run else resolved_run_id
+        if tree.exists(row_id):
+            tree.selection_set(row_id)
+            tree.focus(row_id)
+            tree.see(row_id)
             self._on_run_selected()
     except Exception:
         pass
 
-def _update_training_history_progress(self, *, run_id, epoch=None, total_epochs=None) -> bool:
+def _update_training_history_progress(self, *, run_id, epoch=None, total_epochs=None, metrics=None) -> bool:
     """Update only live cells, without disk reads, rebuilding rows or changing selection."""
     tree = getattr(self, "tree", None)
     trainer = getattr(self, "trainer", None)
     current_run = getattr(trainer, "current_run", None)
-    row_id = str(run_id or "")
-    if (tree is None or not row_id or not bool(getattr(trainer, "is_training", False))
-            or str(getattr(current_run, "id", "")) != row_id
-            or str(getattr(self, "current_run_id", "") or row_id) != row_id):
+    real_run_id = str(run_id or "")
+    if (tree is None or not real_run_id or not bool(getattr(trainer, "is_training", False))
+            or str(getattr(current_run, "id", "")) != real_run_id
+            or str(getattr(self, "current_run_id", "") or real_run_id) != real_run_id):
         return False
+    row_id = z4_history_runtime._history_row_id_for_run(self, current_run, history=getattr(self, "history", None))
     try:
         if not tree.exists(row_id):
             return False
@@ -1006,6 +1072,21 @@ def _update_training_history_progress(self, *, run_id, epoch=None, total_epochs=
         if "pinned_result" in tree.item(row_id, "tags"):
             status = f"★ PODPIĘTY | {status}"
         values = {"Status": status}
+        if metrics is not None:
+            # Native workers write their own history. Mirror their completed-epoch
+            # event in memory, without saving JSON or reading it back each epoch.
+            rows = list(getattr(current_run, "metrics_history", []) or [])
+            if not any(str(row.get("epoch")) == str(epoch) for row in rows):
+                rows.append(dict(metrics, epoch=epoch))
+            current_run.metrics_history = rows
+            for key in ("map50", "map50_95"):
+                attr = "best_" + key
+                setattr(current_run, attr, max(float(getattr(current_run, attr, 0) or 0), float(metrics.get(key, 0) or 0)))
+            current_run.current_epoch = int(epoch)
+            values["mAP50-95"] = f"{current_run.best_map50_95:.3f}"
+            refs = getattr(self, "_history_row_refs", None)
+            if isinstance(refs, dict) and row_id in refs:
+                refs[row_id]["run"] = current_run
         if epoch is not None and total_epochs is not None:
             total = max(1, int(total_epochs))
             values["Epoki"] = f"{max(0, min(int(epoch), total))}/{total}"
@@ -1014,6 +1095,12 @@ def _update_training_history_progress(self, *, run_id, epoch=None, total_epochs=
             if tree.set(row_id, column) != value:
                 tree.set(row_id, column, value)
                 changed = True
+        selection = tree.selection() if metrics is not None else ()
+        if metrics is not None and selection and selection[0] == row_id:
+            refs = getattr(self, "_history_row_refs", None)
+            ref = refs.get(row_id, {}) if isinstance(refs, dict) else {}
+            target = ref.get("target") or str(getattr(current_run, "training_target", "") or "") or self.get_campaign_training_target()
+            z4_training_metrics._refresh_history_epoch_tables(self, current_run, target=target)
         return changed
     except tk.TclError:
         # The view may have been closed while a progress callback was queued.
@@ -1052,14 +1139,39 @@ def _load_history(self):
         pinned_run_ids, pinned_model_keys = set(), set()
 
     self.tree.delete(*self.tree.get_children())
-    for run in self.history.get_all_runs():
+    self._history_row_refs = {}
+    entries = []
+    used_iids = set()
+    for source_target, source_history in z4_history_runtime._get_visible_training_history_sources(self):
+        try:
+            source_dir = Path(source_history.history_dir)
+            project_scope = source_dir.parent.name if source_dir.name == "5_training_runs" else source_dir.name
+        except Exception:
+            project_scope = "history"
+
+        for run in source_history.get_all_runs():
+            if CAMPAIGN.get_active_project_name():
+                iid = str(run.id)
+            else:
+                scope = source_target if source_target in {"plate", "char", "vehicle"} else f"project@{project_scope}"
+                iid = f"{scope}:{run.id}"
+                if iid in used_iids:
+                    suffix = 2
+                    while f"{iid}#{suffix}" in used_iids:
+                        suffix += 1
+                    iid = f"{iid}#{suffix}"
+            used_iids.add(iid)
+            self._history_row_refs[iid] = {"run":run, "history":source_history, "target":source_target}
+            entries.append((iid, source_target, run))
+    entries.sort(key=lambda entry:str(getattr(entry[2], "created_at", "") or ""), reverse=True)
+    for iid, source_target, run in entries:
         if CAMPAIGN.get_active_project_name():
             try:
                 if not self._does_history_run_match_active_campaign_target(run):
                     continue
             except Exception:
                 continue
-        # Zachowaj pełne run.id, aby wybór historii i folderów był jednoznaczny.
+        # The UI ID includes storage scope; run.id remains unchanged.
         best_map = getattr(run, 'best_map50_95', 0.0) or 0.0
         run_target = ""
         try:
@@ -1075,6 +1187,9 @@ def _load_history(self):
                 ).strip().lower()
             except Exception:
                 run_target = ""
+        if not CAMPAIGN.get_active_project_name() and source_target in {"plate", "char", "vehicle"}:
+            run_target = source_target
+        self._history_row_refs[iid]["target"] = run_target
         target_label = self._format_history_run_target_label(run_target)
         run_label = build_run_display_ref(run, kind_hint="training").id
         dataset_path = str(getattr(run, "dataset_path", "") or "").strip()
@@ -1118,7 +1233,7 @@ def _load_history(self):
             model_label = f"★ WYNIK {gate_label} | {model_label}"
             status_label = f"★ PODPIĘTY | {status_label}"
 
-        self.tree.insert("", tk.END, iid=str(run.id), values=(
+        self.tree.insert("", tk.END, iid=iid, values=(
             target_label,
             model_label,
             dataset_label,
@@ -1152,7 +1267,14 @@ def _load_history(self):
 def _delete_selected(self):
     run = self._selected_run()
     if run and messagebox.askyesno("Potwierdź", "Usunąć run treningu?"):
-        self.history.delete_run(run.id, delete_files=True)
+        selected = self.tree.selection()
+        ref = z4_history_runtime._history_row_ref(self, selected[0]) if selected else None
+        if ref is None or ref["run"] is not run:
+            return
+        # Refresh only the selected source before this explicit write, so a
+        # cached catalog cannot overwrite epochs persisted since it was opened.
+        source = TrainingHistory(history_dir=ref["history"].history_dir, reconcile_on_load=False)
+        source.delete_run(run.id, delete_files=True)
         self._load_history()
 
 def _open_run_folder(self):
@@ -1437,12 +1559,16 @@ def _refresh_campaign_training_result_selector(self):
     except Exception:
         selected_label = ""
     preferred_run_id = str(getattr(self, "_preferred_campaign_training_result_run_id", "") or "").strip()
-    if selected_label not in choices and finish_run_id and finish_run_id in set(choices.values()):
+
+    # Gdy wynik bramki jest już przypięty, selektor musi pokazywać właśnie ten
+    # run. Poprzednio stara, ale nadal poprawna etykieta pozostawała w polu,
+    # więc historia wskazywała nowy wynik T06, a nagłówek pokazywał inny run.
+    if finish_run_id and finish_run_id in set(choices.values()):
         for label, run_id in choices.items():
             if run_id == finish_run_id:
                 selected_label = label
                 break
-    elif not finish_run_id and preferred_run_id and preferred_run_id in set(choices.values()):
+    elif preferred_run_id and preferred_run_id in set(choices.values()):
         for label, run_id in choices.items():
             if run_id == preferred_run_id:
                 selected_label = label
@@ -1685,10 +1811,15 @@ def _promote_selected_run_model_to_campaign(self):
     )
 
 def _resume_selected_run(self):
+    if z4_mz_experiment.is_active(self):
+        return messagebox.showerror("Eksperyment kontrolowany", "W trybie kontrolowanym wznowienie jest zablokowane. Nowy run musi startować od oficjalnych wag bazowych.")
     if bool(getattr(self, "_training_start_in_progress", False)):
         return
     run = self._selected_run()
     if run is None:
+        return
+
+    if not z4_history_runtime._ensure_history_run_storage_for_action(self, run):
         return
 
     if not self._is_history_run_resume_allowed(run):
@@ -2031,6 +2162,34 @@ def _use_selected_ranking_model_as_campaign_result(self):
 def _is_history_run_fine_tune_candidate(self, run) -> bool:
     if run is None:
         return False
+
+    if CAMPAIGN.get_active_project_name():
+        if not z4_history_runtime._history_run_matches_active_storage(self, run):
+            return False
+    else:
+        active_target = str(self._get_selected_training_target() or "").strip().lower()
+        run_target = ""
+        try:
+            iid = z4_history_runtime._history_row_id_for_run(self, run)
+            ref = (getattr(self, "_history_row_refs", {}) or {}).get(iid, {})
+            ref_target = str(ref.get("target") or "").strip().lower()
+            if ref_target in {"plate", "char", "vehicle"}:
+                run_target = ref_target
+        except Exception:
+            run_target = ""
+        if not run_target:
+            try:
+                run_target = str(self._infer_history_run_target(run) or "").strip().lower()
+            except Exception:
+                run_target = ""
+        if not run_target:
+            try:
+                run_target = str(self._infer_dataset_target(getattr(run, "dataset_path", "")) or "").strip().lower()
+            except Exception:
+                run_target = ""
+        if active_target in {"plate", "char", "vehicle"} and run_target != active_target:
+            return False
+
     if str(getattr(run, "status", "") or "").strip().lower() != TrainingStatus.COMPLETED.value:
         return False
     try:
@@ -2053,12 +2212,17 @@ def _is_history_run_fine_tune_candidate(self, run) -> bool:
 
 
 def _select_selected_run_as_fine_tune_base(self):
+    if z4_mz_experiment.is_active(self):
+        return messagebox.showerror("Eksperyment kontrolowany", "W trybie kontrolowanym dotrenowanie jest zablokowane. Wyłącz tryb, aby wybrać rodzica.")
     run = self._selected_run()
     if run is None:
         return messagebox.showwarning(
             "Brak runu",
             "Najpierw wybierz ukończony run z historii treningów."
         )
+    if CAMPAIGN.get_active_project_name():
+        if not z4_history_runtime._ensure_history_run_storage_for_action(self, run):
+            return
     if not self._is_history_run_fine_tune_candidate(run):
         return messagebox.showwarning(
             "Nie można dotrenować",
@@ -2080,6 +2244,11 @@ def _select_selected_run_as_fine_tune_base(self):
         self._set_step4_fine_tune_parent_state(run, best_weights)
     finally:
         self._step4_setting_fine_tune_base = False
+
+    try:
+        z4_fine_tune_protocol.refresh_visibility(self)
+    except Exception:
+        pass
 
     try:
         self._refresh_training_base_model_selection_ui()
@@ -2107,6 +2276,8 @@ def _select_selected_run_as_fine_tune_base(self):
 
 
 def _select_selected_ranking_run_as_fine_tune_base(self):
+    if z4_mz_experiment.is_active(self):
+        return messagebox.showerror("Eksperyment kontrolowany", "W trybie kontrolowanym dotrenowanie jest zablokowane. Wyłącz tryb, aby wybrać rodzica.")
     run = _selected_ranking_run(self)
     if run is None:
         return messagebox.showwarning(
@@ -2286,9 +2457,9 @@ def _close_run_details_dialog(self):
         pass
 
 def _open_current_run_details_analysis(self):
-    run = None
+    run = getattr(self, "_run_details_current_run", None)
     run_id = str(getattr(self, "_run_details_current_run_id", "") or "").strip()
-    if run_id:
+    if run is None and run_id:
         try:
             run = self.history.get_run(run_id)
         except Exception:
@@ -2300,9 +2471,9 @@ def _open_current_run_details_analysis(self):
     return self._open_run_analysis_window(run)
 
 def _open_current_run_details_folder(self):
-    run = None
+    run = getattr(self, "_run_details_current_run", None)
     run_id = str(getattr(self, "_run_details_current_run_id", "") or "").strip()
-    if run_id:
+    if run is None and run_id:
         try:
             run = self.history.get_run(run_id)
         except Exception:
@@ -2347,7 +2518,16 @@ def _open_run_details_modal(self, run):
         dialog.title("Szczegóły runu treningowego")
         dialog.geometry("1180x760")
         dialog.minsize(980, 640)
-        dialog.transient(self.frame.winfo_toplevel())
+        # Zwykłe okno, nie transient. Na Windows transient usuwa z ramki
+        # przyciski minimalizacji/maksymalizacji.
+        try:
+            dialog.wm_transient("")
+        except Exception:
+            pass
+        try:
+            dialog.attributes("-toolwindow", False)
+        except Exception:
+            pass
         dialog.resizable(True, True)
         dialog.protocol("WM_DELETE_WINDOW", self._close_run_details_dialog)
         self._run_details_dialog = dialog
@@ -2431,6 +2611,7 @@ def _open_run_details_modal(self, run):
         ).pack(side=tk.RIGHT)
 
     self._run_details_current_run_id = run_id
+    self._run_details_current_run = run
     try:
         self.run_details_title_lbl.configure(text=f"Szczegóły runu: {run_ref.id or self._shorten_training_text(run_name, 72)}")
     except Exception:
@@ -2452,6 +2633,12 @@ def _open_run_details_modal(self, run):
     )
 
     try:
+        # Wyczyść transient również przy ponownym pokazaniu istniejącego okna.
+        dialog.wm_transient("")
+        try:
+            dialog.attributes("-toolwindow", False)
+        except Exception:
+            pass
         dialog.title(f"Szczegóły runu | {run_ref.id or self._shorten_training_text(run_name, 48)}")
         dialog.deiconify()
         dialog.lift()
@@ -2583,6 +2770,15 @@ def _run_validation(self):
 
 def _load_ranking(self):
     if not hasattr(self, "rank_tree"):
+        return
+    from .z4_eval396 import selected_eval396
+    if selected_eval396(self):
+        self.rank_tree.delete(*self.rank_tree.get_children())
+        self._ranking_tree_entry_refs = {}
+        for attr in ("rank_leader_title", "rank_leader_hint", "rank_metrics_hint_lbl"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.configure(text="EVAL396: otwórz WYNIKI — Exact Match / CER na 449 cropach GT.")
         return
     self._ensure_plate_ranking_engine()
     target = self._get_ranking_task_target()

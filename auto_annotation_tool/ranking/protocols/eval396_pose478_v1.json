@@ -1,0 +1,68 @@
+{
+  "schema": "alpr.mt_metric_eligibility.v1",
+  "id": "EVAL396_POSE478_BBOX479_v1",
+  "revision": 1,
+  "selection_sha256": "1f2db18cd073114f230ca2dd70a76ea9d1257d624dddf7ff39f51ada8e66aefe",
+  "gt_freeze_sha256": "33add3fda705416bb88ed9b1ab71e275d2c4f36dd8f5b1bb2f2cbc59130ff77b",
+  "model_labels": ["MT-n", "MT-DAY", "MT-NIGHT"],
+  "authorization": {
+    "source": "operator_message",
+    "date": "2026-10-09",
+    "timezone": "Europe/Warsaw",
+    "statement": "Przyjmuję decyzję o wyłączeniu `plate_000421` wyłącznie z metryk wymagających jednoznacznej identyfikacji czterech narożników Pose.",
+    "scope": "metric_eligibility_only",
+    "visual_geometry_protocol_approved": false,
+    "inference_authorized_by_this_record": false
+  },
+  "expected_counts": {
+    "scenes": 396,
+    "bbox": 479,
+    "pose": 478,
+    "ocr": 449,
+    "pose_exclusions": 1,
+    "per_domain": {
+      "ALL": {"scenes": 396, "bbox": 479, "pose": 478, "ocr": 449},
+      "DAY": {"scenes": 199, "bbox": 235, "pose": 234, "ocr": 230},
+      "NIGHT": {"scenes": 197, "bbox": 244, "pose": 244, "ocr": 219}
+    }
+  },
+  "exclusions": [
+    {
+      "policy_id": "EVAL396_POSE478_BBOX479_v1",
+      "plate_id": "plate_000421",
+      "source_annotation_id": "plate-ann-75627a47e7154bfbaf444acb86e86429",
+      "scene_file": "DAY/SG385F_SG386F_SGLM9MK_001_4688cd857aed_0b956ef8ab.jpg",
+      "source_scene_sha256": "4688cd857aed389ebe651ff71fde977c2dae05f5aaea36be2b4b417f9b579a14",
+      "domain": "DAY",
+      "oriented_size": [2048, 1153],
+      "original_bbox": [1586.37, 492.07, 1616.05, 533.49],
+      "original_quad": [[1586.37, 503.98], [1601.9, 533.49], [1616.05, 520.38], [1600.69, 492.07]],
+      "source_geometry_sha256": "7424e3c3337a28245a3b5029390c4fc5a38fd3160f551d38286741fb2ed6024a",
+      "expected_geometry_issue": "GT_CORNER_ORDER_REVERSED",
+      "reason_code": "AMBIGUOUS_INDEXED_CORNER_IDENTITY",
+      "reason": "Odwrotny obieg wypukłego quada; brak zatwierdzonej fizycznej tożsamości indeksów czterech narożników. Decyzja operatora: wyłączyć tylko ocenę indeksowanego Pose.",
+      "excluded_from": ["indexed_pose_metrics"],
+      "retained_in": ["mt_scene_inference", "box_detection_metrics", "bbox_iou", "unindexed_geometry_diagnostics"],
+      "ocr_eligibility": "unchanged_from_frozen_text_decision",
+      "gt_transform": "none",
+      "corner_reordering": "forbidden"
+    }
+  ],
+  "metric_semantics": {
+    "pose_scope": "indexed_four_corner_metrics_only",
+    "geometric_validity_diagnostics_population": 479,
+    "box_matching": "deterministic_one_to_one_against_all_479_gt",
+    "prediction_matched_to_excluded_gt": "count_for_box; NOT_EVALUATED_for_indexed_pose",
+    "undetected_excluded_gt": "box_FN; no_indexed_pose_FN",
+    "duplicate_predictions": "exclusion_does_not_absorb_unmatched_duplicates",
+    "corner_error_statistics": "report_actual_matched_valid_sample_count_and_coverage_against_478",
+    "missing_invalid_or_bbox_fallback": "retain_explicit_counts_in_pose_coverage",
+    "official_pose_map": "NOT_COMPUTED; requires_separate_validated_pose_only_ignore_protocol",
+    "custom_corner_metric_label": "indexed_corner_error; never_official_Pose_mAP"
+  },
+  "experimental_limitations": [
+    "Historyczne etykiety MT zawierają samoprzecięcia i odwrócone obiegi; ograniczenie interpretacji wyników Pose, bez retreningu w tej kampanii.",
+    "Poprawna geometria i zgodność granic nie zastępują wzrokowego odbioru EXIF/GT.",
+    "Dokładna niezależność SHA nie certyfikuje braku near-duplicates ani znajomości danych pretrainingu."
+  ]
+}

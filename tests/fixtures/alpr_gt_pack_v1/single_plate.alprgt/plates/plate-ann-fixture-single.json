@@ -1,0 +1,18 @@
+{
+  "geometry_heads": [
+    "geom-sha256-551e793309d89e624c8a6532fef2a0f7ffb5890135f287dfb83d005c9f90b853"
+  ],
+  "geometry_revision_ids": [
+    "geom-sha256-551e793309d89e624c8a6532fef2a0f7ffb5890135f287dfb83d005c9f90b853"
+  ],
+  "image_id": "img-sha256-0f8b6327327aa97711d20804dc230cba1940816aedbdc27c4e95726635dc1562",
+  "legacy_ids": [],
+  "plate_id": "plate-ann-fixture-single",
+  "revision_heads": [
+    "rev-sha256-0b72dd1387eb2596ad00625a43575fb4435d302da0294a23756eb3e4eb6fa2eb"
+  ],
+  "revision_ids": [
+    "rev-sha256-0b72dd1387eb2596ad00625a43575fb4435d302da0294a23756eb3e4eb6fa2eb"
+  ],
+  "schema": "alpr.gt.plate.v1"
+}

@@ -695,7 +695,8 @@ def _start_plate_annotation_package_export(self):
     scope_label = "tylko zatwierdzone [OK]" if approved_only else "wszystkie zapisane"
     export_root = Path(options.get("export_root") or self._get_plate_annotation_exports_base_dir())
     try:
-        annotations = [copy.deepcopy(ann) for ann in self._get_plate_annotation_export_annotations(run_dir)]
+        annotations = [copy.deepcopy(ann) for ann in self._get_plate_annotation_export_annotations(
+            run_dir, include_empty=not approved_only)]
     except Exception as e:
         return messagebox.showerror(
             "Eksport anotacji tablic",
@@ -850,6 +851,8 @@ def _start_plate_annotation_package_export(self):
             "annotation_scope": annotation_scope,
             "annotation_scope_label": scope_label,
             "exported_images": int(images_with_plates),
+            "xml_image_records": len(annotations),
+            "images_without_plate_annotations": len(annotations) - int(images_with_plates),
             "exported_plates": int(total_plates),
             "approved_images_in_source_run": int(approved_images),
             "approved_plates_in_source_run": int(approved_plates),
@@ -868,6 +871,8 @@ def _start_plate_annotation_package_export(self):
                 f"Zakres anotacji: {scope_label}\n"
                 f"Obrazy dołączone do pakietu: {'tak' if include_images else 'nie'}\n"
                 f"Obrazy z anotacjami: {images_with_plates}\n"
+                f"Wszystkie rekordy image w XML: {len(annotations)}\n"
+                "Pusty rekord image nie jest automatyczną deklaracją NO_PLATES.\n"
                 f"Tablice: {total_plates}\n"
                 f"Status OK w runie źródłowym: {approved_images} obrazów / {approved_plates} tablic\n"
             ),

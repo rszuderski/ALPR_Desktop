@@ -148,10 +148,12 @@ def test_empty_free_session_does_not_restore_history_implicitly():
 
 
 @pytest.mark.parametrize("free,entry,should_load", [(True, "new", False), (True, "import", False),
-                                                    (True, "continue", True), (False, "new", True)])
+                                                    (True, "continue", True), (False, "new", False),
+                                                    (False, "continue", True)])
 def test_history_is_loaded_when_needed_without_changing_campaign(free, entry, should_load):
     owner = run_owner(free)
     owner._get_manual_entry_mode.return_value = entry
+    owner._get_workflow_route.return_value = "manual"
     owner._manual_review_active = False
     owner._manual_review_from_auto = False
     owner.manual_history_run_var = Value()

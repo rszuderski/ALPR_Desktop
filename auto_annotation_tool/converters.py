@@ -11,9 +11,10 @@ import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .config import CONFIG, logger
+from .rectification.quad_geometry import validated_pose_label_points, pose_label_identity_confirmation, format_pose_label
 
 
 @dataclass
@@ -23,65 +24,23 @@ class PlateAnnotation:
     image_width: int
     image_height: int
     points: List[Tuple[float, float]]  # 4 punkty (x, y) w pikselach
+    attributes: Dict[str, str] = field(default_factory=dict)
     
-    def to_yolo_pose(self) -> Optional[str]:
+    def to_yolo_pose(self) -> str:
         """
         Konwertuje do formatu YOLO Pose.
         
         Format: class_id x_center y_center width height kp1_x kp1_y kp2_x kp2_y kp3_x kp3_y kp4_x kp4_y
         Wszystkie wartości znormalizowane [0, 1]
         """
-        if len(self.points) != 4:
-            return None
-        
-        # Oblicz bbox z punktów
-        xs = [p[0] for p in self.points]
-        ys = [p[1] for p in self.points]
-        
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        
-        # Środek i wymiary (znormalizowane)
-        x_center = ((x_min + x_max) / 2) / self.image_width
-        y_center = ((y_min + y_max) / 2) / self.image_height
-        width = (x_max - x_min) / self.image_width
-        height = (y_max - y_min) / self.image_height
-        
-        # Keypoints (znormalizowane)
-        # Kolejność: TL, TR, BR, BL (sortowane clockwise)
         sorted_points = self._sort_points_clockwise()
         
-        keypoints = []
-        for px, py in sorted_points:
-            kp_x = px / self.image_width
-            kp_y = py / self.image_height
-            keypoints.extend([kp_x, kp_y])
-        
-        # Format: class x_center y_center w h kp1_x kp1_y kp2_x kp2_y kp3_x kp3_y kp4_x kp4_y
-        values = [0, x_center, y_center, width, height] + keypoints
-        
-        return " ".join([f"{v:.6f}" if isinstance(v, float) else str(v) for v in values])
+        return format_pose_label(sorted_points, (self.image_width, self.image_height))
     
     def _sort_points_clockwise(self) -> List[Tuple[float, float]]:
-        """Sortuje 4 punkty w kolejności: TL, TR, BR, BL."""
-        if len(self.points) != 4:
-            return self.points
-        
-        cx = sum(p[0] for p in self.points) / 4
-        cy = sum(p[1] for p in self.points) / 4
-        
-        top = [p for p in self.points if p[1] < cy]
-        bottom = [p for p in self.points if p[1] >= cy]
-        
-        if len(top) != 2 or len(bottom) != 2:
-            sorted_by_y = sorted(self.points, key=lambda p: p[1])
-            top = sorted(sorted_by_y[:2], key=lambda p: p[0])
-            bottom = sorted(sorted_by_y[2:], key=lambda p: p[0])
-        else:
-            top = sorted(top, key=lambda p: p[0])
-            bottom = sorted(bottom, key=lambda p: p[0], reverse=True)
-        
-        return [top[0], top[1], bottom[0], bottom[1]]
+        """Zachowuje zatwierdzone indeksy; nie sortuje położenia na ekranie."""
+        return validated_pose_label_points(self.points, (self.image_width, self.image_height),
+                                           corner_identity_confirmed=pose_label_identity_confirmation(self.attributes))
 
 
 class CVATToYOLOPoseConverter:
@@ -222,10 +181,13 @@ class CVATToYOLOPoseConverter:
         # Parsuj CVAT XML
         logger.info(f"Parsowanie CVAT XML: {cvat_xml_path}")
         annotations = self._parse_cvat_xml(cvat_xml_path, stats)
+        if stats["errors"]:
+            raise ValueError("Nieprawidłowe etykiety Pose: " + stats["errors"][0])
         
         if not annotations:
             stats["errors"].append("Nie znaleziono anotacji tablic")
             return stats
+        prepared_labels = {id(ann): ann.to_yolo_pose() for ann in annotations}
         
         # Grupuj po obrazie
         images_annotations = {}
@@ -275,7 +237,7 @@ class CVATToYOLOPoseConverter:
             
             yolo_lines = []
             for ann in images_annotations[img_name]:
-                yolo_line = ann.to_yolo_pose()
+                yolo_line = prepared_labels[id(ann)]
                 if yolo_line:
                     yolo_lines.append(yolo_line)
                     if split == "train":
@@ -311,6 +273,8 @@ class CVATToYOLOPoseConverter:
                 img_height = int(image.get('height', 0))
                 
                 if not img_name or not img_width or not img_height:
+                    if any(poly.get('label', '').lower() in CONFIG.PLATE_LABELS for poly in image.findall('polygon')):
+                        stats["errors"].append(f"{img_name}: nieprawidłowe wymiary obrazu dla Pose")
                     continue
                 
                 for poly in image.findall('polygon'):
@@ -322,28 +286,32 @@ class CVATToYOLOPoseConverter:
                     points_str = poly.get('points', '')
                     if not points_str:
                         stats["skipped_plates"] += 1
+                        stats["errors"].append(f"{img_name}: KEYPOINTS_MISSING")
                         continue
                     
                     try:
                         points = []
                         for p in points_str.split(';'):
-                            if ',' in p:
-                                x, y = p.strip().split(',')
-                                points.append((float(x), float(y)))
+                            x, y = p.strip().split(',')
+                            points.append((float(x), float(y)))
                         
                         if len(points) == 4:
                             ann = PlateAnnotation(
                                 image_name=img_name,
                                 image_width=img_width,
                                 image_height=img_height,
-                                points=points
+                                points=points,
+                                attributes={a.get('name', ''): a.text or '' for a in poly.findall('attribute')},
                             )
+                            ann.to_yolo_pose()
                             annotations.append(ann)
                         else:
                             stats["skipped_plates"] += 1
+                            stats["errors"].append(f"{img_name}: KEYPOINTS_MISSING ({len(points)})")
                             
-                    except (ValueError, AttributeError):
+                    except (ValueError, AttributeError) as exc:
                         stats["skipped_plates"] += 1
+                        stats["errors"].append(f"{img_name}: {exc}")
                         
         except ET.ParseError as e:
             stats["errors"].append(f"Błąd parsowania XML: {e}")

@@ -12,7 +12,7 @@
     "full_help": "Eksportuje z PZ3 zestaw kompatybilny z późniejszym importem CVAT. Dotyczy cropów tablic i boxów znaków, nie boxów tablic na pełnych zdjęciach. Używaj tylko wtedy, gdy chcesz poprawiać znaki poza aplikacją."
   },
   "btn_export_yolo": {
-    "full_help": "Buduje źródłowy dataset znaków z tablic oznaczonych jako perfect i z wybranych źródeł gold packa. PZ3 przygotowuje materiał źródłowy, a wariant treningowy, split i wybór modelu są dalej obsługiwane w Z4."
+    "full_help": "Tworzy źródłowy zbiór znaków z tablic, które zostały sprawdzone i zatwierdzone. Wariant treningowy i podział danych przygotujesz później w części treningowej."
   },
   "btn_import_cvat": {
     "full_help": "Importuje poprawki z CVAT z powrotem do aktywnego zestawu PZ3. Import jest zgodny z eksportem PZ3: oczekuje cropów tablic i boxów znaków, a nie XML-a z boxami tablic na pełnych zdjęciach."
@@ -54,7 +54,7 @@
     "full_help": "Karta E2. Tutaj wybierasz tor iteracji i przechodzisz do Z2 albo wracasz tam, by uzupełnić tablice."
   },
   "camp_step3": {
-    "full_help": "Karta E3. Prowadzi do Z3, gdzie wycinasz tablice, uruchamiasz OCR, poprawiasz znaki i budujesz materiał gold/manual."
+    "full_help": "Etap przygotowania znaków. Najpierw wyodrębniasz tablice, potem sprawdzasz i poprawiasz ramki oraz znaki, a na końcu tworzysz źródłowy zbiór znaków."
   },
   "camp_step4": {
     "full_help": "Karta E4T/E4Z. Prowadzi do Z4, gdzie budujesz wariant datasetu iteracji, trenujesz model tablic albo znaków i oceniasz wynik."
@@ -147,10 +147,10 @@
     "full_help": "Techniczny panel wskazania gotowego datasetu YOLO znaków. Jest zachowany pomocniczo, ale główna praca z wariantami, splitem i treningiem odbywa się teraz w Z4/PZ1 i Z4/PZ2."
   },
   "t2_pz3_goldpack": {
-    "full_help": "Gold pack to zaufany zestaw tablic oznaczonych jako perfect oraz wybrane źródła znaków. PZ3 używa go do zbudowania źródłowego datasetu znaków, który później trafia do Z4."
+    "full_help": "Tutaj wybierasz zakres sprawdzonych i zatwierdzonych tablic, z których ma powstać źródłowy zbiór znaków."
   },
   "t2_pz3_source": {
-    "full_help": "Źródło pracy [Z3]/[PZ3]. Domyślnie PZ3 pracuje na perfectach z aktywnego runu PZ2 oraz ręcznych importach. Gotowe warianty treningowe i split przygotowujesz później w Z4."
+    "full_help": "Źródłem są sprawdzone i zatwierdzone tablice z bieżącej pracy oraz ręczne poprawki. Gotowy wariant treningowy i podział danych przygotujesz później."
   },
   "t2_to_dataset": {
     "full_help": "Przechodzi z PZ2 do PZ3, gdy zestaw tablic jest gotowy do integracji i eksportu datasetu znaków."

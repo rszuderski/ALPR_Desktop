@@ -1849,6 +1849,10 @@ def open_filter_lab(host):
             pass
 
     def add_slider(parent, label, var, from_, to_, res, ghost_key="", help_key=""):
+        from .z3_threshold_percent import format_percent, percent_label, percent_reference
+        reference = percent_reference(self, var)
+        if reference is not None:
+            label = percent_label(label)
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=4)
 
@@ -1862,7 +1866,10 @@ def open_filter_lab(host):
             params_dict = best_preset_data["params"]
             if ghost_key in params_dict:
                 val = params_dict[ghost_key]
-                ghost_str = f"{val:.1f}" if isinstance(val, float) else str(val)
+                if reference is not None:
+                    ghost_str = format_percent(val, reference, suffix=True)
+                else:
+                    ghost_str = f"{val:.1f}" if isinstance(val, float) else str(val)
                 ttk.Label(
                     lbl_f,
                     text=f"[Zwycięzca: {ghost_str}]",
@@ -1873,12 +1880,13 @@ def open_filter_lab(host):
         s = ttk.Scale(f, from_=from_, to=to_, variable=var, command=update_preview)
         s.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        l = ttk.Label(f, width=5)
+        l = ttk.Label(f, width=9 if reference is not None else 5)
         l.pack(side=tk.RIGHT)
 
         def update_lbl(*a):
             if lab_win.winfo_exists():
-                l.config(text=f"{var.get():.{res}f}")
+                value = format_percent(var.get(), reference, suffix=True) if reference is not None else f"{var.get():.{res}f}"
+                l.config(text=value)
 
         trace_id = var.trace_add("write", update_lbl)
         active_traces.append((var, trace_id))
@@ -1945,7 +1953,7 @@ def open_filter_lab(host):
 
     filt = ttk.LabelFrame(scrollable_frame, text=" 2. Filtry bazowe ", padding=10)
     filt.pack(fill=tk.X, pady=(0, 10))
-    add_slider(filt, "Odcięcie odblasków (255=Wył):", self.prep_clip_var, 100, 255, 0, "clip_thresh", "lab_clip")
+    add_slider(filt, "Odcięcie odblasków (100%=Wył):", self.prep_clip_var, 100, 255, 0, "clip_thresh", "lab_clip")
     add_slider(filt, "Usuwanie ziarna (0=Wył):", self.prep_denoise_var, 0, 50, 0, "denoise_h", "lab_denoise")
     cb2 = ttk.Checkbutton(filt, text="Wzmacniaj kontrast (CLAHE)", variable=self.do_clahe_var, command=update_preview)
     cb2.pack(anchor=tk.W)
@@ -1956,13 +1964,13 @@ def open_filter_lab(host):
     bina.pack(fill=tk.X, pady=(0, 10))
     ttk.Checkbutton(bina, text="Włącz pełną binaryzację", variable=self.prep_use_bin_var, command=update_preview).pack(anchor=tk.W)
     add_slider(bina, "Rozmiar bloku (nieparzyste):", self.prep_block_var, 3, 51, 0, "thresh_block", "lab_block")
-    add_slider(bina, "Stała odcięcia (C):", self.prep_c_var, -20, 20, 0, "thresh_c", "lab_c")
+    add_slider(bina, "Stała odcięcia C (skala jasności):", self.prep_c_var, -20, 20, 0, "thresh_c", "lab_c")
     add_slider(bina, "Pogrubianie liter (Erozja):", self.prep_erode_var, 0, 5, 0, "erode_iter", "lab_erode")
     add_slider(bina, "Biała ramka - Padding [%]:", self.prep_padding_var, 0, 50, 0, "padding_pct", "lab_pad")
 
     ocr_f = ttk.LabelFrame(scrollable_frame, text=" 4. Parametry Sieci (OCR) ", padding=10)
     ocr_f.pack(fill=tk.X, pady=(0, 10))
-    add_slider(ocr_f, "Wymagany próg pewności (0-1.0):", self.ocr_conf_var, 0.05, 0.95, 2, "char_ocr_conf", "lab_conf")
+    add_slider(ocr_f, "Wymagany próg pewności OCR:", self.ocr_conf_var, 0.05, 0.95, 2, "char_ocr_conf", "lab_conf")
 
     add_slider(ocr_f, "Min. wysokość boxa OCR:", self.ocr_min_height_ratio_var, 0.20, 1.00, 2, "char_ocr_min_height_ratio", "lab_conf")
 

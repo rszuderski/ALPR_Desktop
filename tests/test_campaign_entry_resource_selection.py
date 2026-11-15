@@ -155,11 +155,35 @@ class EntryResourceSelectionTests(unittest.TestCase):
             self.refresh_rows()
         self.campaign.set_iteration_path.assert_not_called()
 
-    def test_az_is_honestly_planned_not_blocked_by_route(self):
-        rows = self.refresh_rows()
-        self.assertIn("Planowane", rows["char_run"]["validation_text"])
-        self.assertNotIn("wybierz", rows["char_run"]["validation_text"].lower())
+    def test_az_registry_state_is_not_blocked_by_route(self):
+        az_state = {
+            "project_id": "PRJ-DEMO",
+            "project_exists": True,
+            "crop_count": 0,
+            "az_count": 0,
+            "usable_count": 0,
+            "ready_count": 0,
+            "pending_review_count": 0,
+            "excluded_count": 0,
+            "other_count": 0,
+            "missing_count": 0,
+            "reviewed_count": 0,
+            "review_required": False,
+            "review_complete": False,
+            "contract_ready": False,
+            "coverage_status": "no_crops",
+            "latest_updated_at": "",
+        }
+        with patch.object(
+            assets,
+            "_get_project_start_az_resource_state",
+            return_value=az_state,
+        ):
+            rows = self.refresh_rows()
+
+        self.assertIn("Brak cropów PZ1", rows["char_run"]["validation_text"])
         self.assertFalse(rows["char_run"]["meta"]["contract_ready"])
+        self.campaign.set_iteration_path.assert_not_called()
 
     def test_model_picker_does_not_require_route(self):
         self.owner._open_project_start_model_candidate_browser.return_value = True
@@ -172,6 +196,69 @@ class EntryResourceSelectionTests(unittest.TestCase):
         self.assertFalse(is_transition_ready(spec, CampaignTransitionEvalContext(
             current_step=1, current_iteration=1, image_count=1000, material_ready=True, plate_material_count=50,
         )))
+
+    def test_filename_tokens_are_hint_not_at_import_gate(self):
+        class Host:
+            @staticmethod
+            def _get_project_start_filename_plate_texts(filename):
+                return assets._get_project_start_filename_plate_texts(filename)
+
+        host = Host()
+
+        self.assertEqual(
+            assets._get_project_start_filename_plate_texts("B955ET_0017.jpg"),
+            ["B955ET", "0017"],
+        )
+        self.assertEqual(
+            assets._project_start_annotation_covers_filename_plates(
+                host, "B955ET_0017.jpg", 1
+            ),
+            (True, 2),
+        )
+
+        self.assertEqual(
+            assets._get_project_start_filename_plate_texts(
+                "1TF8664_SK188LN_001.jpg"
+            ),
+            ["1TF8664", "SK188LN"],
+        )
+        self.assertEqual(
+            assets._project_start_annotation_covers_filename_plates(
+                host, "1TF8664_SK188LN_001.jpg", 1
+            ),
+            (True, 2),
+        )
+
+    def test_single_filename_token_remains_accepted(self):
+        class Host:
+            @staticmethod
+            def _get_project_start_filename_plate_texts(filename):
+                return assets._get_project_start_filename_plate_texts(filename)
+
+        self.assertEqual(
+            assets._project_start_annotation_covers_filename_plates(
+                Host(), "WI1234A_001.jpg", 1
+            ),
+            (True, 1),
+        )
+
+    def test_clear_images_uses_lightweight_state_cleanup(self):
+        self.owner._is_project_start_asset_clearable.return_value = True
+        self.owner._get_iteration_target.return_value = ""
+        self.owner._clear_dashboard_perf_cache = Mock()
+        self.owner._sync_iteration_artifact_registry_from_project_start = Mock()
+        self.owner._refresh_dashboard = Mock()
+        self.owner.app.update_status = Mock()
+        self.campaign.clear_step1_image_source_state.return_value = {"ok": True}
+
+        with patch.object(assets.messagebox, "askyesno", return_value=True):
+            assets._clear_project_start_asset(self.owner, "images")
+
+        self.campaign.clear_step1_image_source_state.assert_called_once_with()
+        self.campaign.clear_master_pool_dir.assert_not_called()
+        self.campaign.clear_latest_ingest_plan.assert_not_called()
+        self.owner._sync_iteration_artifact_registry_from_project_start.assert_not_called()
+        self.owner._refresh_dashboard.assert_called_once_with()
 
 
 if __name__ == "__main__":

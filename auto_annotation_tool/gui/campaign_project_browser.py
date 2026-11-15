@@ -103,6 +103,30 @@ def _reset_campaign_graph_runtime_state(self) -> None:
         except Exception:
             pass
 
+def _reset_campaign_project_runtime_state(self) -> None:
+    """Clear transient CampaignTab state when the active project context changes."""
+    try:
+        self._ingest_plan_generation_token = None
+    except Exception:
+        pass
+
+    for attr_name, value in (
+        ("current_ingest_plan", {}),
+        ("ingest_plan_items", []),
+        ("last_ingest_snapshot", {}),
+        ("_existing_iteration_ingest_plan_signature", None),
+    ):
+        try:
+            setattr(self, attr_name, value)
+        except Exception:
+            pass
+
+    try:
+        self._clear_dashboard_perf_cache()
+    except Exception:
+        pass
+
+
 def _add_new_project(self):
     new_name = self.app.themed_ask_string(
         "Nowy projekt",
@@ -131,6 +155,7 @@ def _add_new_project(self):
     self._project_switch_in_progress = True
     try:
         self._reset_campaign_graph_runtime_state()
+        self._reset_campaign_project_runtime_state()
         if active_before:
             try:
                 self._release_active_project_resources_before_switch(active_before)
@@ -622,6 +647,10 @@ def _release_active_project_resources_before_switch(self, current_project: str =
         pass
 
     self._clear_project_contexts(restore_free_mode_preview=False)
+    try:
+        self._reset_campaign_project_runtime_state()
+    except Exception as e:
+        logger.debug(f"Nie udało się wyczyścić runtime E1 przed zmianą projektu: {e}")
 
     try:
         self.frame.update_idletasks()
@@ -806,13 +835,15 @@ def _clear_project_contexts(
                     setattr(tab, "_campaign_graph_entry_context", {})
                 except Exception:
                     pass
-                if lightweight_tab_clear:
-                    try:
-                        setattr(tab, "_campaign_lightweight_context_detached", True)
-                    except Exception:
-                        pass
-                    logger.debug(f"Lekko odpinam kontekst {label} bez czyszczenia niewidocznego UI.")
-                    continue
+                if lightweight_tab_clear and tab_key != "training":
+                    # "Lightweight" oznacza tylko: nie odtwarzaj ciężkiego
+                    # podglądu free mode. Nie wolno pomijać samego czyszczenia
+                    # kontekstu kampanii, bo po wejściu do Z2/Z3 zostaje wtedy
+                    # stary shell projektu. Marker detached nie był nigdzie konsumowany.
+                    logger.debug(
+                        f"Odpinam kontekst {label} bez odtwarzania ciężkiego "
+                        "podglądu trybu swobodnego."
+                    )
                 clear_context = getattr(tab, "clear_campaign_context", None)
                 if clear_context is None:
                     continue

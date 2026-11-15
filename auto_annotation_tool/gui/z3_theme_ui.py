@@ -678,9 +678,13 @@ def apply_character_annotation_theme(host, progress_bar_cls) -> None:
     try:
         self.app.style_canvas_widget(
             self.preview_canvas,
-            background=palette.get("panel", "#1e1e1e"),
+            background="#1e1e1e",
             bordercolor=console_border,
         )
+        if hasattr(self, "preview_canvas_host"):
+            self.preview_canvas_host.configure(bg="#1e1e1e")
+        if hasattr(self, "preview_badge_legend"):
+            self.preview_badge_legend.refresh()
     except Exception:
         pass
 
@@ -1036,3 +1040,8 @@ def apply_character_annotation_theme(host, progress_bar_cls) -> None:
             refresh()
     except Exception:
         pass
+
+    # Restore the loading card after the generic panel pass flattens its
+    # nested backgrounds. Keep the current text, value and animation.
+    from .z3_extraction_tab_ui import _apply_campaign_detect_splash_theme
+    _apply_campaign_detect_splash_theme(self)

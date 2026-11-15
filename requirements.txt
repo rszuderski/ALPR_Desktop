@@ -1,2 +1,2 @@
-# Standardowa instalacja aplikacji; eksport mobilny jest opcjonalny.
+-c requirements-constraints.txt
 -r requirements-runtime.txt

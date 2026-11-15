@@ -197,7 +197,9 @@ def _sync_left_panel_canvas_width(self, event=None):
 def _should_show_free_mode_manual_right_panel(self) -> bool:
     if not self._is_free_mode_session_context():
         return False
-    if bool(getattr(self, "_preview_fullscreen_active", False)):
+    if bool(getattr(self, "_preview_fullscreen_active", False)) and not getattr(
+        getattr(self, "_preview_workspace_drawers", None), "detached", False
+    ):
         return False
     try:
         route = str(self._get_workflow_route() or "").strip().lower()
@@ -236,7 +238,9 @@ def _should_show_free_mode_manual_right_panel(self) -> bool:
 
 
 def _should_show_right_panel(self) -> bool:
-    if bool(getattr(self, "_preview_fullscreen_active", False)):
+    if bool(getattr(self, "_preview_fullscreen_active", False)) and not getattr(
+        getattr(self, "_preview_workspace_drawers", None), "detached", False
+    ):
         return False
     if self._is_free_mode_session_context():
         return self._should_show_free_mode_manual_right_panel()
@@ -288,6 +292,10 @@ def _sync_preview_left_counter_layout_width(self) -> None:
 
 
 def _sync_main_pane_right_panel_visibility(self):
+    drawers = getattr(self, "_preview_workspace_drawers", None)
+    if drawers is not None and drawers.detached:
+        drawers.sync_right_visibility(self._should_show_right_panel())
+        return
     pane = getattr(self, "main_pane", None)
     right_frame = getattr(self, "main_right_frame", None)
     if pane is None or right_frame is None:
@@ -298,7 +306,7 @@ def _sync_main_pane_right_panel_visibility(self):
 
     try:
         if should_show and not has_right:
-            pane.add(right_frame, weight=1)
+            pane.add(right_frame, weight=0)
         elif not should_show and has_right:
             pane.forget(right_frame)
     except Exception:
@@ -451,7 +459,7 @@ def _restore_right_panel_content_after_fullscreen(self):
 
     try:
         if not self._pane_has_child(pane, right_frame):
-            pane.add(right_frame, weight=1)
+            pane.add(right_frame, weight=0)
     except Exception:
         pass
 
@@ -537,7 +545,7 @@ def _get_main_pane_width_limits(self) -> tuple[int, int]:
         int(left_counter_req),
     )
     left_min = max(280, min(420, left_base_req))
-    right_min = max(320, min(460, right_content_req + right_scrollbar_req + 20))
+    right_min = max(260, min(280, right_content_req + right_scrollbar_req + 16))
     return int(left_min), int(right_min)
 
 
@@ -618,13 +626,14 @@ def _sync_approve_hint_wraplength(self, event=None):
     if width <= 1:
         return
 
-    wraplength = max(220, int(width) - 34)
-    for widget_name in ("approve_context_lbl", "approve_gate_hint_lbl", "approve_breakdown_lbl"):
+    wraplength = max(1, int(width) - 54)
+    for widget_name in ("approve_context_lbl", "approve_gate_hint_lbl", "approve_breakdown_lbl",
+                        "approve_hint_title_lbl", "approve_breakdown_title_lbl"):
         label = getattr(self, widget_name, None)
         if label is None:
             continue
         try:
-            if int(float(label.cget("wraplength") or 0)) != wraplength:
+            if label.winfo_pixels(label.cget("wraplength")) != wraplength:
                 label.configure(wraplength=wraplength)
         except Exception:
             pass
@@ -1105,11 +1114,110 @@ def _preview_annotation_passes_metric_filters(self, ann) -> bool:
     return True
 
 
+def _get_t02_review_scope_filenames(self) -> set[str]:
+    """Nazwy obrazów, które faktycznie mają AT tablicy w pakiecie kontrolowanym przez T02."""
+    try:
+        from .z2_shared_ui import is_campaign_t02_at_review_context
+
+        if not is_campaign_t02_at_review_context(self):
+            return set()
+    except Exception:
+        return set()
+
+    def _normalize_name(value) -> str:
+        text = str(value or "").strip().replace("\\", "/")
+        if not text:
+            return ""
+        return text.rsplit("/", 1)[-1].lower()
+
+    def _image_has_plate_shape(image_el) -> bool:
+        negative_label_parts = ("vehicle", "car", "pojazd")
+        positive_label_parts = ("plate", "tablic")
+        for det_el in list(image_el):
+            tag_name = str(getattr(det_el, "tag", "") or "").strip().lower()
+            if tag_name not in {"polygon", "box"}:
+                continue
+            label = str(det_el.get("label", "") or "").strip().lower()
+            if label and any(part in label for part in negative_label_parts):
+                continue
+            if not label or any(part in label for part in positive_label_parts):
+                return True
+        return False
+
+    # Kanoniczny zakres T02 to obrazy, które w źródłowym XML faktycznie mają
+    # anotację tablicy. Sam XML może zawierać setki pustych <image> z całego O.
+    try:
+        from ..campaign_manager import CAMPAIGN
+
+        source = dict(CAMPAIGN.get_project_start_plate_source() or {})
+        source_xml = str(source.get("source_xml_path") or "").strip()
+    except Exception:
+        source_xml = ""
+
+    if source_xml:
+        try:
+            xml_path = Path(source_xml)
+            if xml_path.exists() and xml_path.is_file():
+                root = ET.parse(xml_path).getroot()
+                names = {
+                    _normalize_name(image_el.get("name"))
+                    for image_el in root.findall(".//image")
+                    if _image_has_plate_shape(image_el)
+                }
+                names.discard("")
+                if names:
+                    return names
+        except Exception:
+            pass
+
+    # Fallback dla starszych/importowanych runów: jawny scope z manifestu.
+    manifest = {}
+    for run_dir in (
+        getattr(self, "current_annotation_run_dir", None),
+        getattr(self, "last_staging_run_dir", None),
+    ):
+        if run_dir is None:
+            continue
+        try:
+            payload = self._load_annotation_run_manifest(run_dir)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict) and payload:
+            manifest = payload
+            break
+
+    result = {
+        _normalize_name(raw_name)
+        for raw_name in list(manifest.get("input_scope_filenames") or [])
+    }
+    result.discard("")
+    return result
+
 def _filter_preview_list_entries(
     self,
     entries: list[tuple[int, ImageAnnotation]],
 ) -> list[tuple[int, ImageAnnotation]]:
+    from .z2_gt_readiness import annotation_gt_readiness, missing_required_gt
+    from .z2_gt_review import missing_gt_filter_active
     filtered_entries = list(entries or [])
+
+    t02_scope_filenames = _get_t02_review_scope_filenames(self)
+    if t02_scope_filenames:
+        filtered_entries = [
+            (actual_idx, ann)
+            for actual_idx, ann in filtered_entries
+            if str(getattr(ann, "filename", "") or "")
+            .strip()
+            .replace("\\", "/")
+            .rsplit("/", 1)[-1]
+            .lower()
+            in t02_scope_filenames
+        ]
+
+    if missing_gt_filter_active(self):
+        # The repair filter must also reveal previously approved rows and must
+        # not hide missing GT behind confidence/fit thresholds.
+        return [(idx, ann) for idx, ann in filtered_entries if annotation_gt_readiness(ann)["missing"]]
     if not self._is_free_mode_session_context():
         try:
             project_approved_lookup = set(self._get_campaign_hidden_project_approved_filenames_runtime() or set())
@@ -1120,6 +1228,7 @@ def _filter_preview_list_entries(
                 (actual_idx, ann)
                 for actual_idx, ann in filtered_entries
                 if str(getattr(ann, "filename", "") or "").strip().lower() not in project_approved_lookup
+                or missing_required_gt(self, ann)
             ]
 
     conf_threshold, fit_threshold = self._get_preview_metric_filter_thresholds()
@@ -1133,6 +1242,9 @@ def _filter_preview_list_entries(
 
 
 def _reset_preview_metric_filters(self):
+    variable = getattr(self, "preview_missing_gt_only_var", None)
+    if variable is not None:
+        variable.set(False)
     self.preview_filter_conf_var.set(0.0)
     self.preview_filter_fit_var.set(0.0)
     self._preview_filter_conf_applied = 0.0

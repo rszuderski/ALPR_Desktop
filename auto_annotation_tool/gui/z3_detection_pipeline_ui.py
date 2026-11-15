@@ -9,6 +9,7 @@ from ..campaign_manager import CAMPAIGN
 from .z3_detection_controls_ui import normalize_detection_method_key
 from .z3_model_metadata_dialog import show_yolo_model_metadata_dialog
 from .web_slim_scrollbar import blend_hex_colors
+from .z3_threshold_percent import create_percent_spinbox, percent_label, percent_reference
 
 if TYPE_CHECKING:
     from .tab_character_annotation import CharacterAnnotationTab
@@ -731,6 +732,9 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
                 from_ = max(0.00001, float(from_))
         except Exception:
             pass
+        reference = percent_reference(self, variable)
+        if reference is not None:
+            text = percent_label(text)
         row_bg = widget_bg(parent)
         row = tk.Frame(parent, bg=row_bg, bd=0, highlightthickness=0)
         row.pack(fill=tk.X, pady=(0, 9))
@@ -746,14 +750,19 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
             bd=0,
             highlightthickness=0,
         ).grid(row=0, column=0, sticky="w")
-        spin = ttk.Spinbox(row, from_=from_, to=to_, increment=increment, textvariable=variable, width=width, format="%.5f")
+        if reference is not None:
+            spin = create_percent_spinbox(row, variable=variable, from_=from_, to=to_, increment=increment,
+                                          reference=reference, width=width, command=save_pipeline_advanced_options)
+        else:
+            spin = ttk.Spinbox(row, from_=from_, to=to_, increment=increment, textvariable=variable, width=width, format="%.5f")
         spin.grid(row=0, column=2, sticky="e")
-        try:
-            spin.configure(command=save_pipeline_advanced_options)
-            spin.bind("<FocusOut>", lambda _event: save_pipeline_advanced_options(), add="+")
-            spin.bind("<Return>", lambda _event: save_pipeline_advanced_options(), add="+")
-        except Exception:
-            pass
+        if reference is None:
+            try:
+                spin.configure(command=save_pipeline_advanced_options)
+                spin.bind("<FocusOut>", lambda _event: save_pipeline_advanced_options(), add="+")
+                spin.bind("<Return>", lambda _event: save_pipeline_advanced_options(), add="+")
+            except Exception:
+                pass
         if hint:
             tk.Label(
                 parent,
@@ -766,7 +775,7 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
                 anchor="w",
                 bd=0,
                 highlightthickness=0,
-            ).pack(anchor=tk.W, fill=tk.X, pady=(-4, 9))
+            ).pack(anchor=tk.W, fill=tk.X, pady=(0, 9))
         return spin
 
     def add_check(parent, text, variable, *, command=None, onvalue=True, offvalue=False, hint=None):
@@ -806,7 +815,7 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
                 anchor="w",
                 bd=0,
                 highlightthickness=0,
-            ).pack(anchor=tk.W, fill=tk.X, padx=(24, 0), pady=(-6, 9))
+            ).pack(anchor=tk.W, fill=tk.X, padx=(24, 0), pady=(0, 9))
         return check
 
     def add_choice(parent, text, variable, values, *, width=18, hint=None):
@@ -850,7 +859,7 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
                 anchor="w",
                 bd=0,
                 highlightthickness=0,
-            ).pack(anchor=tk.W, fill=tk.X, pady=(-4, 9))
+            ).pack(anchor=tk.W, fill=tk.X, pady=(0, 9))
         return combo
 
     def save_pipeline_advanced_options():
@@ -926,7 +935,7 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
             0.10,
             1.50,
             0.05,
-            hint="Jak bardzo znaki mogą odbiegać od wspólnej linii. Niżej: ostrzej pilnuje rzędu. Wyżej: lepiej znosi krzywe lub nierówne tablice.",
+            hint="Odchylenie środków znaków od wspólnej linii jako procent mediany wysokości. Wyżej: większa tolerancja dla krzywych tablic.",
         )
         add_spin(
             sequence,
@@ -944,7 +953,7 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
             1.00,
             3.50,
             0.05,
-            hint="Odrzuca kandydaty zbyt wysokie względem reszty znaków. Pomaga, gdy YOLO obejmie część ramki tablicy albo tło.",
+            hint="100% = mediana wysokości ramek w rzędzie. Odrzuca kandydaty wyższe od ustawionego limitu.",
         )
         add_spin(
             sequence,
@@ -953,7 +962,7 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
             1.00,
             4.50,
             0.05,
-            hint="Odrzuca ramki podejrzanie szerokie. To główny bezpiecznik przeciw boxom obejmującym dwa sąsiednie znaki.",
+            hint="100% = mediana szerokości ramek w rzędzie. Odrzuca ramki szersze od limitu, np. obejmujące dwa znaki.",
         )
         add_spin(
             sequence,
@@ -1093,7 +1102,8 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
             self.prep_use_bin_var,
             command=save_pipeline_advanced_options,
         )
-        add_spin(base, "Odcięcie odblasków:", self.prep_clip_var, 100, 255, 1)
+        add_spin(base, "Odcięcie odblasków:", self.prep_clip_var, 100, 255, 1,
+                 hint="Próg jasności: 100% odpowiada pełnej skali jasności i wyłącza odcięcie.")
         add_spin(base, "Usuwanie ziarna:", self.prep_denoise_var, 0, 50, 1)
         add_check(
             base,
@@ -1104,7 +1114,8 @@ def open_detection_pipeline_advanced_modal(host, block_key: str) -> None:
         )
         add_spin(base, "Siła CLAHE:", self.prep_clahe_var, 0.0, 10.0, 0.5)
         add_spin(base, "Blok binaryzacji:", self.prep_block_var, 3, 51, 2)
-        add_spin(base, "Stała C:", self.prep_c_var, -20, 20, 1)
+        add_spin(base, "Stała C:", self.prep_c_var, -20, 20, 1,
+                 hint="Korekta progu binaryzacji jako procent pełnej skali jasności.")
         add_spin(base, "Erozja:", self.prep_erode_var, 0, 5, 1)
 
     footer = ttk.Frame(root)
@@ -1356,18 +1367,25 @@ def refresh_detection_pipeline_builder_property_panel(host):
                 from_ = max(0.00001, float(from_))
         except Exception:
             pass
+        reference = percent_reference(self, variable)
+        if reference is not None:
+            text = percent_label(text)
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(row, text=text).pack(side=tk.LEFT)
-        spin = ttk.Spinbox(row, from_=from_, to=to_, increment=increment, textvariable=variable, width=width, format="%.5f")
-        spin.pack(side=tk.RIGHT)
         save_command = command or self._on_yolo_option_var_write
-        try:
-            spin.configure(command=save_command)
-            spin.bind("<FocusOut>", lambda _event: save_command(), add="+")
-            spin.bind("<Return>", lambda _event: save_command(), add="+")
-        except Exception:
-            pass
+        if reference is not None:
+            spin = create_percent_spinbox(row, variable=variable, from_=from_, to=to_, increment=increment,
+                                          reference=reference, width=width, command=save_command)
+        else:
+            spin = ttk.Spinbox(row, from_=from_, to=to_, increment=increment, textvariable=variable, width=width, format="%.5f")
+            try:
+                spin.configure(command=save_command)
+                spin.bind("<FocusOut>", lambda _event: save_command(), add="+")
+                spin.bind("<Return>", lambda _event: save_command(), add="+")
+            except Exception:
+                pass
+        spin.pack(side=tk.RIGHT)
         if hint:
             add_hint(parent, hint)
         return spin
@@ -1508,7 +1526,7 @@ def refresh_detection_pipeline_builder_property_panel(host):
             0.10,
             1.50,
             0.05,
-            hint="Jak bardzo znaki mogą odbiegać od wspólnej linii. Wyżej: większa tolerancja dla krzywych tablic.",
+            hint="Odchylenie środków znaków od wspólnej linii jako procent mediany wysokości. Wyżej: większa tolerancja dla krzywych tablic.",
         )
         add_spin(
             parent,
@@ -1526,7 +1544,7 @@ def refresh_detection_pipeline_builder_property_panel(host):
             1.00,
             3.50,
             0.05,
-            hint="Odcina kandydaty zbyt wysokie względem reszty znaków.",
+            hint="100% = mediana wysokości ramek w rzędzie. Odcina ramki wyższe od ustawionego limitu.",
         )
         add_spin(
             parent,
@@ -1535,7 +1553,7 @@ def refresh_detection_pipeline_builder_property_panel(host):
             1.00,
             4.50,
             0.05,
-            hint="Najważniejszy bezpiecznik przeciw ramkom obejmującym dwa znaki.",
+            hint="100% = mediana szerokości ramek w rzędzie. Odcina ramki szersze od limitu, np. obejmujące dwa znaki.",
         )
         add_spin(
             parent,

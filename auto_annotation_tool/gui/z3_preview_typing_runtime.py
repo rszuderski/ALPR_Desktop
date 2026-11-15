@@ -116,18 +116,34 @@ def _get_preview_typing_overlay_text(self) -> str:
 def _format_preview_operation_assistant_status(self) -> str:
     if not self._preview_status_overlay_available():
         return ""
+
+    decision_keys = "R OK · T cofnij OK · F wyklucz"
+
     add_state = getattr(self, "_preview_char_add_state", None)
     if isinstance(add_state, dict) and bool(add_state.get("click_draw")):
-        return "AS: D aktywne - przesuń mysz i kliknij drugi narożnik boxa."
+        return (
+            "AS: D aktywne — kliknij drugi narożnik boxa. "
+            f"{decision_keys}."
+        )
     if bool(getattr(self, "_preview_char_add_click_armed", False)):
-        return "AS: D uzbraja box - kliknij pierwszy narożnik."
+        return (
+            "AS: D uzbrojone — kliknij pierwszy narożnik boxa. "
+            f"{decision_keys}."
+        )
     if self._preview_char_add_requested():
-        return "AS: rysuj box - LPM przeciąga narożniki."
+        return (
+            "AS: rysowanie boxa — LPM ustawia geometrię. "
+            f"{decision_keys}."
+        )
     if bool(getattr(self, "_preview_char_edit_mode", False)):
-        return "AS: edycja boxów - S zaznacza, LPM przesuwa, uchwyty skalują."
+        return (
+            "AS: S wybór · LPM przesuń/skaluj · PPM usuń · G grupa · "
+            f"Ctrl+Z/Y historia · {decision_keys}."
+        )
+
     return (
-        "AS: Q/E tablice, D nowy box, S zaznacza, Alt+W wpisywanie. "
-        f"{self._format_preview_layout_semantics(short=True)}"
+        "AS: Q/E tablica · R OK · T cofnij OK · F wyklucz · "
+        "D nowy box · S wybór · Alt+W znaki · 1R/2R układ."
     )
 
 def _preview_status_overlay_available(self) -> bool:
@@ -217,7 +233,7 @@ def _configure_preview_typing_overlay_text(self, text: str, wraplength: int) -> 
     wrapped = textwrap.wrap(content, width=width_chars) if content else [""]
     height_lines = max(1, min(5, len(wrapped)))
     key_pattern = re.compile(
-        r"(?<![\w+])(?:Ctrl\+Z|Ctrl\+Y|Alt\+W|D\+LPM|LPM\+drag|Q/E|0-9|A-Z|LPM|PPM|Esc|Enter|Spacja|Space|D|S|N|F|Q|E)(?![\w+])"
+        r"(?<![\w+])(?:Ctrl\+Z|Ctrl\+Y|Alt\+W|D\+LPM|LPM\+drag|Q/E|0-9|A-Z|LPM|PPM|Esc|Enter|Spacja|Space|D|S|R|T|F|Q|E)(?![\w+])"
     )
 
     try:
@@ -352,16 +368,28 @@ def _assign_character_to_active_preview_label(self, symbol: str):
         return False
 
     rec = chars[int(idx)]
+    persistent_label_mode = bool(getattr(self, "_preview_char_label_mode", False))
     if self._sanitize_preview_char_symbol(rec.get("character", "")) == symbol:
         self._preview_char_selected_index = int(idx)
-        self._preview_char_label_active_index = int(idx)
-        self._preview_char_hover_label_index = int(idx)
-        self._update_preview_edit_status(
-            "Znak już ma taką wartość. Użyj strzałek lewo/prawo albo kliknij inny box LPM.",
-            tone="muted",
-        )
-        if not self._refresh_preview_character_selection_visual({int(idx)}):
-            self._on_preview_select(None)
+        if persistent_label_mode:
+            self._preview_char_label_active_index = int(idx)
+            self._preview_char_hover_label_index = int(idx)
+            self._update_preview_edit_status(
+                "Znak już ma taką wartość. Użyj strzałek lewo/prawo albo kliknij inny box LPM.",
+                tone="muted",
+            )
+            if not self._refresh_preview_character_selection_visual({int(idx)}):
+                self._on_preview_select(None)
+        else:
+            self._cancel_preview_char_label_interaction(
+                reset_mode=False,
+                clear_hover=True,
+                redraw_canvas=True,
+            )
+            self._update_preview_edit_status(
+                "Znak już ma taką wartość. Korekta pojedynczego pola zakończona.",
+                tone="muted",
+            )
         return True
     self._push_preview_history_snapshot()
     rec["character"] = symbol
@@ -378,9 +406,19 @@ def _assign_character_to_active_preview_label(self, symbol: str):
         refresh_row=True,
         light_redraw_indices="selected",
     )
-    if bool(getattr(self, "_preview_char_label_mode", False)):
+    if persistent_label_mode:
         self._update_preview_edit_status(
             f"Zapisano znak {symbol}. Użyj strzałek lewo/prawo albo kliknij kolejny box LPM.",
+            tone="success",
+        )
+    else:
+        self._cancel_preview_char_label_interaction(
+            reset_mode=False,
+            clear_hover=True,
+            redraw_canvas=True,
+        )
+        self._update_preview_edit_status(
+            f"Zapisano znak {symbol}. Korekta pojedynczego pola zakończona.",
             tone="success",
         )
     return True

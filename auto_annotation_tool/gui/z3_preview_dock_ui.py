@@ -141,25 +141,6 @@ def _get_preview_dock_row_runtime_state(host: "CharacterAnnotationTab", row_key:
             "icon_text": None,
             "interactive": True,
         }
-    if key == "plate_status":
-        data = host._get_preview_active_data(create=False)
-        status_meta = host._get_preview_status_presentation(data=data if isinstance(data, dict) else None)
-        status_raw = str(status_meta.get("status", "unknown") or "unknown").strip().lower()
-        severity = str(status_meta.get("severity", "muted") or "muted").strip().lower()
-        status_text = "PERFECT" if status_raw == "perfect" else "KOREKTA"
-        if status_text == "PERFECT":
-            severity = "success"
-        elif severity not in {"warning", "error"}:
-            severity = "warning"
-        return {
-            "visible": True,
-            "tone": severity,
-            "status_text": status_text,
-            "label_text": None,
-            "icon_text": None,
-            "interactive": False,
-        }
-
     if gate_state is None:
         gate_state = host._get_preview_step3_gate_overlay_state()
     gate_visible = bool(gate_state.get("visible"))
@@ -334,7 +315,6 @@ def render_preview_overlay_dock(host: "CharacterAnnotationTab", *, force_render:
     row_states = {key: _get_preview_dock_row_runtime_state(host, key, theme, gate_state=gate_state)
                   for key in (getattr(host, "_preview_overlay_dock_tool_rows", {}) or {})}
     layout_state = _get_preview_dock_row_runtime_state(host, "layout", theme, gate_state=gate_state)
-    plate_state = _get_preview_dock_row_runtime_state(host, "plate_status", theme, gate_state=gate_state)
     render_key = (
         int(expanded),
         int(compact),
@@ -342,8 +322,6 @@ def render_preview_overlay_dock(host: "CharacterAnnotationTab", *, force_render:
         int(assistant_visible),
         str(layout_state.get("status_text", "")),
         str(layout_state.get("tone", "")),
-        str(plate_state.get("status_text", "")),
-        str(plate_state.get("tone", "")),
         int(gate_visible),
         gate_id,
         gate_label,
@@ -393,7 +371,7 @@ def render_preview_overlay_dock(host: "CharacterAnnotationTab", *, force_render:
 
         for key, widgets in dict(getattr(host, "_preview_overlay_dock_tool_rows", {}) or {}).items():
             row_key = str(key)
-            if compact and row_key not in {"legend", "assistant", "layout", "plate_status", "gate"}:
+            if compact and row_key not in {"legend", "assistant", "layout", "gate"}:
                 _forget_preview_dock_row(widgets)
                 continue
             row_state = row_states[row_key]
@@ -470,6 +448,26 @@ def render_preview_overlay_dock(host: "CharacterAnnotationTab", *, force_render:
     max_width = 178 if compact else 220
     min_height = 74 if compact else 136
     max_height = 210 if compact else 318
+
+    # W fullscreen nie opieramy wysokości wyłącznie na aktualnym
+    # winfo_reqheight(), bo po przejściu z widoku kompaktowego Tk może
+    # przez chwilę zwracać wysokość sprzed dopakowania dodatkowych wierszy.
+    # Skutek był widoczny jako obcięte pola MINIMUM/JAKOŚĆ/W ZBIORZE.
+    if not compact:
+        visible_row_count = 0
+        for key in (getattr(host, "_preview_overlay_dock_tool_rows", {}) or {}):
+            state = _get_preview_dock_row_runtime_state(
+                host,
+                key,
+                theme,
+                gate_state=gate_state,
+            )
+            if bool(state.get("visible")) or key in {"legend", "assistant"}:
+                visible_row_count += 1
+
+        expected_full_height = 34 + (visible_row_count * 29)
+        height = max(height, expected_full_height)
+
     width = int(max(min_width, min(max_width, width)))
     height = int(max(min_height, min(max_height, height)))
     host._preview_overlay_dock_last_width = width

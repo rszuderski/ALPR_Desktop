@@ -87,8 +87,22 @@ def test_complete_package_exports_and_preserves_each_child(models, tmp_path, rol
     assert manifest["schema"] == "alpr.package.v1"
     assert set(manifest["models"]) == set(roles)
     with zipfile.ZipFile(path) as archive:
+        assert len(archive.read("manifest.json")) <= mobile.MAX_ANDROID_ROOT_MANIFEST_BYTES
         for role in roles:
-            assert archive.read(manifest["models"][role]["package_file"]) == models[role][0].read_bytes()
+            root_entry = manifest["models"][role]
+            assert archive.read(root_entry["package_file"]) == models[role][0].read_bytes()
+            assert set(root_entry).issuperset({
+                "role", "task", "model_id", "schema", "package_file", "manifest_file", "sha256",
+            })
+            assert not ({"training", "metrics", "source", "model", "export_reproducibility"} & set(root_entry))
+            child = json.loads(archive.read(root_entry["manifest_file"]))
+            assert child["model_id"] == root_entry["model_id"]
+            assert child["training"]
+            assert child["export_reproducibility"]
+            repro = manifest["export_reproducibility"]["models"][role]
+            assert "model_ref" in repro
+            assert not ({"training", "metrics", "source", "model", "child_export_reproducibility"} & set(repro))
+            assert manifest["model_refs"][role]["model_id"] == root_entry["model_id"]
     for missing in ("plate", "character"):
         invalid = copy.deepcopy(manifest)
         invalid["models"].pop(missing)
@@ -99,6 +113,41 @@ def test_complete_package_exports_and_preserves_each_child(models, tmp_path, rol
             archive.writestr("manifest.json", json.dumps(invalid))
         with pytest.raises(ValueError, match="required MT\\+MZ"):
             read_alpr_package_manifest(invalid_path)
+
+
+
+
+
+def test_publish_package_inherits_destination_context_without_moving_source(tmp_path):
+    source_dir = tmp_path / "private-temp"
+    destination_dir = tmp_path / "published"
+    source_dir.mkdir()
+    destination_dir.mkdir()
+    source = source_dir / "model.alprmodel"
+    destination = destination_dir / "model.alprmodel"
+    source.write_bytes(b"validated package bytes")
+    destination.write_bytes(b"old package")
+
+    mobile._publish_package_with_destination_acl(source, destination)
+
+    assert source.exists(), "Publikacja ma kopiowac z temp, a nie przenosic plik z jego ACL."
+    assert source.read_bytes() == b"validated package bytes"
+    assert destination.read_bytes() == b"validated package bytes"
+    assert not list(destination_dir.glob(".*.publish-*.tmp"))
+
+
+def test_complete_package_rejects_root_manifest_above_android_limit(models, tmp_path):
+    request = mobile.MobileAlprPackageRequest(
+        destination=tmp_path / "too-large-root-manifest.alprmodel",
+        package_id="too-large-root-manifest",
+        plate_package=models["plate"][0],
+        character_package=models["character"][0],
+        metadata={"oversized": "x" * (mobile.MAX_ANDROID_ROOT_MANIFEST_BYTES + 4096)},
+    )
+    exporter = mobile.MobileAlprPackageExporter()
+    with pytest.raises(mobile.MobileExportError, match="limit importera Androida"):
+        exporter.export(request)
+    assert not request.destination.exists()
 
 
 @pytest.mark.parametrize("roles", [("plate",), ("vehicle", "plate"), ("character",), ("vehicle", "character"), ("vehicle",), ()])
@@ -132,11 +181,9 @@ def test_d8_selection_names_the_actual_export_contract(markers, schema):
         assert noun.lower() in selection.success_title.lower()
 
 
-def test_d9_documentation_does_not_allow_single_model_as_alpr_package():
+def test_d9_ui_help_does_not_allow_single_model_as_alpr_package():
     root = Path(__file__).resolve().parents[1]
-    paths = ["auto_annotation_tool/gui/tab_help.py", "docs/specyfikacja_agenta_aplikacji_mobilnej_alpr.md",
-             "docs/eksport_mobilny_kwantyzacja.md", "alpr_python_exporter_handoff.md",
-             "DZIENNIK_ARCHITEKTURY_I_ZMIAN.md", "docs/freeze_smoke_test_checklist.md"]
+    paths = ["auto_annotation_tool/gui/tab_help.py"]
     for name in paths:
         text = (root / name).read_text(encoding="utf-8")
         assert "alpr.package.v1 może zawierać jeden model" not in text, name

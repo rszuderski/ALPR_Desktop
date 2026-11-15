@@ -1,3 +1,6 @@
+# Z4MOBREV003_VIEWPORT_ZOOM_PAN_20261016
+# Z4MOBREV002_FIX01_DECISIONS_UI_20261016
+# Z4MOBREV001_SIMPLE_REVIEW_20261016
 """Native review workflow against synthetic Android-contract bundles, isolated writes."""
 from pathlib import Path
 import sys
@@ -23,7 +26,7 @@ from auto_annotation_tool.gui.app_style_setup import setup_style
 from auto_annotation_tool.gui.z4_mobile_report_browser import MobileReportBrowser
 from auto_annotation_tool.ranking.mobile_package_experiments import MobilePackageExperimentStore, read_mobile_report_bundle, _file_sha256
 from auto_annotation_tool.ranking.mobile_human_review import MobileReviewSession
-from auto_annotation_tool.gui.z4_mobile_sample_review import HIDDEN_PREDICTION
+from auto_annotation_tool.gui.z4_mobile_sample_review import HIDDEN_PREDICTION, VISIBILITY_LABELS
 
 OUT = Path(__file__).resolve().parents[1] / "output/mobile_sample_review_audit" / f"run-{time.time_ns()}"
 OUT.mkdir(parents=True, exist_ok=True)
@@ -139,6 +142,11 @@ def run():
         owner = SimpleNamespace(app=app, frame=root)
         with patch.object(CONFIG, "DIR_7_RANKINGS_MOBILE_PACKAGES", OUT / "ranking"), \
                 patch("auto_annotation_tool.gui.z4_mobile_report_browser.MobilePackageExperimentStore", return_value=store):
+            # Syntetyczny przypadek starego sidecara: zachowaj historyczny test zaslepienia.
+            old_blind = MobileReviewSession(bundle)
+            old_blind.review.review_mode_locked = True
+            old_blind.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            old_blind.sidecar_path.write_text(json.dumps(old_blind.review.to_dict()), encoding="utf-8")
             browser = MobileReportBrowser(owner)
             browser.bundle_by_report_id[bundle.report.report_id] = bundle
             pump(150)
@@ -148,10 +156,10 @@ def run():
             panel = browser._sample_review
             wait_for(lambda: panel.session is not None and bool(panel.subject_key) and panel.current_record is not None)
             assert "PARTIAL" in panel.notice_label.cget("text")
-            assert panel.session.review.review_mode == "blinded_gt_v1"
-            assert not panel.accept_button.winfo_ismapped()
-            assert all(panel.record_tree.item(iid, "values")[3] == HIDDEN_PREDICTION for iid in panel._record_ids)
-            assert all("Brak znaków" not in panel.record_tree.item(iid, "values")[2] for iid in panel._record_ids)
+            assert panel.session.review.review_mode == "assisted"
+            assert panel.session.review.review_mode_origin == "blinded_gt_v1"
+            assert not hasattr(panel, "accept_button")
+            assert any(panel.record_tree.item(iid, "values")[3] != HIDDEN_PREDICTION for iid in panel._record_ids)
             def select_record(kind, key):
                 iid = next(iid for iid, value in panel._record_ids.items() if value == (kind, key))
                 panel.record_tree.selection_set(iid)
@@ -160,15 +168,37 @@ def run():
             panel.show_invocation_input()
             wait_for(lambda: bool(panel.canvas.find_withtag("detection_box")))
             assert panel._image_entry == "samples/evidence/a2.jpg"  # Child's own input first.
-            assert panel._image_source_size == (1280, 1280) and panel._image.size == (1000, 1000)
-            assert panel.canvas.itemcget(panel.canvas.find_withtag("detection_label")[0], "text") == "Detekcja 2 / 3"
+            assert panel._image_source_size == (1280, 1280) and panel._image.size == (1280, 1280)
+            assert panel.canvas.itemcget(panel.canvas.find_withtag("detection_label")[0], "text") == "BBOX (bez 4 narożników) • Detekcja 2 / 3"
             def check_second_box_position():
-                w, h = panel._photo.width(), panel._photo.height()
-                x, y = (panel.canvas.winfo_width() - w) / 2, (panel.canvas.winfo_height() - h) / 2
-                expected = (x + 640 * w / 1280, y + 560 * h / 1280, x + 1024 * w / 1280, y + 656 * h / 1280)
+                # Overlay musi byc transformowany TA SAMA macierza co piksele po zoom/pan.
+                zoom_scale = panel._view_pixel_scale
+                cx, cy = panel._view_center
+                canvas_w, canvas_h = panel.canvas.winfo_width(), panel.canvas.winfo_height()
+                expected = tuple([
+                    (640 - cx) * zoom_scale + canvas_w / 2,
+                    (560 - cy) * zoom_scale + canvas_h / 2,
+                    (1024 - cx) * zoom_scale + canvas_w / 2,
+                    (656 - cy) * zoom_scale + canvas_h / 2,
+                ])
                 actual = panel.canvas.coords(panel.canvas.find_withtag("detection_box")[0])
-                assert all(abs(a - b) < .01 for a, b in zip(actual, expected)), (actual, expected)
+                assert all(abs(a - b) < .05 for a, b in zip(actual, expected)), (actual, expected)
             check_second_box_position()
+            # Zoom/pan: overlay porusza sie zgodnie z obrazem, Fit przywraca rozmiar.
+            panel.zoom_image(2.0)
+            assert panel._view_zoom == 2.0
+            check_second_box_position()
+            panel._pan_begin(SimpleNamespace(x=200, y=160))
+            panel._pan_move(SimpleNamespace(x=165, y=133))
+            panel._pan_end()
+            check_second_box_position()
+            panel.fit_image()
+            assert panel._view_zoom == 1.0
+            check_second_box_position()
+            panel.zoom_to_mt_detection()
+            assert panel._view_zoom > 1.0
+            check_second_box_position()
+            panel.fit_image()
             capture(panel.window, "detection_overlay_blinded")
             old_geometry = panel.window.geometry()
             old_width = panel.canvas.winfo_width()
@@ -180,10 +210,17 @@ def run():
             panel.show_invocation_input()
             wait_for(lambda: bool(panel.canvas.find_withtag("detection_box")))
             assert panel._image_entry == "samples/evidence/a1.jpg"  # Missing own input: another full input.
-            assert "Detekcja 3 / 3" == panel.canvas.itemcget(panel.canvas.find_withtag("detection_label")[0], "text")
+            assert "BBOX (bez 4 narożników) • Detekcja 3 / 3" == panel.canvas.itemcget(panel.canvas.find_withtag("detection_label")[0], "text")
             assert panel.canvas.coords(panel.canvas.find_withtag("detection_box")[0]) != second_box
-            assert not panel.accept_button.winfo_ismapped() and not panel.alignment_text.get("1.0", "end").strip()
+            assert not panel.alignment_text.get("1.0", "end").strip()
             select_record("sample", "c2")
+            # On a sample the full MT input is the default; the crop remains selectable.
+            wait_for(lambda: panel._image_entry == "samples/evidence/a2.jpg")
+            assert panel.canvas.find_withtag("detection_overlay")
+            crop_index = next(i for i, (title, _) in enumerate(panel._image_rows)
+                              if title.startswith("Wycięta tablica"))
+            panel.image_choice.current(crop_index)
+            panel._load_image()
             wait_for(lambda: panel._image_entry == "samples/crops/c2.jpg")
             assert not panel.canvas.find_withtag("detection_overlay")
             select_record("attempt", "a4")
@@ -195,14 +232,14 @@ def run():
             assert "RuntimeException" in panel.invocation_error_label.cget("text")
             assert str(panel.invocation_choice["state"]) == "disabled"
             assert panel.session.invocation_completion_issues("mt-error") == []
-            panel.invocation_choice.set("Jedna widoczna tablica")
+            panel.invocation_choice.set(VISIBILITY_LABELS["one"])
             panel.save_invocation_decision()
             assert "mt-error" not in panel.session.review.invocation_annotations
             assert not panel.canvas.find_withtag("detection_overlay")
             capture(panel.window, "execution_error")
             select_record("attempt", "a6")
             wait_for(lambda: bool(panel.canvas.find_withtag("detection_box")))
-            assert panel.canvas.itemcget(panel.canvas.find_withtag("detection_label")[0], "text") == "Detekcja 1 / 1 • błędna geometria"
+            assert panel.canvas.itemcget(panel.canvas.find_withtag("detection_label")[0], "text") == "BBOX (bez 4 narożników) • Detekcja 1 / 1 • błędna geometria"
             select_record("attempt", "a7")
             wait_for(lambda: panel._image_entry == "samples/evidence/a7.jpg")
             assert not panel.canvas.find_withtag("detection_overlay")
@@ -210,30 +247,36 @@ def run():
                        for item in panel.canvas.find_withtag("detection_geometry_notice") if panel.canvas.type(item) == "text")
             panel.window.geometry(old_geometry)
             select_record("attempt", "a1")
-            panel.accept_prediction()
             assert not panel.gt_var.get()
             panel.gt_var.set("WI1234A")
             # A decision clicked before the debounce must preserve the typed GT.
-            panel.annotate({"plate_visibility": "visible", "is_plate": True})
+            # Wybranie opcji MT ma pozostać widoczne po zapisie/zmianie rekordu.
+            panel.show_invocation_input()
+            wait_for(lambda: panel._image is not None and panel._image_entry.startswith("samples/evidence/"))
+            panel.zoom_image(1.5)
+            before_view = (panel._image_entry, panel._view_zoom, panel._view_center)
+            panel.detection_choice.set("yes")
+            panel.save_detection_choice()
             wait_for(lambda: panel.session.review.review_revision > 0 and not panel._saving)
             assert panel.session.sidecar_path.exists()
+            assert panel.detection_choice.get() == "yes"
+            assert (panel._image_entry, panel._view_zoom, panel._view_center) == before_view, "Radio zmieniło kadr obrazu"
             assert panel.session.subject_draft(panel.subject_key) == "WI1234A"
-            assert not panel.session.predictions_visible(panel.subject_key)
-            assert all(panel.record_tree.item(iid, "values")[3] == HIDDEN_PREDICTION for iid in panel._record_ids)
-            assert not panel.alignment_text.get("1.0", "end").strip()
-            capture(panel.window, "blinded_draft")
-            panel.save_gt(explicit=True)
-            wait_for(lambda: not panel._saving and panel.accept_button.winfo_ismapped())
+            assert panel.session.review.subjects[panel.subject_key]["evaluable"] is True
+            assert panel.session.predictions_visible(panel.subject_key)
+            assert panel.subject_eval_choice.get() == "assess"
+            capture(panel.window, "assisted_auto_gt")
+            wait_for(lambda: not panel._saving)
             first_subject = panel.subject_key
             other_iid = next(iid for iid, key in panel._subject_ids.items() if key != first_subject)
             panel.subject_tree.selection_set(other_iid)
             wait_for(lambda: panel.subject_key != first_subject and panel.current_record == ("sample", "other"))
-            assert not panel.accept_button.winfo_ismapped()
-            assert "X999XYZ" not in panel.alignment_label.cget("text")
             assert not panel.alignment_text.get("1.0", "end").strip()
-            assert all(panel.record_tree.item(iid, "values")[3] == HIDDEN_PREDICTION for iid in panel._record_ids)
-            panel.exclude_subject()
+            assert panel.subject_eval_choice.get() == "assess"
+            panel.subject_eval_choice.set("exclude")
+            panel.save_subject_eval_choice()
             wait_for(lambda: not panel._saving)
+            assert panel.session.review.subjects[panel.subject_key]["evaluable"] is False
             first_iid = next(iid for iid, key in panel._subject_ids.items() if key == first_subject)
             panel.subject_tree.selection_set(first_iid)
             wait_for(lambda: panel.subject_key == first_subject and panel.current_record is not None)
@@ -243,15 +286,21 @@ def run():
                 select_record("attempt", row["attempt_id"])
                 panel.annotate({"plate_visibility": "visible", "is_plate": True, "evaluable": True})
                 wait_for(lambda: not panel._saving)
-                panel.invocation_choice.set("Niejednoznaczne" if row["attempt_id"] in {"a6", "a7"} else "Jedna widoczna tablica")
+                panel.invocation_choice.set(VISIBILITY_LABELS["uncertain"] if row["attempt_id"] in {"a6", "a7"} else VISIBILITY_LABELS["one"])
                 panel.save_invocation_decision()
                 wait_for(lambda: not panel._saving)
             select_record("sample", "c2")
             wait_for(lambda: panel._image is not None)
             assert "błędnie rozpoznane: 1" in panel.alignment_label.cget("text")
             capture(panel.window, "new_partial_review")
-            assert panel.canvas.winfo_height() >= 120
-            assert panel.record_tree.winfo_rooty() + panel.record_tree.winfo_height() < panel.window.winfo_rooty() + panel.window.winfo_height() - 22
+            assert panel.canvas.winfo_height() >= 260, "Obraz powinien zajmowac srodkowa kolumne"
+            assert panel._view_zoom >= 1.0
+            assert len(panel.detection_radios) == 3
+            assert "czy" in panel.detection_question.cget("text").lower()
+            # Celowo przewijany panel boczny, nie zaslania podgladu.
+            panel.review_sidebar_scroll.yview_moveto(1.0)
+            pump(80)
+            assert panel.record_tree.winfo_rooty() < panel.window.winfo_rooty() + panel.window.winfo_height() - 20
             panel.complete()
             wait_for(lambda: not panel._saving)
             assert panel.session.review.review_status == "COMPLETED", panel.status_var.get()
@@ -282,7 +331,7 @@ def run():
             assert reopened.session.review.review_status == "COMPLETED"
             assert reopened.session.review.review_revision == revision
             assert _file_sha256(source) == source_hash
-            records.append({"samples_v2": True, "blinded_before_explicit_gt": True, "three_detections_one_invocation": True,
+            records.append({"samples_v2": True, "assisted_with_history": True, "auto_gt": True, "view_stable_on_radio": True, "three_detections_one_invocation": True,
                             "autosave": True, "completed": True, "export": True, "reopen": True, "source_unchanged": True,
                             "overlay_selection_resize_crop": True, "execution_error_without_decisions": True,
                             "single_invalid_quad_overlay": True, "missing_geometry_notice": True})

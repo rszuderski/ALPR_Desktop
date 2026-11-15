@@ -106,6 +106,7 @@ from .z4_shared_ui import (
     step4_train_go_back,
 )
 from . import z4_dataset_sources
+from . import z4_fine_tune_protocol
 from .z4_view_models import (
     Step4CampaignNavigationViewModel,
     Step4DatasetWorkflowViewModel,
@@ -823,12 +824,34 @@ def _build_training_run_detail_rows(self, run) -> list[tuple[str, str]]:
     best_weights_detail = f"{best_weights}{_best_weights_epoch_text()}" if best_weights != "-" else best_weights
     resumable = self._is_history_run_resume_allowed(run)
     technically_resumable = self._is_history_run_resumable(run)
-    if resumable:
+    status = str(getattr(run, "status", "") or "").lower()
+    checkpoint_exists = bool(last_weights_raw and Path(last_weights_raw).is_file())
+    if not checkpoint_exists:
+        checkpoint_exists = (Path(str(getattr(run, "output_dir", "") or "")) / "train" / "weights" / "last.pt").is_file()
+    if status == TrainingStatus.COMPLETED.value:
+        resume_hint = "NIE - trening został zakończony."
+    elif status == TrainingStatus.CANCELLED.value:
+        resume_hint = "NIE - trening został anulowany."
+        resume_hint += " Checkpoint last.pt jest dostępny." if checkpoint_exists else " Brak checkpointu last.pt."
+    elif resumable:
         resume_hint = "TAK - zaznacz ten run w historii, kliknij PPM i wybierz `Wznów trening`."
     elif technically_resumable:
-        resume_hint = "NIE - w kampanii można wznowić tylko najnowszy run aktywnego toru."
+        resume_hint = ("NIE - w kampanii można wznowić tylko najnowszy run aktywnego toru."
+                       if CAMPAIGN.get_active_project_name() else "NIE - przełącz Z4 na tor tego runu przed wznowieniem.")
+    elif checkpoint_exists:
+        resume_hint = "NIE - bieżący status runu nie pozwala na wznowienie."
     else:
-        resume_hint = "NIE - brakuje poprawnego checkpointu last.pt."
+        resume_hint = "NIE - brak checkpointu last.pt."
+
+    snapshot = getattr(run, "training_protocol_snapshot", {}) or {}
+    device_text = "-"
+    for device in (getattr(run, "device", None), snapshot.get("actual", {}).get("device"),
+                   snapshot.get("requested", {}).get("device")):
+        text = str(device if device is not None else "").strip()
+        if text.lower() in {"", "-", "none", "null"} or (getattr(run, "strict_experiment", False) and text.lower() == "auto"):
+            continue
+        device_text = f"CUDA device {text}" if text.isdigit() else text
+        break
 
     lineage_rows: list[tuple[str, str]] = []
     lineage_mode = str(getattr(run, "lineage_mode", "") or "").strip().lower()
@@ -851,6 +874,29 @@ def _build_training_run_detail_rows(self, run) -> list[tuple[str, str]]:
             f"Dotrenowanie od runu {parent_run_display} ({parent_model_name or 'best.pt'}){parent_suffix}",
         ))
 
+    protocol_rows = []
+    requested_protocol = dict(getattr(run, "training_protocol_requested", None) or {})
+    protocol_snapshot = dict(getattr(run, "training_protocol_snapshot", None) or {})
+    if requested_protocol:
+        protocol_rows.append((
+            "Protokół żądany",
+            " | ".join(
+                f"{key}={requested_protocol.get(key)}"
+                for key in ("memory_policy","batch","imgsz","lr0","amp","mosaic","cache","workers","plots","seed","optimizer")
+                if key in requested_protocol
+            ) or "-",
+        ))
+    actual_protocol = dict(protocol_snapshot.get("actual") or protocol_snapshot.get("effective") or {})
+    if actual_protocol:
+        protocol_rows.append((
+            "Protokół efektywny",
+            " | ".join(
+                f"{key}={actual_protocol.get(key)}"
+                for key in ("memory_policy","batch","batch_size","imgsz","img_size","lr0","amp","mosaic","cache","workers","plots","seed","optimizer","ram_safe_applied","attempt_label")
+                if key in actual_protocol
+            ) or "-",
+        ))
+
     rows = [
         ("ID runu", getattr(run_ref, "id", "") or run_id or "-"),
         ("Nazwa techniczna", run_name or run_id or "-"),
@@ -868,7 +914,8 @@ def _build_training_run_detail_rows(self, run) -> list[tuple[str, str]]:
                 f"współczynnik uczenia {float(getattr(run, 'lr0', 0.0) or 0.0):.4f}"
             ),
         ),
-        ("Urządzenie", self._shorten_training_text(str(getattr(run, "device", "") or "-"), 28)),
+        *protocol_rows,
+        ("Urządzenie", self._shorten_training_text(device_text, 28)),
         ("Najlepsze wagi", best_weights_detail),
         ("Checkpoint last.pt", last_weights_name),
         ("Wznowienie", resume_hint),
@@ -876,7 +923,7 @@ def _build_training_run_detail_rows(self, run) -> list[tuple[str, str]]:
     ]
     return rows
 
-def _build_training_run_metric_rows(self, run) -> list[tuple[str, str, str, str]]:
+def _build_training_run_metric_rows(self, run, *, target=None) -> list[tuple[str, str, str, str]]:
     if run is None:
         return []
 
@@ -888,11 +935,11 @@ def _build_training_run_metric_rows(self, run) -> list[tuple[str, str, str, str]
             "map50": latest_map,
             "map50_95": latest_map95,
         }
-        live_rows = self._build_training_metric_rows(fallback_metrics, self._infer_dataset_target(getattr(run, "dataset_path", "")))
+        live_rows = self._build_training_metric_rows(fallback_metrics, target or self._infer_dataset_target(getattr(run, "dataset_path", "")))
         return [(label, value, value, band) for label, value, band, _range in live_rows]
 
     latest = history[-1]
-    target = self._infer_dataset_target(getattr(run, "dataset_path", "")) or self.get_campaign_training_target()
+    target = target or self._infer_dataset_target(getattr(run, "dataset_path", "")) or self.get_campaign_training_target()
     rows: list[tuple[str, str, str, str]] = []
 
     for key in self._iter_training_metric_keys(target):
@@ -978,6 +1025,10 @@ def _set_train_live_metrics(self, metrics: dict | None):
     _set_training_status_tree_rows(self, tree, styled_rows)
 
 def _build_training_cockpit_summary(self, *, ready: bool | None = None) -> dict:
+    from . import z4_mz_experiment
+    frozen = z4_mz_experiment.frozen_cockpit_summary(self)
+    if frozen is not None:
+        return frozen
     if getattr(self, "_training_start_in_progress", False):
         previous = dict(getattr(self, "_last_training_cockpit_summary", {}) or {})
         return {
@@ -1108,7 +1159,16 @@ def _build_training_cockpit_summary(self, *, ready: bool | None = None) -> dict:
         except Exception:
             ready = False
 
-    if ready:
+    try:
+        pinned_state = dict(_get_pinned_step4_result_state(self) or {})
+    except Exception:
+        pinned_state = {}
+
+    if pinned_state:
+        status = "Wynik T06 wybrany"
+        subtitle = "Model wynikowy jest przypięty. Wróć do bramki T06 i zakończ decyzję."
+        tone = "success"
+    elif ready:
         status = "Gotowe do startu"
         subtitle = "Masz wariant datasetu, zgodny model i dobrane parametry treningu."
         tone = "success"
@@ -1410,6 +1470,9 @@ def _apply_training_device_recommendation(self):
     self._apply_training_recommended_start_params()
 
 def _on_training_base_model_value_write(self, *_args):
+    from . import z4_mz_experiment
+    if bool(getattr(self, "_mz_applying_protocol", False)) or z4_mz_experiment.is_active(self):
+        return
     try:
         self._sync_step4_fine_tune_parent_selection()
     except Exception:
@@ -1622,7 +1685,14 @@ def _validate_training_source_lightweight(self) -> dict:
             if raw:
                 candidate = Path(raw)
                 known_roots.append((candidate.parent if candidate.name.lower() == "data.yaml" else candidate).resolve())
-        if selected_root not in known_roots:
+        from . import z4_mz_experiment
+        frozen_path = (
+            str(self._mz_protocol.get("dataset", {}).get("path") or "").strip()
+            if z4_mz_experiment.is_active(self) else ""
+        )
+        # A frozen experiment input is not an ordinary PZ1 split variant.
+        frozen_root_selected = bool(frozen_path) and selected_root == Path(frozen_path).resolve()
+        if selected_root not in known_roots and not frozen_root_selected:
             result["message"] = "Wybierz wariant splitu z listy PZ2 albo utwórz go w PZ1."
             return result
     try:
@@ -2232,7 +2302,7 @@ def _refresh_training_start_state(self):
     try:
         pinned_state = _get_pinned_step4_result_state(self)
         _ensure_new_training_uses_final_base_model(self)
-        preparing = bool(getattr(self, "_training_start_in_progress", False))
+        preparing = bool(getattr(self, "_training_start_in_progress", False) or getattr(self, "_mz_validation_in_progress", False))
         ready = bool(not preparing and not pinned_state and self._is_training_configuration_ready())
         button.configure(state=(tk.NORMAL if ready else tk.DISABLED))
     except Exception:
@@ -2257,6 +2327,9 @@ def _refresh_training_start_state(self):
         self._refresh_training_base_model_identity_ui()
     except Exception:
         pass
+
+    from . import z4_mz_experiment
+    z4_mz_experiment.refresh_controls(self)
 
 def _build_training_start_gate_message(self, *, ready: bool) -> tuple[str, str, str]:
     if getattr(self, "_training_start_in_progress", False):
@@ -2442,11 +2515,25 @@ def _training_base_model_context(self) -> dict:
 def _set_step4_fine_tune_parent_state(self, run, model_path: str | Path) -> None:
     self._step4_fine_tune_parent_run_id = str(getattr(run, "id", "") or "").strip()
     self._step4_fine_tune_parent_model_path = str(model_path or "").strip()
+    self._step4_fine_tune_parent_history_dir = ""
+    try:
+        from . import z4_history_runtime
+        iid = z4_history_runtime._history_row_id_for_run(self, run)
+        ref = (getattr(self, "_history_row_refs", {}) or {}).get(iid, {})
+        history = ref.get("history")
+        if history is not None:
+            self._step4_fine_tune_parent_history_dir = str(Path(history.history_dir))
+    except Exception:
+        self._step4_fine_tune_parent_history_dir = ""
+    # Z4FTGUI001 visibility
+    z4_fine_tune_protocol.refresh_visibility(self)
 
 
 def _clear_step4_fine_tune_parent_state(self) -> None:
     self._step4_fine_tune_parent_run_id = ""
     self._step4_fine_tune_parent_model_path = ""
+    self._step4_fine_tune_parent_history_dir = ""
+    z4_fine_tune_protocol.refresh_visibility(self)
 
 
 def _resolve_step4_fine_tune_parent_run(self):
@@ -2476,6 +2563,30 @@ def _resolve_step4_fine_tune_parent_run(self):
         run = history.get_run(parent_run_id) if history is not None else None
     except Exception:
         run = None
+
+    if run is None:
+        history_dir = str(getattr(self, "_step4_fine_tune_parent_history_dir", "") or "").strip()
+        if history_dir:
+            try:
+                external_history = TrainingHistory(
+                    history_dir=Path(history_dir),
+                    reconcile_on_load=False,
+                )
+                run = external_history.get_run(parent_run_id)
+            except Exception:
+                run = None
+
+    if run is None:
+        try:
+            refs = getattr(self, "_history_row_refs", {}) or {}
+            for ref in refs.values():
+                candidate = ref.get("run")
+                if str(getattr(candidate, "id", "") or "").strip() == parent_run_id:
+                    run = candidate
+                    break
+        except Exception:
+            run = None
+
     if run is None:
         return None
 
@@ -2500,6 +2611,9 @@ def _sync_step4_fine_tune_parent_selection(self) -> None:
 
 
 def _resolve_selected_training_base_model_training_state(self) -> dict:
+    from . import z4_mz_experiment
+    if z4_mz_experiment.is_active(self):
+        return {"label":"OFICJALNY CHECKPOINT", "detail":"Oficjalny checkpoint protokołu", "tone":"success"}
     context = _training_base_model_context(self)
     prefix = str(context.get("prefix") or "").strip()
     base_key = str(getattr(self, "base_model_var", tk.StringVar()).get() or "").strip()
@@ -2597,6 +2711,10 @@ def _format_training_base_model_summary_value(
     base_model: str = "",
     context: dict | None = None,
 ) -> str:
+    from . import z4_mz_experiment
+    frozen = z4_mz_experiment.frozen_cockpit_summary(self)
+    if frozen is not None:
+        return next(text for title, text, _hint in frozen["cards"] if title == "Model")
     label = str(model_label or "").strip() or "-"
     target_hint = str((context or {}).get("target") or self._get_selected_training_target() or "").strip().lower()
     try:
@@ -2728,7 +2846,10 @@ def _refresh_training_base_model_identity_ui(self):
         origin_text = "Preset YOLO"
         state_text = str(state.get("label") or "-")
         custom_model = ""
-        if self._is_custom_base_model_key(base_key):
+        from . import z4_mz_experiment
+        if z4_mz_experiment.is_active(self):
+            origin_text = "Oficjalny checkpoint protokołu"
+        elif self._is_custom_base_model_key(base_key):
             custom_model = str(getattr(self, "base_custom_var", tk.StringVar()).get() or "").strip()
             selected_text = Path(custom_model).name if custom_model else "-"
             origin_text = "Plik .pt"
@@ -2811,6 +2932,10 @@ def _refresh_training_base_model_identity_ui(self):
         pass
 
 def _resolve_selected_training_base_model_display(self) -> str:
+    from . import z4_mz_experiment
+    frozen = z4_mz_experiment.frozen_cockpit_summary(self)
+    if frozen is not None:
+        return next(text for title, text, _hint in frozen["cards"] if title == "Model")
     base_key = str(getattr(self, "base_model_var", tk.StringVar()).get() or "").strip()
     if not base_key:
         return "Nie wybrano modelu"
@@ -2913,6 +3038,9 @@ def _resolve_selected_training_base_model_info(self, *, lightweight: bool = Fals
     return model_path, info if ok and isinstance(info, dict) else {}
 
 def _build_selected_training_base_model_identity_lines(self) -> list[str]:
+    from . import z4_mz_experiment
+    if z4_mz_experiment.is_active(self):
+        return [_resolve_selected_training_base_model_display(self), "Oficjalny checkpoint protokołu"]
     model_path, info = self._resolve_selected_training_base_model_info()
     if model_path is None or not info:
         return []
@@ -3180,6 +3308,10 @@ def _ensure_training_execution_summary_row_capacity(self, required_rows: int) ->
         self._append_training_execution_summary_row_widget(len(row_widgets))
 
 def _build_training_execution_summary_rows(self) -> list[tuple[str, str]]:
+    from . import z4_mz_experiment
+    frozen = z4_mz_experiment.frozen_execution_summary_rows(self)
+    if frozen is not None:
+        return frozen
     target = self._get_selected_training_target()
     target_label = self._format_training_target_label(target)
     base_model_display = self._resolve_selected_training_base_model_display()
@@ -3342,15 +3474,30 @@ def _append_training_metric_table_to_global(self, epoch: int, total_epochs: int,
 
 def _set_history_run_tables(self, run):
     if run is None:
+        self._history_selected_detail_rows = []
         self._set_metric_table_rows(getattr(self, "hist_detail_tree", None), [])
         self._set_metric_table_rows(getattr(self, "hist_metrics_tree", None), [])
         return
 
+    self._history_selected_detail_rows = self._build_training_run_detail_rows(run)
     self._set_metric_table_rows(
         getattr(self, "hist_detail_tree", None),
-        self._build_training_run_detail_rows(run),
+        self._history_selected_detail_rows,
     )
     self._set_metric_table_rows(
         getattr(self, "hist_metrics_tree", None),
         self._build_training_run_metric_rows(run),
     )
+
+
+def _refresh_history_epoch_tables(self, run, *, target):
+    """Refresh volatile fields from memory; retain already rendered static data."""
+    previous = getattr(self, "_history_selected_detail_rows", None)
+    if isinstance(previous, list):
+        changes = {"Postęp":f"{run.current_epoch}/{run.epochs} epok", "Status":self._format_history_run_status_label(run)}
+        updated = [(field, changes.get(field, value)) for field, value in previous]
+        if updated != previous:
+            self._history_selected_detail_rows = updated
+            self._set_metric_table_rows(getattr(self, "hist_detail_tree", None), updated)
+    self._set_metric_table_rows(getattr(self, "hist_metrics_tree", None),
+        _build_training_run_metric_rows(self, run, target=target))

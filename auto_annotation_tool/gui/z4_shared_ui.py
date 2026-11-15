@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tkinter as tk
 from tkinter import messagebox
 from datetime import datetime
@@ -56,6 +58,152 @@ def _configure_step4_next_button(host: "TrainingTab", label: str, *, state=None)
             button.configure(**kwargs)
         except Exception:
             pass
+
+
+def _normalize_char_pz3_manifest_root(path_like) -> Path | None:
+    raw = str(path_like or "").strip()
+    if not raw:
+        return None
+    try:
+        root = Path(raw)
+    except Exception:
+        return None
+    if root.is_file() and root.name.lower() == "data.yaml":
+        root = root.parent
+    return root
+
+
+def _load_char_pz3_manifest(path_like) -> tuple[Path | None, dict]:
+    root = _normalize_char_pz3_manifest_root(path_like)
+    if root is None:
+        return None, {}
+    manifest_path = root / "metadata_manifest.json"
+    try:
+        if not manifest_path.exists() or not manifest_path.is_file():
+            return root, {}
+        payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        return root, dict(payload) if isinstance(payload, dict) else {}
+    except Exception:
+        return root, {}
+
+
+def _char_pz3_logical_payload(manifest: dict) -> dict:
+    items = []
+    for raw_item in list(manifest.get("items") or []):
+        item = dict(raw_item or {}) if isinstance(raw_item, dict) else {}
+        source_image = str(item.get("source_image") or "").strip()
+        try:
+            source_image = Path(source_image).name if source_image else ""
+        except Exception:
+            pass
+        items.append(
+            {
+                "source_pid": str(item.get("source_pid") or "").strip(),
+                "source_image": source_image,
+                "source_bucket": str(item.get("source_bucket") or "").strip(),
+                "strategy_bucket": str(item.get("strategy_bucket") or "").strip(),
+                "provenance": dict(item.get("provenance") or {}),
+                "layout": dict(item.get("layout") or {}),
+                "characters": list(item.get("characters") or []),
+            }
+        )
+    items.sort(key=lambda item: (str(item.get("source_pid") or ""), str(item.get("source_image") or "")))
+    return {
+        "schema": str(manifest.get("schema") or ""),
+        "dataset_type": str(manifest.get("dataset_type") or ""),
+        "gold_source_contract_schema": str(manifest.get("gold_source_contract_schema") or ""),
+        "gold_source_contract_sha256": str(manifest.get("gold_source_contract_sha256") or ""),
+        "gt_contract_fingerprint_sha256": str(manifest.get("gt_contract_fingerprint_sha256") or ""),
+        "plate_count": int(manifest.get("plate_count", 0) or 0),
+        "character_count": int(manifest.get("character_count", 0) or 0),
+        "items": items,
+    }
+
+
+def _char_pz3_logical_sha256(manifest: dict) -> str:
+    if not isinstance(manifest, dict) or not manifest:
+        return ""
+    try:
+        raw = json.dumps(
+            _char_pz3_logical_payload(manifest),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        return ""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _build_char_pz3_source_provenance(path_like) -> dict:
+    root, manifest = _load_char_pz3_manifest(path_like)
+    result = {
+        "ok": False,
+        "folder": root.name if root is not None else "",
+        "logical_sha256": "",
+        "logical_id": "",
+        "contract_sha256": "",
+        "gt_fingerprint_sha256": "",
+        "plate_count": 0,
+        "character_count": 0,
+        "source_pid_count": 0,
+        "equivalent_exports": [],
+    }
+    if root is None or not manifest:
+        return result
+    if str(manifest.get("dataset_type") or "").strip().lower() != "char_yolo_detect":
+        return result
+
+    logical_sha = _char_pz3_logical_sha256(manifest)
+    contract_sha = str(manifest.get("gold_source_contract_sha256") or "").strip()
+    gt_sha = str(manifest.get("gt_contract_fingerprint_sha256") or "").strip()
+    source_pids = {
+        str(item.get("source_pid") or "").strip()
+        for item in list(manifest.get("items") or [])
+        if isinstance(item, dict) and str(item.get("source_pid") or "").strip()
+    }
+
+    equivalents = []
+    if logical_sha:
+        try:
+            candidates = sorted(root.parent.glob("*/metadata_manifest.json"))
+        except Exception:
+            candidates = []
+        for candidate_manifest in candidates:
+            candidate_root = candidate_manifest.parent
+            try:
+                if candidate_root.resolve() == root.resolve():
+                    continue
+            except Exception:
+                if candidate_root == root:
+                    continue
+            try:
+                candidate = json.loads(candidate_manifest.read_text(encoding="utf-8-sig"))
+                candidate = dict(candidate) if isinstance(candidate, dict) else {}
+            except Exception:
+                candidate = {}
+            if (
+                candidate
+                and str(candidate.get("dataset_type") or "").strip().lower() == "char_yolo_detect"
+                and _char_pz3_logical_sha256(candidate) == logical_sha
+            ):
+                equivalents.append(candidate_root.name)
+
+    result.update(
+        {
+            "ok": bool(logical_sha),
+            "logical_sha256": logical_sha,
+            "logical_id": f"MAT-ZN-{logical_sha[:10].upper()}" if logical_sha else "",
+            "contract_sha256": contract_sha,
+            "gt_fingerprint_sha256": gt_sha,
+            "plate_count": int(manifest.get("plate_count", 0) or 0),
+            "character_count": int(manifest.get("character_count", 0) or 0),
+            "source_pid_count": len(source_pids),
+            "equivalent_exports": equivalents,
+        }
+    )
+    return result
+
 
 
 def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
@@ -353,6 +501,7 @@ def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
         if not bool(getattr(vm, "in_campaign", False)) or str(getattr(vm, "mode", "") or "") != "char":
             _set_pack_visible(frame, False)
             _set_pack_visible(getattr(host, "split_campaign_summary_title", None), False)
+            _set_pack_visible(getattr(host, "split_source_technical_row", None), False)
             return
 
         palette = getattr(host.app, "palette", {})
@@ -369,62 +518,99 @@ def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
         header_bg = blend_hex_colors(success, panel_alt, 0.84)
         row_alt = blend_hex_colors(panel_alt, panel, 0.45)
 
-        readiness = {}
         try:
             readiness = dict(host.get_campaign_step4_readiness(iteration_target="char") or {})
         except Exception:
             readiness = {}
+
         source_dataset = str(readiness.get("source_dataset") or "").strip()
         if not source_dataset:
             try:
                 source_dataset = str(host.split_src_var.get() or "").strip()
             except Exception:
                 source_dataset = ""
+
         ready_dataset = str(readiness.get("ready_dataset") or "").strip()
         train_count = int(readiness.get("train_images", 0) or 0)
         val_count = int(readiness.get("val_images", 0) or 0)
         test_count = int(readiness.get("test_images", 0) or 0)
-        counts = {
-            "train": train_count,
-            "val": val_count,
-            "test": test_count,
-            "total": train_count + val_count + test_count,
-        }
         has_ready_variant = bool(ready_dataset and train_count > 0 and val_count > 0)
+
         source_brief = _char_yolo_dataset_brief(source_dataset)
-        variant_brief = _char_yolo_dataset_brief(ready_dataset) if has_ready_variant else {}
+        source_provenance = _build_char_pz3_source_provenance(source_dataset)
+
+        try:
+            project_name = str(CAMPAIGN.get_active_project_name() or "").strip() or "-"
+        except Exception:
+            project_name = "-"
+        try:
+            iteration_num = int(CAMPAIGN.get_current_iteration_num() or 0)
+        except Exception:
+            iteration_num = 0
+
+        if bool(source_brief.get("ok")):
+            source_state = (
+                f"{int(source_brief.get('plates', 0) or 0)} tablic · "
+                f"{int(source_brief.get('chars', 0) or 0)} znaków"
+            )
+            source_explanation = "Przygotowane w PZ3 w tej iteracji."
+        else:
+            source_state = "BRAK GOTOWEGO ŹRÓDŁA"
+            source_explanation = "Wróć do PZ3 i przygotuj źródłowy dataset znaków."
+
+        equivalents = list(source_provenance.get("equivalent_exports") or [])
+        if bool(source_provenance.get("ok")) and equivalents:
+            identity_state = "NIE — TO TEN SAM MATERIAŁ"
+            identity_explanation = (
+                "Ten eksport zawiera te same tablice i oznaczenia co poprzedni. "
+                "Możesz bezpiecznie kontynuować."
+            )
+        elif bool(source_provenance.get("ok")):
+            identity_state = "PIERWSZY ZAPIS"
+            identity_explanation = (
+                "Nie znaleziono wcześniejszego równoważnego eksportu tego materiału w projekcie."
+            )
+        else:
+            identity_state = "NIE MOŻNA POTWIERDZIĆ"
+            identity_explanation = (
+                "Brakuje manifestu PZ3 potrzebnego do automatycznego potwierdzenia pochodzenia."
+            )
+
+        if has_ready_variant:
+            variant_state = f"GOTOWY · {train_count}/{val_count}/{test_count}"
+            variant_explanation = "Wariant train / val / test jest gotowy do użycia w treningu."
+        else:
+            variant_state = "JESZCZE NIE UTWORZONO"
+            variant_explanation = (
+                "Następny krok: ustaw podział train / val / test i utwórz wariant treningowy."
+            )
+
         values = {
-            "source": (
-                _dataset_ref_id(source_dataset, target_hint="char"),
-                _format_char_dataset_brief(
-                    source_brief,
-                    empty_text="Brak źródłowego datasetu znaków z T05/PZ3.",
-                ),
-            ),
-            "variant": (
-                (
-                    _dataset_ref_id(ready_dataset, target_hint="char", counts=counts)
-                    if has_ready_variant
-                    else "Jeszcze nie utworzono wariantu"
-                ),
-                (
-                    _format_char_dataset_brief(
-                        variant_brief,
-                        empty_text="Utwórz wariant, aby odblokować trening w PZ2.",
-                    )
-                    if has_ready_variant
-                    else "Utwórz wariant, aby odblokować trening w PZ2."
-                ),
-            ),
-            "split": (
-                "train / val / test",
-                (
-                    f"train {train_count} | val {val_count} | test {test_count}"
-                    if has_ready_variant
-                    else "Podział zostanie zapisany w tworzonym wariancie."
-                ),
-            ),
+            "source": (source_state, source_explanation),
+            "identity": (identity_state, identity_explanation),
+            "variant": (variant_state, variant_explanation),
         }
+
+        artifact_id = _dataset_ref_id(source_dataset, target_hint="char")
+        folder = str(source_provenance.get("folder") or "").strip() or "-"
+        logical_id = str(source_provenance.get("logical_id") or "").strip() or "-"
+        contract_sha = str(source_provenance.get("contract_sha256") or "").strip() or "-"
+        gt_sha = str(source_provenance.get("gt_fingerprint_sha256") or "").strip() or "-"
+        equivalent_text = ", ".join(str(value) for value in equivalents) if equivalents else "brak"
+
+        host._split_source_technical_text = (
+            "Te informacje są pomocnicze i nie są potrzebne do zwykłej pracy operatora.\n\n"
+            f"Projekt: {project_name}\n"
+            f"Iteracja: {iteration_num or '-'}\n"
+            f"Folder eksportu PZ3: {folder}\n"
+            f"Identyfikator artefaktu: {artifact_id}\n"
+            f"Identyfikator materiału logicznego: {logical_id}\n"
+            f"Kontrakt źródła SHA-256: {contract_sha}\n"
+            f"Fingerprint GT SHA-256: {gt_sha}\n"
+            f"Liczba source_pid: {int(source_provenance.get('source_pid_count', 0) or 0)}\n"
+            f"Równoważne eksporty: {equivalent_text}\n"
+            f"Pełna ścieżka: {source_dataset or '-'}"
+        )
 
         try:
             frame.configure(bg=border, highlightbackground=border, highlightcolor=border)
@@ -434,9 +620,15 @@ def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
                 title.configure(bg=panel, fg=fg)
         except Exception:
             pass
+
         for widget in getattr(host, "_split_campaign_summary_header_widgets", ()) or ():
             try:
-                widget.configure(bg=header_bg, fg=success, highlightbackground=border, highlightcolor=border)
+                widget.configure(
+                    bg=header_bg,
+                    fg=success,
+                    highlightbackground=border,
+                    highlightcolor=border,
+                )
             except Exception:
                 pass
 
@@ -446,36 +638,59 @@ def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
             except Exception:
                 continue
             bg = field if index % 2 == 0 else row_alt
+            state_text, explanation_text = values.get(key, ("-", "-"))
+            state_fg = fg
+            explanation_fg = fg
+            if key == "source":
+                state_fg = success if bool(source_brief.get("ok")) else warning
+                explanation_fg = fg if bool(source_brief.get("ok")) else warning
+            elif key == "identity":
+                if identity_state == "NIE — TO TEN SAM MATERIAŁ":
+                    state_fg = success
+                    explanation_fg = success
+                elif identity_state == "PIERWSZY ZAPIS":
+                    state_fg = accent
+                    explanation_fg = fg
+                else:
+                    state_fg = warning
+                    explanation_fg = warning
+            elif key == "variant":
+                state_fg = success if has_ready_variant else warning
+                explanation_fg = success if has_ready_variant else muted
+
             try:
-                label_widget.configure(bg=bg, fg=muted, highlightbackground=border, highlightcolor=border)
-                id_text, details_text = values.get(key, ("-", "-"))
-                id_fg = fg
-                details_fg = fg
-                if key == "source":
-                    id_fg = success if bool(source_brief.get("ok")) else warning
-                    details_fg = success if bool(source_brief.get("ok")) else warning
-                elif key == "variant":
-                    id_fg = success if has_ready_variant else warning
-                    details_fg = success if has_ready_variant else warning
-                elif key == "split":
-                    id_fg = accent
-                    details_fg = success if has_ready_variant else muted
-                id_widget.configure(
-                    text=str(id_text or "-"),
+                label_widget.configure(
                     bg=bg,
-                    fg=id_fg,
+                    fg=muted,
                     highlightbackground=border,
                     highlightcolor=border,
-                    wraplength=260,
+                )
+                id_widget.configure(
+                    text=str(state_text or "-"),
+                    bg=bg,
+                    fg=state_fg,
+                    highlightbackground=border,
+                    highlightcolor=border,
+                    wraplength=280,
                 )
                 details_widget.configure(
-                    text=str(details_text or "-"),
+                    text=str(explanation_text or "-"),
                     bg=bg,
-                    fg=details_fg,
+                    fg=explanation_fg,
                     highlightbackground=border,
                     highlightcolor=border,
-                    wraplength=420,
+                    wraplength=500,
                 )
+            except Exception:
+                pass
+
+        technical_row = getattr(host, "split_source_technical_row", None)
+        details_button = getattr(host, "btn_split_source_technical_details", None)
+        if technical_row is not None:
+            _set_pack_visible(technical_row, True, fill=tk.X, pady=(5, 3))
+        if details_button is not None:
+            try:
+                details_button.configure(state=tk.NORMAL if source_dataset else tk.DISABLED)
             except Exception:
                 pass
 
@@ -527,6 +742,7 @@ def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
             ready_label = getattr(host, "creator_ready_dataset_lbl", None)
             ready_radio = getattr(host, "creator_source_ready_radio", None)
             xml_radio = getattr(host, "creator_source_xml_radio", None)
+            ready_row = getattr(host, "creator_ready_dataset_row", None)
             xml_row = getattr(host, "creator_xml_row", None)
             auto_match_hint = getattr(host, "creator_auto_match_hint_lbl", None)
             images_row = getattr(host, "creator_images_row", None)
@@ -591,23 +807,72 @@ def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
                 _set_pack_visible(getattr(host, "creator_campaign_summary_frame", None), False)
                 _set_pack_visible(getattr(host, "creator_campaign_summary_title", None), False)
                 _set_pack_visible(getattr(host, "creator_flow_strip", None), False)
+
+                # W trybie swobodnym użytkownik może teraz jawnie wybrać:
+                # 1) gotowy zamrożony split tablic albo 2) budowę splitu z XML.
+                _set_pack_visible(
+                    source_mode_frame,
+                    True,
+                    fill=tk.X,
+                    pady=(6, 8),
+                    after=host.creator_intro_lbl,
+                )
                 try:
-                    host._set_creator_source_mode("xml")
+                    ready_mode = host._get_creator_source_mode() == "ready"
                 except Exception:
-                    pass
-                _set_pack_visible(source_mode_frame, False)
-                if ready_label is not None:
-                    _set_pack_visible(ready_label, False)
+                    ready_mode = False
 
                 if source_summary is not None:
                     _set_pack_visible(source_summary, False)
-                _set_pack_visible(xml_row, True, fill=tk.X, pady=2, after=host.creator_intro_lbl)
-                _set_pack_visible(auto_match_hint, True, anchor=tk.W, fill=tk.X, pady=(2, 6), after=xml_row)
-                _set_pack_visible(images_row, True, fill=tk.X, pady=2, after=auto_match_hint)
                 _set_pack_visible(output_row, False)
-                _set_pack_visible(ratios_frame, True, fill=tk.X, pady=(12, 8), after=images_row)
-                _set_pack_visible(augmentation_frame, True, fill=tk.X, pady=(12, 8), after=ratios_frame)
-                _set_pack_visible(create_frame, True, fill=tk.X, pady=(12, 10), after=(augmentation_frame or ratios_frame))
+
+                if ready_mode:
+                    _set_pack_visible(
+                        ready_row,
+                        True,
+                        fill=tk.X,
+                        pady=2,
+                        after=source_mode_frame,
+                    )
+                    if ready_label is not None:
+                        _set_pack_visible(
+                            ready_label,
+                            True,
+                            anchor=tk.W,
+                            fill=tk.X,
+                            pady=(2, 6),
+                            after=ready_row,
+                        )
+                    _set_pack_visible(xml_row, False)
+                    _set_pack_visible(auto_match_hint, False)
+                    _set_pack_visible(images_row, False)
+                    # Split jest zamrożony — nie pokazuj suwaków train/val/test.
+                    _set_pack_visible(ratios_frame, False)
+                    _set_pack_visible(
+                        augmentation_frame,
+                        True,
+                        fill=tk.X,
+                        pady=(12, 8),
+                        after=(ready_label or ready_row or source_mode_frame),
+                    )
+                    _set_pack_visible(
+                        create_frame,
+                        True,
+                        fill=tk.X,
+                        pady=(12, 10),
+                        after=(augmentation_frame or ready_label or ready_row),
+                    )
+                else:
+                    _set_pack_visible(ready_row, False)
+                    if ready_label is not None:
+                        _set_pack_visible(ready_label, False)
+                    _set_pack_visible(xml_row, True, fill=tk.X, pady=2, after=source_mode_frame)
+                    _set_pack_visible(auto_match_hint, True, anchor=tk.W, fill=tk.X, pady=(2, 6), after=xml_row)
+                    _set_pack_visible(images_row, True, fill=tk.X, pady=2, after=auto_match_hint)
+                    _set_pack_visible(ratios_frame, True, fill=tk.X, pady=(12, 8), after=images_row)
+                    _set_pack_visible(augmentation_frame, True, fill=tk.X, pady=(12, 8), after=ratios_frame)
+                    _set_pack_visible(create_frame, True, fill=tk.X, pady=(12, 10), after=(augmentation_frame or ratios_frame))
+
                 if getattr(progress, "master", None) is not getattr(host, "step4_creator_action_inner", None):
                     _set_pack_visible(progress, True, fill=tk.X, pady=2, after=create_frame)
                 if getattr(status, "master", None) is not getattr(host, "step4_creator_action_inner", None):
@@ -630,7 +895,7 @@ def refresh_step4_campaign_builder_inputs_ui(host: "TrainingTab"):
             host._set_training_widget_text(host.split_intro_lbl, str(vm.split_intro or ""))
             try:
                 if bool(vm.show_split_toggle):
-                    host._set_training_widget_text(host.btn_step4_split_toggle, str(vm.split_toggle_label or "Popraw split"))
+                    host._set_training_widget_text(host.btn_step4_split_toggle, str(vm.split_toggle_label or "Dostosuj wariant"))
                     if str(host.btn_step4_split_toggle.winfo_manager()) != "pack":
                         host.btn_step4_split_toggle.pack(anchor=tk.W, pady=(0, 8))
                 elif str(host.btn_step4_split_toggle.winfo_manager()) == "pack":
@@ -999,6 +1264,8 @@ def refresh_step4_route_choice_cards(host: "TrainingTab"):
 
 
 def _schedule_step4_mode_deferred_refresh(host: "TrainingTab"):
+    if bool(getattr(host, "_mz_applying_protocol", False)):
+        return
     frame = getattr(host, "frame", None)
     if frame is None:
         return

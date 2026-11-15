@@ -1,0 +1,25 @@
+{
+  "geometry_id": "geom-sha256-d89823c347ae86cb0368ebf05df4fa46e8610140e888539e31026fc422ac8098",
+  "parents": [],
+  "plate_id": "plate-ann-fixture-gt-conflict",
+  "points": [
+    [
+      0.1,
+      0.2
+    ],
+    [
+      0.75,
+      0.2
+    ],
+    [
+      0.75,
+      0.7
+    ],
+    [
+      0.1,
+      0.7
+    ]
+  ],
+  "schema": "alpr.gt.geometry.v1",
+  "type": "polygon4-normalized"
+}

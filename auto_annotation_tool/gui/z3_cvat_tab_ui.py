@@ -166,6 +166,10 @@ def refresh_preview_bound_action_states(host) -> None:
                 tone="warning",
                 emphasis=False,
             )
+    try:
+        host._refresh_gt_assist_controls()
+    except Exception:
+        pass
 
 
 def run_cvat_export(host) -> None:
@@ -403,6 +407,10 @@ def run_cvat_import(host) -> None:
             target_data = metadata.get(pid, {})
             previous_chars = list(target_data.get("characters", [])) if isinstance(target_data.get("characters"), list) else []
             previous_status = str(target_data.get("status", "unknown") or "unknown").strip().lower()
+            try:
+                host._mark_review_edit_started(target_data)
+            except Exception:
+                pass
             host._update_preview_plate_layout_metadata(target_data, clean_chars)
             clean_chars = host._annotate_preview_character_reading_positions(clean_chars, data=target_data)
             target_data["characters"] = clean_chars
@@ -919,7 +927,7 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
     self.dataset_export_title_lbl = SectionHeaderLabel(
         dataset_section,
         self.app,
-        text="Budowa datasetu znaków",
+        text="Tworzenie zbioru znaków",
     )
     self.dataset_export_title_lbl.pack(anchor=tk.W, fill=tk.X)
 
@@ -937,8 +945,8 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
     self.cvat_option2_desc_lbl = tk.Label(
         dataset_section,
         text=(
-            "Dataset powstaje z wyodrębnionych tablic, które w PZ2 mają status perfect. "
-            "Jeśli brakuje tablic lub znaków, wróć do PZ2 i popraw boxy przed eksportem."
+            "Zbiór powstaje z wyodrębnionych tablic, które zostały sprawdzone i zatwierdzone. "
+            "Jeśli brakuje tablic lub znaków, wróć do ich sprawdzania i popraw ramki przed eksportem."
         ),
         wraplength=900,
         justify=tk.LEFT,
@@ -1015,7 +1023,7 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
         dataset_source_cards,
         "PZ2",
         "Materiał z PZ2",
-        "Źródłem są wyodrębnione tablice z PZ2 oznaczone jako perfect.",
+        "Źródłem są wyodrębnione tablice, które zostały sprawdzone i zatwierdzone.",
         clickable=True,
     )
     self._pz3_dataset_source_perfect_card = dataset_source_perfect_card
@@ -1098,7 +1106,7 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
 
     self.pz3_goldpack_step_title_lbl = tk.Label(
         dataset_section,
-        text="Zakres datasetu",
+        text="Zakres zbioru",
         anchor="w",
         justify=tk.LEFT,
         bd=0,
@@ -1110,8 +1118,8 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
     self.pz3_goldpack_step_desc_lbl = tk.Label(
         dataset_section,
         text=(
-            "Domyślnie do datasetu wejdą wszystkie dostępne tablice perfect. Zawężaj strategie "
-            "i źródła tylko wtedy, gdy świadomie chcesz ograniczyć materiał treningowy."
+            "Domyślnie do zbioru wejdą wszystkie dostępne tablice sprawdzone i zatwierdzone. "
+            "Ograniczaj zakres tylko wtedy, gdy świadomie chcesz pominąć część materiału."
         ),
         wraplength=900,
         justify=tk.LEFT,
@@ -1127,7 +1135,7 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
     dataset_grid.pack(fill=tk.X, pady=(0, 14))
     dataset_grid.grid_columnconfigure(0, weight=1)
 
-    self.gold_export_goldpack_lf = ttk.LabelFrame(dataset_grid, text=" Zakres datasetu ", padding=8)
+    self.gold_export_goldpack_lf = ttk.LabelFrame(dataset_grid, text=" Zakres zbioru ", padding=8)
     self.gold_export_goldpack_lf.grid(row=0, column=0, sticky="ew", pady=(0, 2))
 
     gold_tables_grid = tk.Frame(self.gold_export_goldpack_lf, bd=0, highlightthickness=0)
@@ -1233,8 +1241,8 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
         gold_tables_grid,
         column=0,
         title_attr="gold_export_filters_title_lbl",
-        title="Strategie kwalifikacji",
-        intro="Wybierz, które sposoby uzyskania statusu perfect mają wejść do datasetu.",
+        title="Sposób przygotowania",
+        intro="Wybierz, z jak przygotowanych tablic chcesz zbudować zbiór.",
         headers=("Wybór", "Strategia", "Tablice", "Znaki", "Status"),
     )
 
@@ -1428,7 +1436,7 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
 
     self.gold_export_scope_lbl = tk.Label(
         self.gold_export_goldpack_lf,
-        text="Zakres datasetu: wszystkie dostępne tablice perfect.",
+        text="Zakres zbioru: wszystkie dostępne zatwierdzone tablice.",
         justify=tk.LEFT,
         wraplength=900,
         anchor="w",
@@ -1831,7 +1839,7 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
 
     self.btn_yolo_gold_export = ttk.Button(
         export_actions,
-        text="UTWÓRZ ŹRÓDŁOWY DATASET ZNAKÓW",
+        text="UTWÓRZ ZBIÓR ZNAKÓW",
         command=self._run_yolo_gold_export,
         style="Accent.TButton",
     )
@@ -1839,7 +1847,7 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
 
     self.btn_char_classifier_export = ttk.Button(
         export_actions,
-        text="EKSPORT KLASYFIKACYJNY ZNAKÓW",
+        text="UTWÓRZ ZBIÓR POJEDYNCZYCH ZNAKÓW",
         command=self._run_char_classification_export,
         style="WorkflowCard.TButton",
     )
@@ -2409,6 +2417,17 @@ def build_cvat_tab(host, parent, nav_button_width, perfect_strategy_labels, gold
     )
     self.import_console.grid(row=5, column=1, sticky="nsew")
     self._set_inline_status_label_state(self.import_console, text="—", tone="muted", emphasis=False)
+
+    # Status PZ3 jest zbudowany dopiero po pierwszym odświeżeniu lewej
+    # części ekranu. Wykonaj więc jawny refresh po utworzeniu wszystkich
+    # wierszy statusu, aby nie zostały w nich wartości z wcześniejszego
+    # snapshotu sprzed pełnego przywrócenia PZ2.
+    try:
+        refresh_status = getattr(self, "_refresh_pz3_status_panel_ui", None)
+        if callable(refresh_status):
+            refresh_status()
+    except Exception as exc:
+        logger.debug(f"Nie udało się wykonać początkowego odświeżenia Status PZ3: {exc}")
 
     HELP.bind_help(btn_cvat, "btn_export_cvat")
     HELP.bind_help(self._pz3_dataset_source_lf, "t2_pz3_source")

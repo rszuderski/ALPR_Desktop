@@ -27,6 +27,14 @@ class CampaignManager:
     def __init__(self):
         self.state_file = CONFIG.WORKSPACE_DIR / "campaigns_registry.json"
         self.state = self._load_state()
+        for project_data in (self.state.get("projects", {}) or {}).values():
+            folder_name = str(project_data.get("folder_name", "") or "").strip()
+            if not folder_name:
+                continue
+            try:
+                self._ensure_project_workspace_tree(CONFIG.DIR_9_PROJECTS / folder_name)
+            except Exception as error:
+                logger.warning(f"Nie udało się sprawdzić drzewa modeli projektu {folder_name}: {error}")
         self._plate_approved_stats_cache: Dict[tuple[str, int, int], Dict[str, Any]] = {}
         self._plate_approved_manifest_runtime_cache: Dict[str, Dict[str, Any]] = {}
         self._plate_approved_stats_runtime_cache: Dict[str, Dict[str, Any]] = {}
@@ -91,6 +99,7 @@ class CampaignManager:
         cloned_manifest["iteration"] = int(target_iteration)
         cloned_manifest["created_at"] = datetime.now().isoformat()
         cloned_manifest["selection_mode"] = "iteration_reuse"
+        cloned_manifest["identity_mode"] = "reference"
         cloned_manifest["reused_from_iteration"] = int(source_iteration)
         cloned_manifest["target_dir"] = str(target_raw_dir.resolve())
         cloned_manifest["manifest_only"] = True
@@ -166,6 +175,7 @@ class CampaignManager:
                         "iteration": int(target_iteration),
                         "created_at": datetime.now().isoformat(),
                         "selection_mode": "iteration_reuse",
+                        "identity_mode": "reference",
                         "reused_from_iteration": int(source_iteration),
                         "source_dir": str(source_raw_dir.resolve()),
                         "target_dir": str(target_raw_dir.resolve()),
@@ -253,8 +263,14 @@ class CampaignManager:
     ) -> str:
         if candidate is None:
             return ""
+        raw_candidate = str(candidate or "").strip()
+        if not raw_candidate:
+            # Path("") resolves to the process working directory. An empty
+            # manifest/source field must never become an image directory,
+            # even when a caller intentionally disables the broad-dir guard.
+            return ""
         try:
-            path = Path(str(candidate or "").strip())
+            path = Path(raw_candidate)
         except Exception:
             return ""
         if not path.exists() or not path.is_dir():
@@ -633,6 +649,7 @@ class CampaignManager:
         }
 
         manifest_saved = bool(self.save_ingest_manifest(manifest, target_iteration, project_name))
+        linked = int(manifest.get("selected_count") or 0)
         if not manifest_saved:
             return {
                 "ok": False,
@@ -751,6 +768,7 @@ class CampaignManager:
             "iteration": int(target_iteration),
             "created_at": datetime.now().isoformat(),
             "selection_mode": "stage_reuse",
+            "identity_mode": "reference",
             "reused_from_iteration": int(source_iteration),
             "source_dir": str(stage_images_dir.resolve()),
             "target_dir": str(target_raw_dir.resolve()),
@@ -769,6 +787,7 @@ class CampaignManager:
             },
         }
         manifest_saved = bool(self.save_ingest_manifest(manifest, target_iteration, project_name))
+        selected_images = list(manifest.get("selected_images") or [])
         if not manifest_saved:
             return {
                 "ok": False,
@@ -1197,7 +1216,10 @@ class CampaignManager:
     def get_project_root_dir(self, project_name: str) -> Path:
         folder_name = self.state["projects"][project_name]["folder_name"]
         root = Path(CONFIG.DIR_9_PROJECTS) / folder_name
-        self._ensure_project_workspace_tree(root)
+        # Getters are used by canvas/status callbacks. Creating all workspace
+        # directories on every lookup turned a single edit into thousands of IOs.
+        if str(root) not in getattr(self, "_project_workspace_roots_ready", set()) or not root.is_dir():
+            self._ensure_project_workspace_tree(root)
         return root
 
     def get_project_state_dir(self, project_name: str = None) -> Path | None:
@@ -2601,6 +2623,136 @@ class CampaignManager:
         self.save_state()
         return True
 
+
+    def clear_step1_image_source_state(
+        self,
+        iteration_num: int | None = None,
+        project_name: str = None,
+    ) -> Dict[str, Any]:
+        project_name = self._resolve_project_name(project_name)
+        if not project_name:
+            return {"ok": False, "reason": "missing_project"}
+
+        try:
+            iter_value = int(
+                iteration_num
+                or self.state["projects"][project_name].get("current_iteration", 1)
+                or 1
+            )
+        except Exception:
+            iter_value = 1
+
+        result: Dict[str, Any] = {
+            "ok": True,
+            "project": project_name,
+            "iteration": int(iter_value),
+            "master_pool_cleared": False,
+            "latest_plan_cleared": False,
+            "manifest_removed": False,
+            "artifact_binding_removed": False,
+        }
+
+        try:
+            result["master_pool_cleared"] = bool(
+                self.clear_master_pool_dir(project_name)
+            )
+        except Exception:
+            result["master_pool_cleared"] = False
+
+        try:
+            result["latest_plan_cleared"] = bool(
+                self.clear_latest_ingest_plan(project_name)
+            )
+        except Exception:
+            result["latest_plan_cleared"] = False
+
+        try:
+            manifest_path = self.get_ingest_manifest_path(
+                iter_value, project_name
+            )
+        except Exception:
+            manifest_path = None
+
+        if manifest_path is not None:
+            try:
+                manifest_path = Path(manifest_path)
+                if manifest_path.exists():
+                    manifest_path.unlink()
+                    result["manifest_removed"] = True
+            except Exception as exc:
+                result["ok"] = False
+                result["manifest_error"] = str(exc)
+
+        try:
+            registry = self.load_artifact_registry(project_name)
+        except Exception:
+            registry = {}
+        if not isinstance(registry, dict):
+            registry = {}
+
+        packages = registry.get("packages")
+        if not isinstance(packages, dict):
+            packages = {}
+            registry["packages"] = packages
+
+        iteration_index = registry.get("iteration_index")
+        if not isinstance(iteration_index, dict):
+            iteration_index = {}
+            registry["iteration_index"] = iteration_index
+
+        package_id = str(
+            iteration_index.pop(str(iter_value), "") or ""
+        ).strip()
+        registry_changed = bool(package_id)
+
+        if package_id:
+            package = packages.get(package_id)
+            if isinstance(package, dict):
+                retained_iterations = []
+                for raw_iteration in list(package.get("iterations") or []):
+                    try:
+                        numeric_iteration = int(raw_iteration)
+                    except Exception:
+                        continue
+                    if numeric_iteration != int(iter_value):
+                        retained_iterations.append(numeric_iteration)
+
+                if retained_iterations:
+                    package["iterations"] = sorted(set(retained_iterations))
+                    package["updated_at"] = datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                    packages[package_id] = package
+                else:
+                    packages.pop(package_id, None)
+
+            result["artifact_binding_removed"] = True
+
+        if registry_changed:
+            try:
+                if not self.save_artifact_registry(registry, project_name):
+                    result["ok"] = False
+                    result["artifact_registry_error"] = "save_failed"
+            except Exception as exc:
+                result["ok"] = False
+                result["artifact_registry_error"] = str(exc)
+
+        for cache_name in (
+            "_ingest_manifest_cache",
+            "_latest_ingest_plan_summary_cache",
+            "_latest_ingest_plan_summary_runtime_cache",
+            "_iteration_image_count_cache",
+            "_iteration_image_source_dir_cache",
+        ):
+            try:
+                cache = getattr(self, cache_name, None)
+                if hasattr(cache, "clear"):
+                    cache.clear()
+            except Exception:
+                pass
+
+        return result
+
     def get_ingest_batch_size(self, project_name: str = None) -> int:
         project_name = self._resolve_project_name(project_name)
         if not project_name:
@@ -3539,11 +3691,24 @@ class CampaignManager:
         manifest: Dict[str, Any],
         iteration_num: int = None,
         project_name: str = None,
+        progress_callback=None,
     ) -> Path | None:
         manifest_path = self.get_ingest_manifest_path(iteration_num, project_name)
         if manifest_path is None:
             return None
-        if self._write_json_file(manifest_path, manifest):
+        from .campaign_image_identity import save_manifest_with_identity
+        try:
+            approved_entries = self.list_plate_approved_entries(project_name) or []
+        except (AttributeError, TypeError):
+            approved_entries = []
+        def progress(value, message, **kwargs):
+            self._ingest_identity_progress = {"value": value, "message": message, **kwargs}
+            if callable(progress_callback):
+                progress_callback(value, message, **kwargs)
+        prepared = save_manifest_with_identity(manifest, manifest_path, progress=progress, approved_entries=approved_entries)
+        if prepared is not None:
+            manifest.clear()
+            manifest.update(prepared)
             try:
                 self._ingest_manifest_cache.clear()
                 self._iteration_image_count_cache.clear()
@@ -3776,6 +3941,7 @@ class CampaignManager:
         project_name: str = None,
         progress_callback=None,
         selected_source_metadata: List[Dict[str, Any]] | None = None,
+        iteration_num: int | None = None,
     ) -> Path | None:
         project_name = self._resolve_project_name(project_name)
         if not project_name:
@@ -3785,7 +3951,7 @@ class CampaignManager:
         if not source_dir.exists() or not source_dir.is_dir():
             return None
 
-        iteration = int(self.state["projects"][project_name].get("current_iteration", 1))
+        iteration = int(iteration_num or self.state["projects"][project_name].get("current_iteration", 1))
         target_dir = self.get_iteration_raw_dir(iteration, project_name)
         if target_dir is None:
             return None
@@ -3856,15 +4022,12 @@ class CampaignManager:
                 resolved_source_path = source_path.resolve()
             except Exception:
                 resolved_source_path = source_path.absolute()
-            meta = metadata_by_name.get(str(source_path.name or "").strip().lower())
+            meta = metadata_by_path.get(str(resolved_source_path).lower())
             if meta is None:
-                meta = metadata_by_path.get(str(resolved_source_path).lower())
-            true_texts = list((meta or {}).get("ground_truth_texts") or [])
-            if not true_texts:
-                true_texts = planner.extract_true_texts_from_filename(source_path.name)
-            char_hist = dict((meta or {}).get("char_histogram") or {})
-            if not char_hist:
-                char_hist = planner.build_char_histogram(true_texts)
+                meta = metadata_by_name.get(str(source_path.name or "").strip().lower())
+            text_fields = planner.normalize_text_metadata(source_path.name, meta)
+            true_texts = text_fields["ground_truth_texts"]
+            char_hist = text_fields["char_histogram"]
             for ch, value in char_hist.items():
                 total_hist[ch] = total_hist.get(ch, 0) + int(value)
 
@@ -3878,6 +4041,7 @@ class CampaignManager:
                 "iteration_target_path": str(logical_target_path.resolve()),
                 "ground_truth_texts": true_texts,
                 "char_histogram": char_hist,
+                **text_fields,
             })
             _progress(
                 6.0 + 74.0 * (processed_count / max(1, total_files)),
@@ -3897,6 +4061,7 @@ class CampaignManager:
             "iteration": iteration,
             "created_at": datetime.now().isoformat(),
             "selection_mode": normalized_selection_mode,
+            "identity_mode": "reference" if normalized_selection_mode in {"source_reuse", "iteration_reuse"} else "admission",
             "source_dir": str(source_dir.resolve()),
             "target_dir": str(target_dir.resolve()),
             "master_pool_dir": str(master_pool_dir.resolve()) if master_pool_dir else "",
@@ -3916,11 +4081,11 @@ class CampaignManager:
             "Kończę zapis JSON i odświeżam pamięć podręczną projektu.",
             force=True,
         )
-        manifest_path = self.save_ingest_manifest(manifest, iteration, project_name)
+        manifest_path = self.save_ingest_manifest(manifest, iteration, project_name, progress_callback=_progress)
         _progress(
             100,
             "Manifest E1 zapisany.",
-            f"Zapisano {len(selected_images)} obrazów.",
+            f"Zapisano {manifest['selected_count']} obrazów; identyczne pominięte: {manifest.get('identity_summary', {}).get('duplicate_sha256', 0)}.",
             force=True,
         )
         return manifest_path

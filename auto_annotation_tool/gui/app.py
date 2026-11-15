@@ -2668,8 +2668,8 @@ class AutoAnnotationApp:
                     "PZ1 wyodrębnia tablice z zatwierdzonego źródła.",
                     "PZ2 wykrywa i koryguje znaki blokami YB, YS i OCR.",
                     "Ręczne ramki i ręcznie wpisane znaki mają pierwszeństwo przed wynikiem automatu.",
-                    "Status perfect oznacza zgodność odczytu, ramek i układu tablicy z regułami projektu.",
-                    "PZ3 zbiera perfecty, obsługuje opcjonalny CVAT i eksportuje źródłowy dataset znaków.",
+                    "Program osobno sprawdza poprawność techniczną, a użytkownik osobno zatwierdza tablicę do zbioru danych.",
+                    "Po sprawdzeniu tablic można utworzyć źródłowy zbiór znaków; opcjonalne poprawki można wykonać także w CVAT.",
                 ),
                 glossary=(
                     "YB = detekcja ramek znaków",
@@ -2678,7 +2678,7 @@ class AutoAnnotationApp:
                     "MB/MS = ręczna ramka lub ręcznie wpisany znak",
                     "AZ = anotacje znaków do datasetu MZ",
                 ),
-                caution="Detekcja ma pomagać, ale nie powinna nadpisywać manuali. Przy zdjęciu z kilkoma rejestracjami odczyt może pasować do jednego z kandydatów zapisanych w nazwie pliku.",
+                caution="Automatyczne wykrywanie ma pomagać, ale nie zastępuje decyzji użytkownika. Prawidłowy numer jest wiązany z konkretną tablicą, a nie wyłącznie z nazwą pliku.",
                 references=("docs/mapa_funkcji_i_kodu.md", "DZIENNIK_ARCHITEKTURY_I_ZMIAN.md"),
             )
         if tab_key == "training":

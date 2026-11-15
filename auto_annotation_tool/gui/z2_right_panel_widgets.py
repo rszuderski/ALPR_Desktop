@@ -5,9 +5,56 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, font as tkfont
 
 from .z2_shared_ui import get_campaign_return_to_graph_copy
+from .web_slim_scrollbar import WebSlimScrollbar
+
+
+class _WrappingStatusButton(ttk.Button):
+    """Keep changing campaign CTA copy readable within the current panel width."""
+
+    def __init__(self, master, **kwargs):
+        self._full_text = str(kwargs.get("text", ""))
+        super().__init__(master, **kwargs)
+        self.bind("<Configure>", self._wrap_text, add="+")
+
+    def configure(self, cnf=None, **kwargs):
+        if isinstance(cnf, dict):
+            kwargs = {**cnf, **kwargs}
+            cnf = None
+        if "text" in kwargs:
+            self._full_text = str(kwargs["text"])
+        if "width" in kwargs:
+            kwargs["width"] = 0
+        result = super().configure(cnf, **kwargs)
+        if kwargs:
+            self._wrap_text()
+        return result
+
+    config = configure
+
+    def _wrap_text(self, _event=None):
+        width = self.winfo_width()
+        if width <= 1:
+            return
+        style = ttk.Style(self)
+        font = tkfont.Font(root=self, font=style.lookup(self.cget("style") or "TButton", "font") or "TkDefaultFont")
+        available = max(1, width - 28)
+        lines = []
+        for paragraph in self._full_text.split("\n"):
+            line = ""
+            for word in paragraph.split():
+                candidate = f"{line} {word}" if line else word
+                if line and font.measure(candidate) > available:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = candidate
+            lines.append(line)
+        text = "\n".join(lines)
+        if str(self.cget("text")) != text:
+            super().configure(text=text)
 
 
 def build_annotation_right_panel(
@@ -32,20 +79,37 @@ def build_annotation_right_panel(
     right_scroll_shell.pack(fill=tk.BOTH, expand=True)
     self.right_scroll_shell = right_scroll_shell
     return_copy = get_campaign_return_to_graph_copy(self)
+    # GT edytujemy bezpośrednio nad polygonem na canvasie.
+    self.plate_gt_frame = None
+    self.plate_gt_entry = None
+    self.plate_gt_var = None
+    self.plate_gt_save_btn = None
+    self.plate_gt_clear_btn = None
 
     # Legacy right-side detection configuration was replaced by the graph flow,
     # scoped modals, and the global device menu. Keep the old attributes as
-    # inert placeholders so older refresh paths can no-op safely.
+    # inert placeholders so older refresh paths can no-op safely. Status content
+    # has its own scrolling surface; right_scroll_host remains the legacy host.
     self.right_scroll_host = None
-    self.right_settings_canvas = None
-    self.right_settings_scrollbar = None
-    self.right_settings_content = None
-    self._right_settings_window_id = None
+    self.right_settings_scrollbar = WebSlimScrollbar(right_scroll_shell)
+    self.right_settings_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    self.right_settings_canvas = tk.Canvas(
+        right_scroll_shell, width=260, bg=panel_bg, highlightthickness=0, bd=0,
+        yscrollcommand=self.right_settings_scrollbar.set,
+    )
+    self.right_settings_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    self.right_settings_scrollbar.configure(command=self.right_settings_canvas.yview)
+    self.right_settings_content = ttk.Frame(self.right_settings_canvas, style="Panel.TFrame")
+    self._right_settings_window_id = self.right_settings_canvas.create_window(
+        (0, 0), window=self.right_settings_content, anchor="nw",
+    )
+    self.right_settings_canvas.bind("<Configure>", self._sync_right_panel_canvas_width, add="+")
+    self.right_settings_content.bind("<Configure>", self._sync_right_panel_scrollregion, add="+")
     self.detection_settings_lf = None
     self._legacy_detection_panel_visible = False
 
     self.approve_btn_row = ttk.LabelFrame(
-        right_scroll_shell,
+        self.right_settings_content,
         text=str(return_copy.get("section") or " Powrót do grafu "),
         padding=10,
     )
@@ -61,7 +125,7 @@ def build_annotation_right_panel(
         textvariable=self.approve_context_var,
         anchor="w",
         justify=tk.LEFT,
-        wraplength=320,
+        wraplength=260,
         bd=0,
         highlightthickness=0,
         padx=10,
@@ -97,7 +161,7 @@ def build_annotation_right_panel(
         textvariable=self.approve_gate_hint_var,
         anchor="w",
         justify=tk.LEFT,
-        wraplength=320,
+        wraplength=260,
         bd=0,
         highlightthickness=0,
         padx=10,
@@ -131,7 +195,7 @@ def build_annotation_right_panel(
         textvariable=self.approve_breakdown_var,
         anchor="w",
         justify=tk.LEFT,
-        wraplength=320,
+        wraplength=260,
         bd=0,
         highlightthickness=0,
         padx=10,
@@ -184,7 +248,7 @@ def build_annotation_right_panel(
     # Campaign gates are closed from the graph badge. Keep the legacy button
     # alive for older code paths, but do not show it in the right panel by default.
 
-    self.return_to_campaign_right_btn = ttk.Button(
+    self.return_to_campaign_right_btn = _WrappingStatusButton(
         self.approve_btn_frame,
         text=str(return_copy.get("button") or "Wróć do grafu"),
         style="WorkflowCard.TButton",

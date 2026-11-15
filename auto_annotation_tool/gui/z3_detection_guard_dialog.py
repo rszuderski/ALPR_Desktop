@@ -162,7 +162,7 @@ def prompt_pz2_detection_guard_options(host, method_key: str) -> dict | None:
     tk.Label(
         body,
         text=(
-            "Wybierz zakres detekcji i zasady zapisu wyniku. Tablice perfect są domyślnie zachowywane, "
+            "Wybierz zakres wykrywania i zasady zapisu wyniku. Sprawdzone tablice są domyślnie chronione, "
             "a refiner może poprawiać wyłącznie geometrię ich boxów bez zmiany odczytu znaków."
         ),
         bg=panel_bg,
@@ -180,9 +180,9 @@ def prompt_pz2_detection_guard_options(host, method_key: str) -> dict | None:
 
     summary_rows = [
         ("Wszystkie tablice", int(counts.get("total", 0)), "Tablice cropy w PZ2"),
-        ("Ze statusem perfect", int(counts.get("perfect", 0)), "Chronione domyślnie"),
-        ("Do korekty", int(counts.get("needs_detection", 0)), "Nie mają statusu perfect"),
-        ("Perfect z OCR", int(counts.get("perfect_ocr", 0)), "Perfect uzyskane przez OCR"),
+        ("Sprawdzone", int(counts.get("perfect", 0)), "Chronione domyślnie"),
+        ("Do korekty", int(counts.get("needs_detection", 0)), "Wymagają sprawdzenia lub poprawy"),
+        ("Sprawdzone po odczycie", int(counts.get("perfect_ocr", 0)), "Poprawność techniczna po odczycie tekstu"),
         ("Z ręcznymi boxami", int(counts.get("manual", 0)), f"{int(counts.get('manual_boxes', 0))} boxów"),
     ]
     for idx, (label, value, note) in enumerate(summary_rows):
@@ -268,16 +268,16 @@ def prompt_pz2_detection_guard_options(host, method_key: str) -> dict | None:
     non_perfect_scope_check = add_check(
         "Przetwarzaj tylko tablice do korekty",
         process_non_perfect_only_var,
-        "Ogranicza detekcję do tablic bez statusu perfect. Tablice perfect zostaną pominięte w tym przebiegu.",
+        "Ogranicza wykrywanie do tablic wymagających sprawdzenia. Sprawdzone tablice zostaną pominięte.",
         disabled=needs_detection_count <= 0,
     )
     protect_perfect_check = add_check(
-        "Zachowaj status i odczyt tablic perfect",
+        "Nie zmieniaj już sprawdzonych tablic",
         protect_perfect_var,
         "Perfect oznacza, że tekst znaków zgadza się z oczekiwanym odczytem z nazwy pliku. Ta opcja blokuje przebudowę wyniku od zera.",
     )
     refine_check = add_check(
-        "Refiner geometrii boxów perfect",
+        "Automatycznie poprawiaj ramki sprawdzonych tablic",
         refine_perfect_yolo_var,
         "Refiner używa propozycji YOLO tylko jako punktu startowego. Zawęża lub przesuwa box, jeśli poprawia pokrycie właściwego znaku. Opcja działa tylko w pipeline z YOLO.",
         disabled=not method_has_yolo,
@@ -315,7 +315,7 @@ def prompt_pz2_detection_guard_options(host, method_key: str) -> dict | None:
     tk.Label(
         body,
         text=(
-            "Jeśli chcesz przebudować automatyczne wyniki od zera, możesz odznaczyć ochronę perfectów. "
+            "Jeśli chcesz przebudować automatyczne wyniki od zera, możesz odznaczyć ochronę sprawdzonych tablic. "
             "Ręczne korekty pozostają chronione."
         ),
         bg=panel_bg,

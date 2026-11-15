@@ -15,12 +15,21 @@ for env_name in (
 ):
     os.environ.setdefault(env_name, "1")
 
-# Pomaga ograniczyć fragmentację alokacji CUDA w dłuższych sesjach treningowych.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Ta optymalizacja alokatora nie jest obsługiwana przez używane buildy PyTorch
+# na Windows. Włączamy ją domyślnie tylko na Linuksie, przed importem torch.
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def main():
     try:
+        from alpr_runtime import initialize_runtime
+        initialize_runtime()
+        # The dependency bootstrap can itself create Tk windows. Select native
+        # Windows pixels before that happens, not only in the Canvas test host.
+        from windows_dpi import enable_windows_dpi_awareness
+        enable_windows_dpi_awareness()
+
         from dependency_bootstrap import ensure_runtime_dependencies, get_last_probe_terminal_entries
         if not ensure_runtime_dependencies(app_argv=list(sys.argv)):
             return
@@ -64,12 +73,18 @@ def main():
                 pass
         
     except Exception as e:
-        print("\n" + "="*60)
-        print("❌ KRYTYCZNY BŁĄD URUCHOMIENIA APLIKACJI ❌")
-        print("="*60)
-        traceback.print_exc()
-        print("="*60)
-        input("Naciśnij ENTER, aby zamknąć...")
+        from alpr_runtime import report_startup_error
+        report_startup_error(e)
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    import multiprocessing
+    multiprocessing.freeze_support()
+    from alpr_runtime import initialize_runtime, run_worker_if_requested
+    initialize_runtime()
+    if len(sys.argv)==3 and sys.argv[1]=='--alpr-acceptance':
+        from release_acceptance import main as acceptance_main
+        raise SystemExit(acceptance_main(sys.argv[2]))
+    elif not run_worker_if_requested():
+        raise SystemExit(main())

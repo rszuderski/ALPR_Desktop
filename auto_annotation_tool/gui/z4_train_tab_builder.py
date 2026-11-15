@@ -95,6 +95,7 @@ from . import z4_training_metrics
 from . import z4_dataset_builder
 from . import z4_analysis_ranking
 from . import z4_training_runtime
+from . import z4_mz_experiment
 from . import z4_campaign_state
 from . import z4_dataset_validation
 from . import z4_layout_runtime
@@ -107,6 +108,7 @@ from . import z4_tab_shell
 from . import z4_history_runtime
 from . import z4_dataset_panels
 from . import z4_dataset_tab_builder
+from . import z4_fine_tune_protocol
 from .z4_view_models import (
     Step4CampaignNavigationViewModel,
     Step4DatasetWorkflowViewModel,
@@ -357,6 +359,8 @@ def _build_train_tab(self):
                 "hint": hint_lbl,
             }
         )
+
+    z4_mz_experiment.build_section(self, settings_col)
 
     section_border = blend_hex_colors(
         palette.get("success", "#2ecc71"),
@@ -798,6 +802,11 @@ def _build_train_tab(self):
     self.step4_pinned_result_shell.pack_forget()
 
     def auto_name(*args):
+        if bool(getattr(self, "_mz_applying_protocol", False)):
+            return
+        if z4_mz_experiment.is_active(self):
+            self.name_var.set(self._mz_protocol["experiment_id"] + "_" + self.mz_variant_var.get())
+            return
         ds_name = Path(self.dataset_var.get()).name if self.dataset_var.get() else "UnknownDS"
         model_name = self.base_model_var.get()
         if self._is_custom_base_model_key(model_name):
@@ -1014,6 +1023,9 @@ def _build_train_tab(self):
     )
     self.train_recommendation_note_lbl.pack(anchor=tk.W, fill=tk.X, pady=(2, 14))
     self._register_train_left_wrap_target(self.train_recommendation_note_lbl, padding=16, min_wrap=220)
+
+    # Z4FTGUI001: zaawansowane opcje są widoczne tylko przy fine-tuningu.
+    z4_fine_tune_protocol.build_panel(self, settings_col)
     self.epochs_var.trace_add("write", lambda *args: self._refresh_training_recommendation_table())
     self.epochs_var.trace_add("write", lambda *args: self._refresh_training_execution_summary())
     self.batch_var.trace_add("write", lambda *args: self._refresh_training_recommendation_table())
@@ -1362,8 +1374,6 @@ def _build_train_tab(self):
     self._register_train_left_wrap_target(self.train_metric_reference_lbl, padding=16, min_wrap=220)
     self._refresh_training_metric_reference()
     self._set_train_live_metrics(None)
-    self._refresh_training_recommendation_table()
-    self._refresh_training_start_state()
 
     terminal_tools = ttk.Frame(root, style="Panel.TFrame")
     terminal_tools.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -1868,6 +1878,19 @@ def _build_train_tab(self):
     self.btn_step4_finish.configure(text="Stwórz inny wariant datasetu", width=28)
 
     self._refresh_step4_campaign_navigation_ui()
+
+    # Historia może już istnieć na dysku zanim leniwa zakładka PZ2 zostanie
+    # zbudowana (np. po restarcie aplikacji po zakończonym treningu).
+    # Drzewo historii powstaje dopiero tutaj, więc po jego utworzeniu trzeba
+    # jawnie załadować snapshot i kandydatów wyniku bramki.
+    try:
+        self._load_history()
+    except Exception as exc:
+        logger.debug(f"Nie udało się załadować historii po zbudowaniu Z4/PZ2: {exc}")
+    try:
+        self._refresh_campaign_training_result_selector()
+    except Exception as exc:
+        logger.debug(f"Nie udało się odświeżyć kandydatów T06 po zbudowaniu Z4/PZ2: {exc}")
 
     if self.training_input_summary_frame is not None:
         HELP.bind_help(self.training_input_summary_frame, "tr_train_input_summary")

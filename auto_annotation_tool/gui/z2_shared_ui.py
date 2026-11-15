@@ -696,8 +696,18 @@ def apply_z2_workflow_left_layout(
         pady=((2, 0) if (campaign_context and campaign_char_repair_mode) else (0, 3)),
     )
     hide_compact_route_meta = bool(
-        compact_single_route_layout
-        and not (campaign_context and route == "manual")
+        (
+            compact_single_route_layout
+            and not (campaign_context and route == "manual")
+        )
+        or (
+            (not campaign_context)
+            and (
+                show_auto_followup
+                or show_manual_review_followup
+                or show_export_followup
+            )
+        )
     )
     if hide_compact_route_meta:
         host._set_widget_packed(host.run_title_lbl, False)
@@ -937,7 +947,7 @@ def apply_z2_workflow_left_layout(
             except Exception:
                 cut_ready = False
             host.open_run_dir_btn.configure(
-                text="Wyodrębnij tablice",
+                text="Przejdź do Z3",
                 command=host._open_step3_from_z2_annotation_source,
                 state=(tk.NORMAL if cut_ready and not host.is_processing else tk.DISABLED),
             )

@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from auto_annotation_tool.gui import z4_training_runtime as runtime
+from auto_annotation_tool.gui import z4_training_metrics as metrics
 from auto_annotation_tool.gui import campaign_graph_actions as actions
 from auto_annotation_tool.training.trainer import YOLOPoseTrainer
 
@@ -22,6 +23,9 @@ class HistoryTree:
         assert threading.get_ident() == self.owner
         return row in self.rows
 
+    def selection(self):
+        return getattr(self,'selected',())
+
     def item(self, row, option):
         assert threading.get_ident() == self.owner
         assert option == "tags"
@@ -32,7 +36,7 @@ class HistoryTree:
         if value is not None:
             self.writes.append((row, column, value))
             self.rows[row][column] = value
-        return self.rows[row][column]
+        return self.rows[row].get(column, "")
 
 
 def live_owner():
@@ -83,6 +87,58 @@ def test_repeated_batches_do_not_rewrite_same_cells():
     for _ in range(50):
         runtime._update_training_history_progress(host, run_id="live", epoch=3, total_epochs=10)
     assert len(host.tree.writes) == 2
+
+
+@pytest.mark.parametrize('selected',[True,False])
+def test_epoch_metrics_are_best_to_date_and_refresh_selected_panel_without_disk(selected):
+    host,queued=live_owner()
+    run=host.trainer.current_run
+    run.dataset_path='chars'
+    host.tree.selected=('char:live',) if selected else ('other',)
+    host.tree.rows['char:live']=host.tree.rows.pop('live')
+    source=SimpleNamespace(history_dir='chars')
+    host.history=source
+    host._history_row_refs={'char:live':{'run':run,'history':source,'target':'char'}}
+    host._infer_dataset_target.return_value='char'
+    host._iter_training_metric_keys.return_value=['map50_95']
+    host._format_training_metric_band.return_value=('Test grade','')
+    host._format_training_metric_name.side_effect=lambda key:key
+    host._format_training_metric_value.side_effect=lambda key,value:f'{value:.3f}'
+    host._build_training_run_detail_rows.return_value=[('Postęp','live')]
+    host._build_training_run_metric_rows.side_effect=lambda run:metrics._build_training_run_metric_rows(host,run)
+    host._set_history_run_tables.side_effect=lambda run:metrics._set_history_run_tables(host,run)
+    host.hist_detail_tree=object()
+    host.hist_metrics_tree=object()
+    host._set_metric_table_rows=Mock()
+    host._history_selected_detail_rows=[('Postęp','0/10 epok'),('Status','running')]
+    host._format_history_run_status_label.return_value='trwa trening'
+    host._infer_dataset_target.side_effect=AssertionError('no dataset inspection after an epoch')
+    for epoch,value,best in [(1,.30,.30),(2,.25,.30),(3,.42,.42)]:
+        host.trainer._emit_worker_event({'type':'epoch_end','epoch':epoch,'metrics':{'map50_95':value,'map50':.5,'loss':1.0}})
+        queued.pop(0)()
+        assert host.tree.rows['char:live']['mAP50-95']==f'{best:.3f}'
+        assert host.tree.rows['char:live']['Epoki']==f'{epoch}/10'
+        if selected:
+            host._set_metric_table_rows.assert_any_call(host.hist_metrics_tree,
+                [('map50_95',f'{value:.3f}',f'{best:.3f}','Test grade')])
+    assert len(run.metrics_history)==3
+    host._set_history_run_tables.assert_not_called()
+    host._build_training_run_detail_rows.assert_not_called()
+    host._infer_dataset_target.assert_not_called()
+    assert host.tree.selected==(('char:live',) if selected else ('other',))
+    host._load_history.assert_not_called()
+    host._reload_history_snapshot_from_disk.assert_not_called()
+
+
+def test_epoch_update_does_not_replace_details_of_first_selected_other_run():
+    host,queued=live_owner()
+    host.tree.selected=('other','live')
+    with patch.object(metrics,'_refresh_history_epoch_tables') as refresh:
+        host.trainer._emit_worker_event({'type':'epoch_end','epoch':1,'metrics':{'map50_95':.3}})
+        queued.pop(0)()
+    assert host.tree.rows['live']['mAP50-95']=='0.300'
+    refresh.assert_not_called()
+    assert host.tree.selected==('other','live')
 
 
 def test_resume_pause_stop_and_pinned_marker():

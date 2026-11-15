@@ -5,7 +5,7 @@ Modele danych aplikacji.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 from enum import Enum
 
 
@@ -32,6 +32,16 @@ class Detection:
     text: Optional[str] = None  # Rozpoznany tekst (ABC 1234)
     text_confidence: float = 0.0  # Pewność OCR (0.0-1.0)
     attributes: Dict[str, str] = field(default_factory=dict)  # format, is_valid, itp
+    # Optional versioned evidence; raw Pose is never replaced by manual/display geometry.
+    geometry: Optional[Dict[str, Any]] = None
+
+    @property
+    def raw_pose_keypoints(self):
+        return (self.geometry or {}).get("raw_pose_keypoints")
+
+    @property
+    def display_polygon(self):
+        return (self.geometry or {}).get("display_polygon")
     
     def is_inside(self, other_bbox: Tuple[float, float, float, float], 
                   threshold: float = 0.95) -> bool:

@@ -74,7 +74,7 @@ class Step3Pz3PathSelectionViewModel:
     cvat_card_selected: bool = False
     dataset_badge_text: str = "DATASET"
     dataset_title_text: str = "Dataset znaków"
-    dataset_desc_text: str = "Główna ścieżka PZ3: materiał z PZ2, zakres tablic perfect i utworzenie źródłowego datasetu znaków."
+    dataset_desc_text: str = "Główna ścieżka: sprawdzone i zatwierdzone tablice oraz utworzenie źródłowego zbioru znaków."
     cvat_badge_text: str = "OPCJA"
     cvat_title_text: str = "Korekta w CVAT"
     cvat_desc_text: str = "Obieg korekty poza aplikacją: wyślij cropy tablic do CVAT, popraw boxy znaków i wczytaj XML z powrotem w PZ3."
@@ -97,7 +97,7 @@ class Step3Pz3DatasetModeViewModel:
     existing_selected: bool = False
     perfect_badge_text: str = "PZ2"
     perfect_title_text: str = "Materiał z PZ2"
-    perfect_desc_text: str = "Źródłem są wyodrębnione tablice z PZ2 oznaczone jako perfect."
+    perfect_desc_text: str = "Źródłem są wyodrębnione tablice, które zostały sprawdzone i zatwierdzone."
     existing_badge_text: str = "Z4"
     existing_title_text: str = "Warianty w Z4"
     existing_desc_text: str = "Gotowe datasety i ich warianty wybierzesz w Z4."

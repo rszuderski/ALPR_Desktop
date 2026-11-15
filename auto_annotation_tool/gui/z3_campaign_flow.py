@@ -171,6 +171,27 @@ def mark_step3_work_interrupted_on_app_close(host: "CharacterAnnotationTab") -> 
     except Exception:
         session = {}
 
+    # Zamknięcie aplikacji nie jest "przerwaniem" zakończonego checkpointu PZ2.
+    # Jeśli operator zatwierdził cały materiał PZ2, bezpośrednim następnym
+    # krokiem pozostaje PZ3 również po restarcie.
+    if selected_work_substep and selected_substep == 2:
+        try:
+            pz2_ready_on_close = bool(
+                host._campaign_step3_pz2_current_contract_ready()
+            )
+        except Exception:
+            pz2_ready_on_close = False
+        if pz2_ready_on_close:
+            _mark_t06_z3_work_session(
+                host,
+                state="ready_for_pz3",
+                substep=2,
+                reason="app_closed_after_pz2_ready",
+                force=True,
+            )
+            _invalidate_step3_campaign_ui_caches()
+            return True
+
     session_state = str(session.get("state") or "").strip().lower()
     session_gate = str(session.get("working_gate_id") or "").strip().upper()
     session_area = str(session.get("work_area") or "").strip().lower()
@@ -437,7 +458,7 @@ def get_step3_finish_block_message(readiness: dict | None = None) -> str:
     if reason == "missing_char_boxes":
         min_exportable_plates = int(readiness.get("min_exportable_plate_count", 10) or 10)
         return str(readiness.get("message") or "").strip() or (
-            f"E3 wymaga co najmniej {min_exportable_plates} tablic perfect z poprawnymi boxami znaków i etykietami. "
+            f"Do przejścia dalej potrzeba co najmniej {min_exportable_plates} sprawdzonych i zatwierdzonych tablic z poprawnymi ramkami znaków i etykietami. "
             "Wróć do PZ2, oznacz znaki na tablicach i ponownie wykonaj eksport w PZ3."
         )
 
@@ -517,11 +538,8 @@ def return_to_wizard_for_step3_rework(host: "CharacterAnnotationTab") -> None:
             readiness = host._get_campaign_step3_training_readiness()
             ready_summary = _read_ready_step3_export_summary(host)
             ready_for_approval = bool(
-                (
-                    host._has_any_step3_export_outputs()
-                    and bool(readiness.get("ok"))
-                )
-                or bool(ready_summary)
+                host._has_any_step3_export_outputs()
+                and bool(readiness.get("ok"))
             )
 
             if current_status == "approved":
@@ -820,8 +838,66 @@ def return_to_wizard_from_step3_pz2(host: "CharacterAnnotationTab") -> None:
         pass
     _invalidate_step3_campaign_ui_caches()
 
+    # Preferowany kontrakt UX: Praca T05 otwiera się jeszcze nad PZ2.
+    # Nie przełączamy najpierw na kartę kampanii, więc użytkownik nie widzi
+    # po drodze samego grafu. Opener pochodzi z ostatniego renderu grafu,
+    # z którego użytkownik wszedł do PZ2.
+    campaign_tab = getattr(host.app, "tabs", {}).get("campaign")
+    immediate_modal_opened = False
+    if campaign_tab is not None:
+        try:
+            campaign_tab._campaign_graph_selected_edge_key = "e3_to_e4"
+            if hasattr(CAMPAIGN, "set_graph_selected_edge_key"):
+                CAMPAIGN.set_graph_selected_edge_key("e3_to_e4")
+        except Exception:
+            pass
+        opener = getattr(campaign_tab, "_campaign_open_gate_actions_modal", None)
+        if callable(opener):
+            try:
+                opener("e3_to_e4")
+                immediate_modal_opened = True
+            except Exception as exc:
+                logger.debug(f"Nie udało się otworzyć Praca T05 bezpośrednio nad PZ2: {exc}")
+
+    if immediate_modal_opened:
+        # Modal istnieje już nad PZ2. Teraz przełączamy kartę bazową na Wizard,
+        # więc PZ2 znika bez wcześniejszego pokazania samego grafu.
+        try:
+            host.app.open_controlled_tab("campaign")
+        except Exception as exc:
+            logger.debug(f"Nie udało się zamknąć widoku PZ2 pod modalem T05: {exc}")
+        try:
+            host.app.update_campaign_tab_access()
+        except Exception:
+            pass
+        try:
+            if pz2_ready:
+                host.app.update_status(
+                    f"PZ2 zapisane. Otworzono pracę bramki {CHAR_WORK_GATE_DISPLAY_ID}.",
+                    "success",
+                )
+            else:
+                host.app.update_status(
+                    f"PZ2 zapisane jako praca w toku. Otworzono pracę bramki {CHAR_WORK_GATE_DISPLAY_ID}.",
+                    "info",
+                )
+        except Exception:
+            pass
+        return
+
+    # Fallback tylko wtedy, gdy bieżący renderer grafu nie udostępnił jeszcze
+    # bezpośredniego openera (np. stary stan UI po nietypowym restore).
+    _request_t05_work_modal_on_campaign_graph(
+        host,
+        reason="pz2_ready_return_to_t05_work" if pz2_ready else "pz2_return_to_t05_work_pending",
+    )
     try:
-        campaign_tab = host.app.tabs.get("campaign")
+        host.app.open_controlled_tab("campaign")
+        host.app.update_campaign_tab_access()
+    except Exception as exc:
+        logger.debug(f"Nie udało się otworzyć grafu awaryjnie po PZ2: {exc}")
+
+    try:
         if campaign_tab:
             try:
                 campaign_tab.request_wizard_stage_focus(step_num=3)
@@ -830,23 +906,7 @@ def return_to_wizard_from_step3_pz2(host: "CharacterAnnotationTab") -> None:
             campaign_tab._rebuild_roadmap_ui()
             campaign_tab._refresh_dashboard()
     except Exception as exc:
-        logger.debug(f"Nie udało się odświeżyć grafu po powrocie z PZ2: {exc}")
-
-    try:
-        host.app.open_controlled_tab("campaign")
-        host.app.update_campaign_tab_access()
-        if pz2_ready:
-            host.app.update_status(
-                f"PZ2 jest zapisane. W pracy bramki {CHAR_WORK_GATE_DISPLAY_ID} wybierz krok 2: utwórz dataset znaków w PZ3.",
-                "success",
-            )
-        else:
-            host.app.update_status(
-                f"Wracasz do grafu. Praca w PZ2 bramki {CHAR_WORK_GATE_DISPLAY_ID} pozostaje w toku.",
-                "info",
-            )
-    except Exception as exc:
-        logger.debug(f"Nie udało się wrócić do grafu z PZ2: {exc}")
+        logger.debug(f"Nie udało się odświeżyć grafu w fallbacku powrotu z PZ2: {exc}")
 
 
 def return_step3_result_to_wizard(host: "CharacterAnnotationTab", summary: dict) -> None:
@@ -1010,6 +1070,171 @@ def _can_reuse_campaign_preview(host, key):
     )
 
 
+# T05PZ3FIX001: direct current-PZ2 checkpoint entry
+def _try_direct_campaign_pz3_checkpoint_entry(
+    host: "CharacterAnnotationTab",
+    source_context: dict | None,
+    *,
+    chars_dir=None,
+    datasets_dir=None,
+) -> dict | None:
+    """Open explicit T05/PZ3 from the current PZ2 checkpoint."""
+    try:
+        context = dict(source_context or {})
+    except Exception:
+        context = {}
+
+    def _truthy(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "tak", "yes", "on"}
+        return bool(value)
+
+    target_hint = str(
+        context.get("target_substep")
+        or context.get("graph_target_substep")
+        or context.get("preferred_substep")
+        or ""
+    ).strip().lower()
+    explicit_pz3 = bool(
+        _truthy(context.get("force_pz3"))
+        or target_hint in {"3", "dataset", "pz3", "z3_pz3"}
+    )
+    if not explicit_pz3:
+        return None
+
+    try:
+        current_pz2_ready = bool(host._campaign_step3_pz2_current_contract_ready())
+    except Exception:
+        current_pz2_ready = False
+    if not current_pz2_ready:
+        return None
+
+    candidates = []
+    try:
+        current_preview = str(host.preview_dir_var.get() or "").strip()
+        if current_preview:
+            candidates.append(current_preview)
+    except Exception:
+        pass
+    try:
+        campaign_preview = str(CAMPAIGN.get_step3_preview_dir() or "").strip()
+        if campaign_preview and campaign_preview not in candidates:
+            candidates.append(campaign_preview)
+    except Exception:
+        pass
+    try:
+        saved_preview = str(host._get_saved_step3_preview_dir(require_plates=True) or "").strip()
+        if saved_preview and saved_preview not in candidates:
+            candidates.append(saved_preview)
+    except Exception:
+        pass
+
+    preview_dir = ""
+    for candidate in candidates:
+        try:
+            usable = bool(
+                host._is_usable_step3_preview_dir(
+                    candidate,
+                    require_plates=True,
+                    check_campaign_inflated=False,
+                )
+            )
+        except TypeError:
+            try:
+                usable = bool(host._is_usable_step3_preview_dir(candidate, require_plates=True))
+            except Exception:
+                usable = False
+        except Exception:
+            usable = False
+        if usable:
+            preview_dir = str(candidate)
+            break
+
+    if not preview_dir:
+        return None
+
+    # Ustaw kontekst PRZED select(PZ3). Zdarzenie NotebookTabChanged jest asynchroniczne
+    # i bez tego widzi force_pz3=False, po czym zrzuca kartę do PZ1.
+    host._step3_linear_mode = True
+    try:
+        host._campaign_force_pz2_entry = False
+        host._campaign_force_detect_entry = False
+        host._campaign_force_pz3_entry = True
+        host._campaign_graph_entry_context = dict(context)
+        host._campaign_step3_hold_pz2_after_reextract = False
+    except Exception:
+        pass
+
+    try:
+        host.preview_dir_var.set(preview_dir)
+    except Exception:
+        pass
+    try:
+        CAMPAIGN.set_step3_preview_dir(preview_dir)
+        CAMPAIGN.set_step3_stage1_done(True)
+        CAMPAIGN.set_step3_stage2_done(True)
+        CAMPAIGN.set_step3_substep(3)
+    except Exception:
+        pass
+
+    try:
+        host._campaign_chars_dir = str(chars_dir) if chars_dir else None
+        host._campaign_datasets_dir = str(datasets_dir) if datasets_dir else None
+    except Exception:
+        pass
+
+    try:
+        loaded = bool(_ensure_campaign_pz2_preview_loaded(host, force_reload=False))
+        host._campaign_pz2_preview_loaded_this_entry = loaded
+    except Exception:
+        pass
+
+    try:
+        host.go_to_substep_3(force=True)
+    except Exception as exc:
+        logger.error("Nie udało się otworzyć PZ3 z bieżącego checkpointu PZ2: %s", exc)
+        return {
+            "ok": False,
+            "reason": "direct_pz3_checkpoint_exception",
+            "message": str(exc),
+            "preview_dir": preview_dir,
+        }
+
+    try:
+        selected = str(host.main_nb.select() or "")
+        expected = str(host.tab_dataset)
+        if selected != expected:
+            return {
+                "ok": False,
+                "reason": "direct_pz3_selection_failed",
+                "message": "Jawne wejście T05/PZ3 nie utrzymało aktywnej karty PZ3.",
+                "preview_dir": preview_dir,
+            }
+    except Exception:
+        pass
+
+    for method_name in (
+        "_refresh_pz3_cards_ui",
+        "_refresh_pz3_status_panel_ui",
+        "_update_step3_finish_button_state",
+    ):
+        try:
+            method = getattr(host, method_name, None)
+            if callable(method):
+                method()
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "direct_pz3_checkpoint": True,
+        "preview_dir": preview_dir,
+        "using_preferred_source": False,
+        "reason": "current_pz2_checkpoint",
+    }
+
+
+
 def open_campaign_step3_entry(
     host: "CharacterAnnotationTab",
     preferred_source_context: dict | None = None,
@@ -1030,6 +1255,20 @@ def open_campaign_step3_entry(
     if not CAMPAIGN.get_active_project_name() or int(CAMPAIGN.get_current_step() or 0) < 3:
         return {"ok": False, "reason": "campaign_inactive"}
 
+    # Defensive context invariant: to jest wejście kampanijne.
+    # Nawet po restore/restart Z3 nie może odziedziczyć flag trybu swobodnego.
+    try:
+        host._step3_linear_mode = True
+    except Exception:
+        pass
+    try:
+        host.app.campaign_free_mode = False
+        set_campaign_mode = getattr(host.app, "set_campaign_mode", None)
+        if callable(set_campaign_mode):
+            set_campaign_mode(True)
+    except Exception:
+        pass
+
     # Finish edits to the previous loaded run before replacing its UI context.
     flush_preview = getattr(host, "_flush_scheduled_preview_metadata_save", None)
     if callable(flush_preview):
@@ -1048,6 +1287,17 @@ def open_campaign_step3_entry(
         return {"ok": False, "reason": "missing_campaign_dirs"}
 
     incoming_source_context = preferred_source_context if isinstance(preferred_source_context, dict) else {}
+
+    # T05PZ3FIX001: explicit PZ3 fast path
+    direct_pz3_checkpoint = _try_direct_campaign_pz3_checkpoint_entry(
+        host,
+        incoming_source_context,
+        chars_dir=chars_dir,
+        datasets_dir=datasets_dir,
+    )
+    if direct_pz3_checkpoint is not None:
+        return direct_pz3_checkpoint
+
 
     def _context_points_to_ready_source(context: dict | None) -> bool:
         if not isinstance(context, dict) or not context:
@@ -1212,6 +1462,18 @@ def open_campaign_step3_entry(
         latest_xml = str(max(xml_files, key=lambda p: p.stat().st_mtime)) if xml_files else ""
     _mark_entry_phase("source_resolution")
 
+    # A usable run XML can still contain rejected or unreviewed polygons. Bind
+    # the exact approved snapshots before checking/reusing old crop metadata.
+    from .z3_approved_source import source_for_campaign
+    try:
+        approved_source = source_for_campaign(CAMPAIGN)
+    except (OSError, ValueError) as exc:
+        host._set_extraction_status(str(exc), "error")
+        return {"ok": False, "reason": "approved_source_invalid", "message": str(exc)}
+    latest_xml = str(approved_source["xml_path"])
+    preferred_run_dir = approved_source["run_dir"]
+    folder = approved_source["images_dir"]
+    using_preferred_source = True
     entry_preview_key = _campaign_preview_entry_key(latest_xml, folder)
     reuse_loaded_preview = _can_reuse_campaign_preview(host, entry_preview_key)
     if not reuse_loaded_preview:
@@ -1510,15 +1772,27 @@ def open_campaign_step3_entry(
     def _can_continue_forced_pz3_without_reextract(refresh_state: dict | None = None) -> bool:
         if not force_dataset_entry:
             return False
+        # Jawne wejście T05 -> PZ3 pracuje na ukończonym checkpointcie PZ2.
+        # Sam mismatch historycznego źródła Z2 nie może cofać operatora do PZ1.
+        # Bezpieczeństwo zapewniają niżej dwa warunki:
+        # 1) aktualny, nie-backfillowy kontrakt PZ2 bieżącej iteracji,
+        # 2) nadal używalny preview PZ2.
         try:
             if host.can_restore_step3_substep(3):
                 return True
         except Exception:
             pass
         try:
-            contracts = dict((CAMPAIGN.get_iteration_state() or {}).get("t06_contracts") or {})
-            pz2_contract = dict(contracts.get("pz2_char_boxes") or {})
-            pz2_ready = bool(pz2_contract.get("fulfilled") or CAMPAIGN.is_step3_stage2_done())
+            current_contract_ready = getattr(
+                host,
+                "_campaign_step3_pz2_current_contract_ready",
+                None,
+            )
+            pz2_ready = bool(
+                current_contract_ready()
+                if callable(current_contract_ready)
+                else False
+            )
         except Exception:
             pz2_ready = False
         if not pz2_ready:
@@ -1786,7 +2060,7 @@ def auto_progress_campaign_step3_entry(
         try:
             if hasattr(host.app, "update_status"):
                 host.app.update_status(
-                    "Przygotowuję tablice dla Z3. Po wyodrębnieniu wrócisz do pracy bramki T05 i wybierzesz kolejny krok.",
+                    "Przygotowuję tablice dla Z3. Po wyodrębnieniu automatycznie otworzę PZ2.",
                     "info",
                 )
         except Exception:
@@ -3583,7 +3857,7 @@ def build_step3_pz3_path_selection_view_model(
         cvat_card_selected=(selected_path == "cvat"),
         dataset_badge_text="DATASET",
         dataset_title_text="Dataset znaków",
-        dataset_desc_text="Główna ścieżka PZ3: materiał z PZ2, zakres tablic perfect i utworzenie źródłowego datasetu znaków.",
+        dataset_desc_text="Główna ścieżka: zatwierdzony materiał i utworzenie źródłowego zbioru znaków.",
         cvat_badge_text="OPCJA",
         cvat_title_text="Korekta w CVAT",
         cvat_desc_text="Opcjonalny obieg: wyślij cropy tablic do CVAT, popraw boxy znaków i wczytaj XML z powrotem.",
@@ -3604,8 +3878,12 @@ def build_step3_pz3_status_panel_view_model(
         export_summary,
         dataset_context=dataset_context,
     )
+    # Status PZ3 przed eksportem musi opisywać gotowość materiału z PZ2,
+    # a nie gotowość treningową, która z definicji wymaga już istniejącego
+    # datasetu PZ3. Inaczej lewy panel może poprawnie pokazywać "gotowy",
+    # a Status PZ3 jednocześnie fałszywie żądać powrotu do PZ2.
     try:
-        readiness = dict(host._get_campaign_step3_training_readiness() or {})
+        readiness = dict(host._get_campaign_step3_annotation_readiness() or {})
     except Exception:
         readiness = {}
     run_text, run_tone = _describe_step3_run_for_status(export_summary, host)

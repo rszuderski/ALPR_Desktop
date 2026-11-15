@@ -313,3 +313,40 @@ def test_campaign_preview_reuse_requires_same_iteration_source_and_file(tmp_path
         host._last_campaign_preview_entry_key = flow._campaign_preview_entry_key(xml, images)
         path.write_text("{}", encoding="utf-8")
         assert not flow._can_reuse_campaign_preview(host, flow._campaign_preview_entry_key(xml, images))
+
+
+def test_sync_persist_writes_loaded_run_not_next_selected_run(tmp_path):
+    loaded_path, _ = source(tmp_path / "loaded")
+    selected_path, _ = source(tmp_path / "selected")
+    before_selected = selected_path.read_bytes()
+
+    host = SimpleNamespace(
+        preview_metadata={
+            "plate": {
+                "status": "needs_fix",
+                "gold_state": {"excluded": True},
+            }
+        },
+        _loaded_meta_path=loaded_path,
+        _loaded_meta_mtime=None,
+        _preview_autosave_writer=None,
+        _get_preview_metadata_path=lambda: selected_path,
+        _atomic_write_json=lambda path, payload: Path(path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        ),
+        _log_preview_edit_flow=Mock(),
+    )
+
+    with patch.object(runtime, "mark_preview_metadata_changed"):
+        runtime._persist_preview_metadata(
+            host,
+            success_message=None,
+            refresh_list=False,
+            sync_access=False,
+        )
+
+    persisted = json.loads(loaded_path.read_text(encoding="utf-8"))
+    assert persisted["plate"]["gold_state"]["excluded"] is True
+    assert selected_path.read_bytes() == before_selected
+    assert host._loaded_meta_path == loaded_path

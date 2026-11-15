@@ -80,6 +80,57 @@ class AutoResultListTests(unittest.TestCase):
         owner._populate_preview_list_async.assert_not_called()
         self.assertEqual(owner.rows[0], "--")
 
+    def test_plate_only_final_merge_cannot_restore_old_vehicle_boxes(self):
+        owner = self.owner(False)
+        owner._current_run_vehicle_assist = False
+
+        def merge(tab, _run):
+            old = annotation("outside_scope.jpg", "manual")
+            old.detections.append(SimpleNamespace(label="vehicle"))
+            tab.current_annotations.append(old)
+            return 1
+
+        with patch.object(workflow, "_merge_pre_run_visible_state_after_auto", side_effect=merge), \
+             patch.object(workflow, "CVATExporter") as exporter:
+            workflow._finalize_successful_annotation_run_ui(owner, Path("test-run"))
+        self.assertEqual([d.label for d in owner.current_annotations[-1].detections], ["plate"])
+        self.assertEqual(owner.rows[-1], "M")
+        exporter.return_value.export.assert_called_once()
+        self.assertEqual(exporter.return_value.export.call_args.args[1], Path("test-run/annotations.xml"))
+
+    def test_reentrant_ready_callback_cannot_append_obsolete_rows(self):
+        root = tk.Tk()
+        root.withdraw()
+        owner = self.owner(True)
+        owner.frame = tk.Frame(root)
+        owner.preview_listbox = tk.Listbox(owner.frame)
+        owner._preview_list_populate_token = 0
+        owner._preview_list_populate_after_id = None
+        owner._campaign_deferred_run_restore_in_progress = False
+        owner._cancel_preview_list_population = MethodType(state._cancel_preview_list_population, owner)
+        owner._get_preview_list_entries.side_effect = lambda: list(enumerate(owner.current_annotations))
+        owner._get_preview_display_index.side_effect = lambda index: index
+        owner._preview_list_item_text.side_effect = lambda ann, **kw: ann.filename
+        owner._preview_list_color_plan.return_value = ("auto", "green")
+        owner.current_preview_index = 0
+        owner.current_annotations = [annotation(f"old_{i}.jpg") for i in range(20)]
+
+        def replace():
+            owner.current_annotations = [annotation(f"new_{i}.jpg") for i in range(20)]
+            preview._populate_preview_list_async(owner, batch_size=5, render_current=False)
+
+        try:
+            preview._populate_preview_list_async(owner, batch_size=5, render_current=False, on_ready=replace)
+            deadline = time.monotonic() + 3
+            while owner._preview_list_populate_after_id and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.005)
+            self.assertEqual(owner.preview_listbox.size(), 20)
+            self.assertTrue(all(row.startswith("new_") for row in owner.preview_listbox.get(0, "end")))
+        finally:
+            owner._cancel_preview_list_population()
+            root.destroy()
+
     def test_real_listbox_cancels_old_batches_and_paints_new_statuses(self):
         root = tk.Tk()
         root.withdraw()

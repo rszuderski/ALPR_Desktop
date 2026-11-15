@@ -11,6 +11,7 @@ import importlib
 import importlib.metadata as importlib_metadata
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,17 @@ import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal, Mapping
+
+from .tflite_precision import (
+    analyze_tflite_bytes, analyze_tflite_file, compact_evidence,
+    manifest_precision_issues, report_digest,
+)
+from .int8_calibration import (
+    validate_manifest as validate_calibration_manifest, bind_litert_loader,
+    ApprovedOnnxReader, fingerprint as calibration_fingerprint,
+    validate_embedded_manifest as validate_calibration_evidence,
+)
+from . import exploratory_calibration as exploratory
 
 try:
     from packaging.requirements import Requirement
@@ -40,6 +52,42 @@ MAX_PACKAGE_ENTRIES = 256
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_ALPR_PACKAGE_ENTRIES = 640
 MAX_ALPR_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+
+
+
+def _publish_package_with_destination_acl(source_package: Path, destination: Path) -> None:
+    """Publish a validated package without carrying ACLs from a private temp dir.
+
+    On Windows a file moved with os.replace() from TemporaryDirectory can retain
+    the temporary directory's restrictive DACL. Create a staging file directly
+    in the destination directory so it inherits the destination parent's ACL,
+    then atomically replace the final path.
+    """
+    source_package = Path(source_package)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    staging = destination.parent / (
+        f".{destination.name}.publish-{os.getpid()}-{hashlib.sha256(os.urandom(32)).hexdigest()[:16]}.tmp"
+    )
+    try:
+        with source_package.open("rb") as src, staging.open("xb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            try:
+                os.fsync(dst.fileno())
+            except OSError:
+                pass
+        os.replace(str(staging), str(destination))
+    finally:
+        try:
+            staging.unlink()
+        except FileNotFoundError:
+            pass
+# Android AlprPackageImporter.readRootManifest() rejects a root manifest
+# larger than 2 MiB. Keep the desktop exporter on the same contract so an
+# artifact that passes desktop validation is also importable on Android.
+MAX_ANDROID_ROOT_MANIFEST_BYTES = 2 * 1024 * 1024
 SAFE_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 CALIBRATION_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 ONNX_INT8_CALIBRATION_MAX_IMAGES = 300
@@ -96,6 +144,10 @@ class MobileExportRequest:
     name: str = ""
     version: str = "1"
     metadata: dict = field(default_factory=dict)
+    calibration_manifest: Path | None = None
+    calibration_fingerprint: str = ""
+    calibration_mode: str = "strict"
+    exploratory_confirmation: bool = False  # Legacy caller compatibility; not an export gate.
 
 
 @dataclass(frozen=True)
@@ -124,6 +176,7 @@ class ExportedVariant:
     relative_files: tuple[str, ...]
     input_spec: dict
     output_spec: dict
+    precision_report: dict = field(default_factory=dict)
 
 
 def sha256_file(path: Path) -> str:
@@ -132,6 +185,83 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _precision_report_path(variant_id: str) -> str:
+    return f"precision/{_safe_id(variant_id)}.json"
+
+
+def _precision_report_bytes(report: dict) -> bytes:
+    return json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+
+
+def _require_tflite_precision(report: dict, precision: str, input_spec: dict | None = None) -> None:
+    if not report:
+        raise MobileExportError("Brak analizy precyzji grafu TFLite; wykonanie na telefonie UNVERIFIED.")
+    problems = manifest_precision_issues(report, precision, input_spec)
+    if problems:
+        raise MobileExportError("Kontrola precyzji TFLite: " + "; ".join(problems)
+                                + f"; SHA={report['artifact_sha256']}. "
+                                + "Wykonanie na telefonie pozostaje UNVERIFIED.")
+
+
+def _validate_precision_evidence(archive, evidence: dict, actual: dict) -> None:
+    """Optional v1 extension: verified against bytes, never trusted as a label."""
+    try:
+        if not isinstance(evidence, dict):
+            raise ValueError("graph_precision nie jest obiektem")
+        path = evidence["report_file"]
+        if not isinstance(path, str) or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
+            raise ValueError("nieprawidłowa ścieżka raportu")
+        if archive.getinfo(path).file_size > 32 * 1024 * 1024:
+            raise ValueError("raport precyzji przekracza limit 32 MiB")
+        content = archive.read(path)
+        if hashlib.sha256(content).hexdigest() != evidence["report_sha256"]:
+            raise ValueError("niezgodny SHA raportu")
+        stored = json.loads(content.decode("utf-8"))
+        if not isinstance(stored, dict):
+            raise ValueError("raport nie jest obiektem")
+        if stored.get("analysis_sha256") != report_digest(stored):
+            raise ValueError("niezgodny digest analizy")
+        if actual["classification"] == "UNVERIFIED":
+            raise ValueError("nie można ponownie potwierdzić dowodu grafu")
+        if any(evidence.get(k) != v for k, v in compact_evidence(actual).items()):
+            raise ValueError("deklarowany dowód nie odpowiada grafowi")
+        if stored != actual:
+            raise ValueError("raport nie odpowiada ponownej analizie grafu")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MobileExportError(f"Nieprawidłowy dowód precyzji TFLite: {exc}") from exc
+
+
+def inspect_mobile_precision(path: Path) -> dict:
+    """Read an existing TFLite or single/nested package; no persistent writes."""
+    path = Path(path)
+    before_sha = sha256_file(path)
+    rows: list[dict] = []
+    if path.suffix.lower() == ".tflite":
+        graph = analyze_tflite_file(path)
+        rows.append({"file": path.name, "variant_id": "", "role": "", "model_id": "",
+                     "declared_precision": None, "graph": graph, "metadata_issues": [],
+                     "legacy_without_evidence": True})
+        contract = "NOT_APPLICABLE"
+    else:
+        with zipfile.ZipFile(path) as archive:
+            if archive.getinfo("manifest.json").file_size > 2 * 1024 * 1024:
+                raise MobileExportError("Manifest przekracza limit 2 MiB.")
+            schema = json.loads(archive.read("manifest.json"))["schema"]
+        if schema == MOBILE_MODEL_SCHEMA:
+            validator = MobileModelExporter()
+        elif schema == MOBILE_ALPR_PACKAGE_SCHEMA:
+            validator = MobileAlprPackageExporter()
+        else:
+            raise MobileExportError("Nieobsługiwany schemat paczki.")
+        validator.validate_package(path, precision_reports=rows)
+        contract = "PASS"
+    if before_sha != sha256_file(path):
+        raise MobileExportError("Plik zmienił się podczas inspekcji (SHA-256).")
+    return {"schema": "alpr.mobile_precision_inspection.v1", "path": str(path.resolve()),
+            "file_sha256": before_sha, "contract_validation": contract, "variants": rows,
+            "execution_precision": "UNVERIFIED", "scope": "static_graph_only"}
 
 
 def _module_available(name: str) -> bool:
@@ -459,6 +589,9 @@ def _export_request_payload(request: MobileExportRequest) -> dict[str, Any]:
         "confidence_threshold": float(request.confidence_threshold),
         "iou_threshold": float(request.iou_threshold),
         "calibration_data": calibration_payload,
+        "calibration_manifest": _path_reproducibility_payload(request.calibration_manifest),
+        "calibration_fingerprint": request.calibration_fingerprint,
+        "calibration_mode": request.calibration_mode,
         "calibration_required_for": _request_int8_calibration_targets(request),
     }
 
@@ -531,6 +664,33 @@ def _child_request_reproducibility_payload(request: MobileExportRequest | None) 
     )
 
 
+def _compact_package_model_entry(role: str, item: Mapping[str, Any]) -> dict[str, Any]:
+    # Root alpr.package.v1 entry: deployment contract only.
+    # Full per-model provenance stays in models/<role>/manifest.json and in the
+    # nested child .alprmodel. Duplicating it in the root manifest can make a
+    # valid desktop export impossible to import on Android.
+    payload = dict(item or {})
+    package_file = str(payload.get("package_file") or "").strip()
+    manifest_file = str(payload.get("manifest_file") or "").strip()
+    hashes = dict(payload.get("sha256") or {})
+    return _json_safe_value(
+        {
+            "role": role,
+            "task": str(payload.get("task") or "").strip(),
+            "model_id": str(payload.get("model_id") or "").strip(),
+            "name": str(payload.get("name") or "").strip(),
+            "version": str(payload.get("version") or "").strip(),
+            "schema": str(payload.get("schema") or "").strip(),
+            "package_file": package_file,
+            "manifest_file": manifest_file,
+            "sha256": {
+                package_file: str(hashes.get(package_file) or "").strip(),
+                manifest_file: str(hashes.get(manifest_file) or "").strip(),
+            },
+        }
+    )
+
+
 def _package_model_source_payload(
     *,
     role: str,
@@ -538,40 +698,19 @@ def _package_model_source_payload(
     request: MobileExportRequest | None,
     source_package: Path | None,
 ) -> dict[str, Any]:
+    # Package-level reproducibility references the full child manifest instead
+    # of embedding it again. model_ref keeps the checkpoint/package/runtime
+    # fingerprints needed by mobile reports while the sidecar remains the
+    # authority for complete training provenance.
     model_item = dict(item or {})
     payload: dict[str, Any] = {
         "role": role,
         "source_kind": "fresh_export" if request is not None else "existing_package",
-        "model_id": str(model_item.get("model_id") or getattr(request, "model_id", "") or ""),
-        "name": str(model_item.get("name") or getattr(request, "name", "") or ""),
-        "version": str(model_item.get("version") or getattr(request, "version", "") or ""),
-        "task": str(model_item.get("task") or ""),
-        "package_file": str(model_item.get("package_file") or ""),
-        "manifest_file": str(model_item.get("manifest_file") or ""),
-        "variants": list(model_item.get("variants") or []),
-        "variant_count": int(model_item.get("variant_count") or 0),
-        "labels": {
-            "count": int(model_item.get("label_count") or len(list(model_item.get("labels") or []))),
-            "items": list(model_item.get("labels") or []),
-        },
-        "training": dict(model_item.get("training") or {}),
-        "metrics": dict(model_item.get("metrics") or {}),
-        "source": dict(model_item.get("source") or {}),
-        "model": dict(model_item.get("model") or {}),
+        "model_ref": _package_model_ref_payload(role, model_item),
     }
-    child_repro = model_item.get("export_reproducibility")
-    if isinstance(child_repro, dict) and child_repro:
-        payload["child_export_reproducibility"] = child_repro
-    request_payload = _child_request_reproducibility_payload(request)
-    if request_payload:
-        payload["requested_export"] = request_payload
     package_payload = _path_reproducibility_payload(source_package)
     if package_payload:
         payload["source_package"] = package_payload
-    if role == "vehicle":
-        vehicle_detection = dict(model_item.get("vehicle_detection") or {})
-        if vehicle_detection:
-            payload["vehicle_detection"] = vehicle_detection
     return _json_safe_value(payload)
 
 
@@ -619,7 +758,17 @@ def _alpr_package_reproducibility_payload(
             },
             "ranking_dataset": dict(request.ranking_dataset or {}),
             "calibration_dataset": dict(request.calibration_dataset or {}),
-            "package_metadata": dict(request.metadata or {}),
+            # request.metadata is already stored once in root["metadata"].
+            # Store only a deterministic fingerprint here to avoid duplicating
+            # potentially large research metadata.
+            "package_metadata_sha256": hashlib.sha256(
+                json.dumps(
+                    _json_safe_value(dict(request.metadata or {})),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
             "toolchain": _runtime_toolchain_payload(),
         }
     )
@@ -799,6 +948,33 @@ def _resolve_ncnn_output_spec(
 def _validate_variant_output_contract(runtime: str, output: dict, *, task: str, class_count: int) -> None:
     """Validate the runtime's complete output contract."""
     output_format = output.get("output_format")
+    if output_format == "raw_split_ltrb_scores_v1":
+        # T2-I-10: only the SHA-pinned research MZ-CLEAN split contract.
+        # This is a static-package validation path, NOT conversion/export approval.
+        fixed = {
+            "decoder": "ultralytics_detect_split_ltrb_scores_int8_v1",
+            "output_format": "raw_split_ltrb_scores_v1", "box_format": "ltrb",
+            "tensor_layout": "channels_first", "class_count": 36,
+            "keypoint_count": 0, "keypoint_dimensions": 0,
+            "has_objectness": False, "normalized_coordinates": True,
+            "nms_in_graph": False, "nms_required": False,
+        }
+        if runtime != "tflite" or task != "detect" or class_count != 36:
+            raise MobileExportError("MZ_SPLIT_RUNTIME_ROLE_CLASS_NOT_ALLOWED")
+        for key, required in fixed.items():
+            actual = output.get(key)
+            if type(actual) is not type(required) or actual != required:
+                raise MobileExportError(f"MZ_SPLIT_OUTPUT_CONTRACT_MISMATCH: {key}")
+        if output.get("end2end_output", False) is not False:
+            raise MobileExportError("MZ_SPLIT_END2END_FORBIDDEN")
+        for key in ("confidence_threshold", "iou_threshold"):
+            try:
+                raw_value = output[key]
+                if type(raw_value) not in (float, int) or not (0 <= raw_value <= 1):
+                    raise ValueError(key)
+            except (KeyError, ValueError, TypeError) as exc:
+                raise MobileExportError(f"MZ_SPLIT_INVALID_THRESHOLD: {key}") from exc
+        return
     if output_format not in {"raw_yolo", "end2end_detections"}:
         raise MobileExportError(f"Wariant {runtime}: nieprawidłowy output_format={output_format!r}.")
     end2end = output_format == "end2end_detections"
@@ -893,13 +1069,15 @@ def _resolve_calibration_sources(data_yaml: Path) -> list[Path]:
 
     root = _resolve_calibration_yaml_root(data_yaml, payload)
     result: list[Path] = []
-    for split in ("val", "train", "test"):
+    for split in ("train",):
         for item in _as_path_list(payload.get(split)):
             path = Path(item)
             if not path.is_absolute():
                 path = root / path
             result.append(path.resolve())
-    return result or [data_yaml.parent.resolve()]
+    if not result:
+        raise MobileExportError("Kalibracja wymaga jawnego splitu train; brak fallbacku val/test.")
+    return result
 
 
 def _collect_calibration_images(data_yaml: Path, *, limit: int = ONNX_INT8_CALIBRATION_MAX_IMAGES) -> list[Path]:
@@ -920,7 +1098,7 @@ def _collect_calibration_images(data_yaml: Path, *, limit: int = ONNX_INT8_CALIB
                 except Exception:
                     candidates = []
         elif source.is_dir():
-            candidates = [path for path in source.rglob("*") if path.suffix.lower() in CALIBRATION_IMAGE_SUFFIXES]
+                candidates = sorted(path for path in source.rglob("*") if path.suffix.lower() in CALIBRATION_IMAGE_SUFFIXES)
         for candidate in candidates:
             path = candidate if candidate.is_absolute() else (source.parent / candidate)
             try:
@@ -1236,8 +1414,218 @@ def validate_checkpoint_metadata(checkpoint: Path, metadata: dict | None) -> Non
         raise MobileExportError("Profil kandydata i manifest wskazują różne najlepsze epoki. Odśwież listę modeli.")
 
 
+# Z4_MZ_RAW_INT8_PRECONVERSION_SAFETY_GATE_20261012_V1
+# This is a preconversion safety barrier, NOT a claim that RAW MZ is deployment-ready.
+_MZ_DAY_YOLO26S_KNOWN_MIXED_CHECKPOINT_SHA256 = (
+    "631bb1453554cdb6b15eca724baa392e2acffb350899107f892dc11f937dbbf8"
+)
+
+
+def _mz_raw_int8_export_block_reason(request: MobileExportRequest) -> str:
+    """Block a known mixed MZ-DAY export or an unimplemented exploratory MZ path.
+
+    Structural verification belongs to the resulting TFLite bytes, and a
+    two-output RAW model requires a client decoder not provided by v1.
+    Never silently select FP32 or rerun the known-costly conversion.
+    """
+    try:
+        if _normalize_role(request.role) != "character":
+            return ""
+        if "int8" not in _request_format_quantization_map(request).get("litert", ()):
+            return ""
+    except (MobileExportError, ValueError, TypeError, AttributeError):
+        # Existing preflight independently reports unsupported roles/options.
+        return ""
+
+    known_mixed_model = False
+    try:
+        path = Path(request.checkpoint)
+        if path.is_file():
+            known_mixed_model = (
+                sha256_file(path).lower() == _MZ_DAY_YOLO26S_KNOWN_MIXED_CHECKPOINT_SHA256
+            )
+    except (OSError, ValueError, TypeError):
+        # Existing preflight independently reports the missing/broken checkpoint.
+        pass
+
+    exploratory_mz = str(getattr(request, "calibration_mode", "") or "").strip().lower() == exploratory.MODE
+    if not known_mixed_model and not exploratory_mz:
+        return ""
+    source = "znany checkpoint MZ-DAY (MIXED)" if known_mixed_model else "badawczy tor MZ INT8"
+    return (
+        "MZ_RAW_INT8_CONTRACT_NOT_READY: " + source + ". "
+        "Standardowa konwersja nie ma potwierdzonego pelnego grafu signed INT8; "
+        "odzyskany RAW z 2 wyjsciami wymaga jeszcze pelnej walidacji grafu "
+        "i osobnego dekodera Android. "
+        "Wstrzymano eksport przed konwersja, bez cichego fallbacku FP32. "
+        "Badania: EXPLORATORY_ONLY, FINAL_TEST_NOT_VERIFIED."
+    )
+
+
+def _validate_mz_split_research_archive(archive, manifest: dict) -> None:
+    """Verify embedded TRAIN evidence refs; NEVER infer actual calibration usage."""
+    research = manifest["research_mz_int8"]
+    if manifest.get("calibration_evidence") is not None:
+        raise MobileExportError("MZ_SPLIT_REUSE_CANNOT_ASSERT_CALIBRATION_LOADER_USAGE")
+    required = {
+        "staged_contract": ("research/staged_contract.json", "610775c88d60e0c6798f49b9575ce75e320b02f48a2e34b8e2d23af5003cef56"),
+        "clean_evidence": ("research/clean_evidence.json", "bdf93990c1f971f571b281b73c02882ebf84adf680050ec31278ef66130678c3"),
+        "train_parity": ("research/train_parity.json", "f2f1b89ec18fd9d71c40c1dbd280bfcef9ea32f3c78d7faa4be9ba8d53976b45"),
+    }
+    refs = research.get("evidence")
+    if not isinstance(refs, dict) or set(refs) != set(required) | {"train_calibration"}:
+        raise MobileExportError("MZ_SPLIT_RESEARCH_EVIDENCE_SET_MISMATCH")
+    for key, (path, digest) in required.items():
+        if refs.get(key) != {"file": path, "sha256": digest}:
+            raise MobileExportError(f"MZ_SPLIT_EVIDENCE_REFERENCE_MISMATCH: {key}")
+        try:
+            blob = archive.read(path)
+        except KeyError as exc:
+            raise MobileExportError(f"MZ_SPLIT_RESEARCH_EVIDENCE_MISSING: {key}") from exc
+        if hashlib.sha256(blob).hexdigest() != digest:
+            raise MobileExportError(f"MZ_SPLIT_RESEARCH_EVIDENCE_SHA_MISMATCH: {key}")
+    calibration = refs["train_calibration"]
+    if (not isinstance(calibration, dict) or calibration.get("file") != "research/calibration_manifest.json"
+            or not re.fullmatch(r"[a-f0-9]{64}", str(calibration.get("sha256") or ""))
+            or not re.fullmatch(r"[a-f0-9]{64}", str(calibration.get("input_fingerprint") or ""))):
+        raise MobileExportError("MZ_SPLIT_CALIBRATION_REFERENCE_INVALID")
+    try:
+        data = archive.read(calibration["file"])
+    except KeyError as exc:
+        raise MobileExportError("MZ_SPLIT_CALIBRATION_MISSING") from exc
+    if hashlib.sha256(data).hexdigest() != calibration["sha256"]:
+        raise MobileExportError("MZ_SPLIT_CALIBRATION_SHA_MISMATCH")
+    try:
+        cal = json.loads(data)
+        exploratory.validate_embedded_manifest(cal, role="character")
+        if (cal["input_fingerprint"] != calibration["input_fingerprint"]
+                or cal["checkpoint"]["sha256"] != manifest["source"]["checkpoint_sha256"]
+                or cal["config"]["confidence_threshold"] != manifest["output"]["confidence_threshold"]
+                or cal["config"]["iou_threshold"] != manifest["output"]["iou_threshold"]
+                or cal["preprocessing"]["width"] != 320 or cal["preprocessing"]["height"] != 320):
+            raise MobileExportError("MZ_SPLIT_CALIBRATION_METADATA_MISMATCH")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise MobileExportError(f"MZ_SPLIT_CALIBRATION_PAYLOAD_INVALID: {exc}") from exc
+
+
 class MobileModelExporter:
     """Export trained YOLO weights into the Android ALPR model-package contract."""
+
+    def inspect_existing_mz_raw_int8_research(
+        self, *, model: Path, evidence: Path, train_parity: Path, checkpoint: Path
+    ) -> dict:
+        """Audit the preconverted MZ-DAY artifact without packing or exporting it.
+
+        Does not bypass MZ_RAW_INT8_CONTRACT_NOT_READY, modify the GUI, call
+        Ultralytics or certify any Android/final_test result. Returns only
+        a provisional machine-readable research contract for later engineering.
+        """
+        from .mz_raw_int8_reuse import inspect_mz_day_research_candidate
+        return inspect_mz_day_research_candidate(
+            model=model, evidence=evidence, train_parity=train_parity,
+            checkpoint=checkpoint,
+        )
+
+    def assess_existing_mz_day_int8_packaging(
+        self,
+        *,
+        repo_root: Path,
+        calibration_manifest: Path | None = None,
+        verify_checkpoint_labels: bool = False,
+    ) -> dict:
+        """Read-only MZ CLEAN packaging readiness. Does NOT authorize .alprmodel.
+
+        The ordinary MZ_RAW_INT8_CONTRACT_NOT_READY block remains active;
+        static signed-INT8 evidence alone does not prove Android import or F4.
+        """
+        from .mz_raw_int8_package_readiness import assess_research_mz_int8
+        return assess_research_mz_int8(
+            repo_root,
+            calibration_manifest=calibration_manifest,
+            verify_checkpoint_labels=verify_checkpoint_labels,
+        )
+
+    def _calibration_for_request(self, request: MobileExportRequest) -> dict:
+        if request.calibration_mode == "strict":
+            return self._approved_calibration(request)
+        if request.calibration_mode != exploratory.MODE:
+            raise MobileExportError("BLOCKED: wybierz jawnie tryb kalibracji.")
+        try:
+            if set(request.formats) != {"litert"}:
+                raise ValueError("Tryb badawczy wymaga formatu LiteRT CPU.")
+            payload = exploratory.validate_manifest(request.calibration_manifest, role=request.role,
+                checkpoint=request.checkpoint, image_size=request.image_size,
+                confidence_threshold=request.confidence_threshold, iou_threshold=request.iou_threshold)
+            if request.calibration_fingerprint and request.calibration_fingerprint != payload["input_fingerprint"]:
+                raise ValueError("Zmieniono fingerprint kalibracji badawczej.")
+            return payload
+        except Exception as exc:
+            raise MobileExportError(f"BLOCKED: kontrola kalibracji badawczej: {exc}") from exc
+
+    @staticmethod
+    def _precision_diagnostics_root():
+        return Path(__file__).resolve().parents[2] / "output" / "mobile_export_diagnostics"
+
+    @staticmethod
+    def _exploratory_signed_output(export_result, *, request=None):
+        """Select a sibling from the SAME supported conversion, then prove its graph.
+
+        Ultralytics 8.4.19 returns the float-I/O artifact. onnx2tf also generates
+        signed-I/O output. Its filename is a locator, never precision evidence.
+        """
+        returned = Path(str(export_result))
+        if not returned.name.endswith("_int8.tflite"):
+            raise MobileExportError("FULL_INT8_OUTPUT_NOT_VERIFIED: nieznany wynik konwertera; brak fallbacku.")
+        full = returned.with_name(returned.name[:-len("_int8.tflite")] + "_full_integer_quant.tflite")
+        if not full.is_file():
+            raise MobileExportError("FULL_INT8_OUTPUT_NOT_AVAILABLE: konwerter nie utworzył signed INT8; DIAGNOSTICS_WRITE_FAILED: brak pliku do zachowania.")
+        report = analyze_tflite_file(full)
+        io = [tensor for graph in report.get("subgraphs", []) for key in ("inputs", "outputs") for tensor in graph[key]]
+        if report["classification"] != "INT8" or not io or any(t["dtype"] != "INT8" for t in io):
+            # F4_RESEARCH_INT8_RECOVERY_GUI_HOOK_V1
+            # Strict export policy and the original diagnostics remain unchanged.
+            # Only the explicit exploratory single-class plate workflow may try this.
+            recovery_failure = ""
+            if (report["classification"] == "MIXED" and request is not None
+                    and request.calibration_mode == exploratory.MODE and request.role == "plate"):
+                try:
+                    from .research_int8_recovery import recover_research_int8
+                    fixed = recover_research_int8(
+                        full, report=report,
+                        diagnostics_root=MobileModelExporter._precision_diagnostics_root(),
+                    )
+                except Exception as exc:
+                    recovery_failure = f" RESEARCH_INT8_RECOVERY_FAILED={type(exc).__name__}: {exc}"
+                    logging.warning("Badawcza korekta TopK/Concat INT8 odrzucona: %s", recovery_failure)
+                else:
+                    logging.info("Badawcza korekta TopK/Concat INT8 przeszla statyczny i CPU parity gate: %s", fixed)
+                    return fixed
+            reason = f"FULL_INT8_OUTPUT_NOT_PROVEN: graf={report['classification']}; wymagane signed INT8 I/O."
+
+            if recovery_failure:
+                reason += recovery_failure[:600]
+            try:
+                from .rejected_precision import write_rejected_precision
+                diagnostic = write_rejected_precision(full, report,
+                    root=MobileModelExporter._precision_diagnostics_root(), request=request)
+            except Exception as exc:
+                raise MobileExportError(reason + f" DIAGNOSTICS_WRITE_FAILED: {type(exc).__name__}; "
+                    "nie potwierdzono zachowania raportu i modelu.") from exc
+            raise MobileExportError(reason + f" Diagnostyka: {diagnostic}")
+        return full
+
+    @staticmethod
+    def _approved_calibration(request: MobileExportRequest) -> dict:
+        if request.calibration_manifest is None:
+            raise MobileExportError("BLOCKED: INT8 wymaga zatwierdzonego manifestu kalibracji z Z4 i inwentarzy EVAL396/final_test; samo data.yaml nie wystarcza.")
+        try:
+            payload = validate_calibration_manifest(request.calibration_manifest, role=request.role,
+                                                    checkpoint=request.checkpoint, image_size=request.image_size)
+            if request.calibration_fingerprint and payload["input_fingerprint"] != request.calibration_fingerprint:
+                raise ValueError("Manifest kalibracji zmienił się w trakcie eksportu.")
+            return payload
+        except Exception as exc:
+            raise MobileExportError(f"BLOCKED: kontrola kalibracji INT8: {exc}") from exc
 
     def preflight(self, request: MobileExportRequest) -> list[str]:
         problems: list[str] = []
@@ -1264,6 +1652,10 @@ class MobileModelExporter:
             _normalize_role(request.role)
         except Exception as exc:
             problems.append(str(exc))
+
+        mz_raw_guard = _mz_raw_int8_export_block_reason(request)
+        if mz_raw_guard:
+            problems.append(mz_raw_guard)
 
         formats = _normalized_export_formats(request.formats)
         if not formats:
@@ -1326,10 +1718,11 @@ class MobileModelExporter:
             onnx_int8_problem = check_mobile_onnx_int8_runtime()
             if onnx_int8_problem:
                 problems.append(onnx_int8_problem)
-        if calibration_targets and request.calibration_data is None:
-            target_labels = {"litert:int8": "LiteRT/TFLite INT8", "onnx:int8": "ONNX INT8"}
-            labels = ", ".join(target_labels.get(target, target) for target in calibration_targets)
-            problems.append(f"{labels} wymaga datasetu kalibracyjnego data.yaml.")
+        if calibration_targets:
+            try:
+                self._calibration_for_request(request)
+            except MobileExportError as exc:
+                problems.append(str(exc))
 
         unique: list[str] = []
         seen: set[str] = set()
@@ -1350,6 +1743,9 @@ class MobileModelExporter:
         problems = self.preflight(request)
         if problems:
             raise MobileExportError("Preflight eksportu mobilnego nie przeszedł:\n" + "\n".join(f"- {item}" for item in problems))
+        if _request_int8_calibration_targets(request):
+            approved = self._calibration_for_request(request)
+            request = replace(request, calibration_fingerprint=approved["input_fingerprint"])
 
         checkpoint = Path(request.checkpoint).resolve()
         destination = Path(request.destination).resolve()
@@ -1415,13 +1811,22 @@ class MobileModelExporter:
                     progress=variant_progress,
                 )
                 variants.append(variant)
+                if variant.runtime == "tflite":
+                    _require_tflite_precision(variant.precision_report, variant.precision, variant.input_spec)
+                    evidence_path = package_root / _precision_report_path(variant.id)
+                    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                    evidence_path.write_bytes(_precision_report_bytes(variant.precision_report))
 
             if not variants:
                 raise MobileExportError("Eksport nie utworzył żadnego wariantu modelu.")
 
             notify(76.0, "Buduję manifest i liczę sumy SHA-256.")
+            from ..training.source_inventory import inventory_for_export, strip_embedded_inventory, write_inventory
+
+            inventory = inventory_for_export(request.metadata, role=role)
+            manifest_request = replace(request, metadata=strip_embedded_inventory(request.metadata))
             manifest = self._build_manifest(
-                request=request,
+                request=manifest_request,
                 model_id=model_id,
                 role=role,
                 task=task,
@@ -1432,6 +1837,27 @@ class MobileModelExporter:
                 checkpoint=checkpoint,
                 model_info=model_info,
             )
+            manifest["training_source_inventory"] = write_inventory(package_root, inventory)
+            if _request_int8_calibration_targets(request):
+                calibration = self._calibration_for_request(request)
+                data = json.dumps(calibration, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+                (package_root / "calibration_manifest.json").write_bytes(data)
+                manifest["calibration_evidence"] = {
+                    "file": "calibration_manifest.json", "sha256": hashlib.sha256(data).hexdigest(),
+                    "input_fingerprint": calibration["input_fingerprint"], "split": "train",
+                    "sample_count": calibration["counts"]["selected"],
+                }
+                if request.calibration_mode == exploratory.MODE:
+                    manifest["calibration_evidence"].update(mode=exploratory.MODE, status="EXPLORATORY_ONLY")
+                    manifest["research_calibration"] = {
+                        "status": "EXPLORATORY_ONLY", "final_test_status": "NOT_VERIFIED",
+                        "execution_precision": "UNVERIFIED", "limitations": calibration["limitations"],
+                    }
+                    usage = json.dumps(exploratory.usage_evidence(calibration), ensure_ascii=False,
+                                       sort_keys=True, indent=2).encode("utf-8")
+                    (package_root / "calibration_usage.json").write_bytes(usage)
+                    manifest["calibration_evidence"]["usage"] = {
+                        "file": "calibration_usage.json", "sha256": hashlib.sha256(usage).hexdigest()}
             self._validate_manifest_basic(manifest)
             manifest_path = package_root / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1440,9 +1866,9 @@ class MobileModelExporter:
             temp_package = temp_root / destination.name
             self._write_zip(package_root, temp_package)
             notify(94.0, "Sprawdzam paczkę po ponownym otwarciu ZIP.")
-            self.validate_package(temp_package)
+            self.validate_package(temp_package, require_precision=True)
 
-            os.replace(str(temp_package), str(destination))
+            _publish_package_with_destination_acl(temp_package, destination)
             notify(100.0, f"Model mobilny gotowy: {destination.name}")
             return destination
 
@@ -1480,6 +1906,7 @@ class MobileModelExporter:
                 output_spec=output_spec,
             )
         if variant.runtime == "tflite":
+            precision_report = analyze_tflite_file(variant.files[0])
             input_spec, output_spec = self._inspect_tflite_variant(
                 variant.files[0],
                 task=task,
@@ -1499,10 +1926,12 @@ class MobileModelExporter:
                 relative_files=variant.relative_files,
                 input_spec=input_spec,
                 output_spec=output_spec,
+                precision_report=precision_report,
             )
         return variant
 
-    def validate_package(self, package_path: Path) -> None:
+    def validate_package(self, package_path: Path, *, precision_reports: list[dict] | None = None,
+                         require_precision: bool = False) -> None:
         package = Path(package_path)
         if not package.exists() or not package.is_file():
             raise MobileExportError(f"Brak pakietu: {package}")
@@ -1529,6 +1958,58 @@ class MobileModelExporter:
 
             manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
             self._validate_manifest_basic(manifest)
+            from ..training.source_inventory import validate_archive_inventory
+
+            try:
+                validate_archive_inventory(archive, manifest)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise MobileExportError(f"Nieprawidłowe inventory SHA źródeł: {exc}") from exc
+            # A reused research MZ did NOT rerun the calibration loader.
+            # Validate SHA-bound research sources without fabricating a
+            # CONSUMED_BY_VERIFIED_LOADER calibration_usage artifact.
+            if any(isinstance(variant, dict) and
+                   (variant.get("output") or manifest.get("output") or {}).get("output_format")
+                   == "raw_split_ltrb_scores_v1" for variant in manifest.get("variants", [])):
+                _validate_mz_split_research_archive(archive, manifest)
+            evidence = manifest.get("calibration_evidence")
+            if evidence is not None:
+                try:
+                    if evidence.get("file") != "calibration_manifest.json":
+                        raise ValueError("Nieprawidłowa ścieżka dowodu kalibracji.")
+                    data = archive.read(evidence["file"])
+                    calibration = json.loads(data)
+                    research = evidence.get("mode") == exploratory.MODE
+                    if research:
+                        exploratory.validate_embedded_manifest(calibration, role=manifest.get("role"))
+                        expected = {"status": "EXPLORATORY_ONLY", "final_test_status": "NOT_VERIFIED",
+                                    "execution_precision": "UNVERIFIED", "limitations": calibration["limitations"]}
+                        if manifest.get("research_calibration") != expected or evidence.get("status") != "EXPLORATORY_ONLY":
+                            raise ValueError("Brak ograniczeń badawczych paczki.")
+                        usage_ref = evidence["usage"]
+                        if usage_ref["file"] != "calibration_usage.json":
+                            raise ValueError("Nieprawidłowy dowód zużycia próbek.")
+                        usage = archive.read(usage_ref["file"])
+                        if (hashlib.sha256(usage).hexdigest() != usage_ref["sha256"]
+                                or json.loads(usage) != exploratory.usage_evidence(calibration)):
+                            raise ValueError("Niezgodne SHA faktycznie użytych danych.")
+                    else:
+                        validate_calibration_evidence(calibration, role=manifest.get("role"))
+                    if (hashlib.sha256(data).hexdigest() != evidence["sha256"]
+                            or calibration.get("schema") not in (exploratory.SUPPORTED_SCHEMAS if research else {"alpr.int8_calibration.v1"})
+                            or calibration.get("status") != ("EXPLORATORY_ONLY" if research else "READY")
+                            or calibration.get("split") != "train"
+                            or calibration.get("role") != manifest.get("role")
+                            or evidence.get("split") != "train"
+                            or evidence.get("sample_count") != len(calibration["samples"])
+                            or calibration["checkpoint"]["sha256"] != manifest.get("source", {}).get("checkpoint_sha256")
+                            or calibration["preprocessing"]["width"] != manifest["input"]["width"]
+                            or calibration["preprocessing"]["height"] != manifest["input"]["height"]
+                            or evidence.get("input_fingerprint") != calibration.get("input_fingerprint")
+                            or calibration["input_fingerprint"] != calibration_fingerprint(
+                                {k: v for k, v in calibration.items() if k != "input_fingerprint"})):
+                        raise ValueError("Niezgodne SHA lub kontrakt kalibracji.")
+                except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                    raise MobileExportError(f"Nieprawidłowy dowód kalibracji: {exc}") from exc
             name_set = set(names)
             for variant in manifest.get("variants", []):
                 files = list(variant.get("files") or ([variant.get("file")] if variant.get("file") else []))
@@ -1555,6 +2036,26 @@ class MobileModelExporter:
                     raise MobileExportError("Wariant ONNX musi wskazywać plik .onnx.")
                 if runtime == "ncnn" and not (has_param and has_bin):
                     raise MobileExportError("Wariant NCNN wymaga plików .param i .bin.")
+                if runtime == "tflite":
+                    primary_file = str(files[0]).replace("\\", "/")
+                    actual_report = analyze_tflite_bytes(archive.read(primary_file))
+                    metadata_issues = manifest_precision_issues(actual_report, variant.get("precision", ""),
+                                                                variant.get("input", manifest.get("input")))
+                    evidence = variant.get("graph_precision")
+                    if evidence is not None:
+                        _validate_precision_evidence(archive, evidence, actual_report)
+                    row = {"role": manifest["role"], "model_id": manifest["model_id"],
+                           "variant_id": variant["id"], "file": primary_file,
+                           "declared_precision": variant.get("precision"), "graph": actual_report,
+                           "metadata_issues": metadata_issues, "legacy_without_evidence": evidence is None}
+                    if precision_reports is not None:
+                        precision_reports.append(row)
+                    if require_precision or evidence is not None:
+                        _require_tflite_precision(actual_report, variant.get("precision", ""),
+                                                 variant.get("input", manifest.get("input")))
+                    elif metadata_issues:
+                        logging.getLogger(__name__).warning("Precyzja starszej paczki %s/%s: %s; wykonanie UNVERIFIED",
+                                                            package.name, variant.get("id"), "; ".join(metadata_issues))
 
     def _load_yolo_model(self, checkpoint: Path):
         runtime_problem = check_mobile_yolo_export_runtime()
@@ -1724,6 +2225,8 @@ class MobileModelExporter:
         end2end_output: bool = False,
         progress: Callable[[float, str], None] | None = None,
     ) -> ExportedVariant:
+        if precision == "int8":
+            self._calibration_for_request(request)
         def notify(value: float, message: str) -> None:
             if progress is not None:
                 try:
@@ -1810,10 +2313,16 @@ class MobileModelExporter:
         notify(0.94, "Ustalam kontrakt RAW YOLO dla NCNN." if runtime == "ncnn"
                else "Sprawdzam wejście i wyjście wyeksportowanego modelu.")
         variant = self.inspect_variant(variant, role=request.role)
+        if runtime == "tflite":
+            _require_tflite_precision(variant.precision_report, precision, variant.input_spec)
         notify(1.0, f"Wariant {runtime.upper()} {precision.upper()} gotowy.")
         return variant
 
     def _run_ultralytics_export(self, model, *, runtime: str, precision: str, request: MobileExportRequest):
+        if runtime == "tflite" and precision == "int8":
+            mz_raw_guard = _mz_raw_int8_export_block_reason(request)
+            if mz_raw_guard:
+                raise MobileExportError(mz_raw_guard)
         imgsz = _ultralytics_imgsz(request.image_size)
         common = {
             "imgsz": imgsz,
@@ -1831,14 +2340,16 @@ class MobileModelExporter:
             if runtime == "tflite":
                 args = dict(common)
                 if precision == "int8":
-                    calibration_data = str(Path(request.calibration_data).resolve()) if request.calibration_data else ""
-                    if not calibration_data:
-                        raise MobileExportError("Eksport INT8 wymaga datasetu kalibracyjnego data.yaml.")
-                    args.update({"data": calibration_data, "fraction": 1.0})
-                    try:
-                        return model.export(format="tflite", int8=True, **args)
-                    except TypeError:
-                        return model.export(format="tflite", quantize=8, **args)
+                    calibration = self._calibration_for_request(request)
+                    # Non-empty data prevents Ultralytics default dataset downloads;
+                    # the instance loader consumes only verified manifest samples.
+                    args.update({"data": str(Path(request.calibration_manifest).resolve()),
+                                 "fraction": 1.0, "split": "train"})
+                    with bind_litert_loader(model, calibration):
+                        result = model.export(format="tflite", int8=True, **args)
+                    if request.calibration_mode == exploratory.MODE:
+                        return self._exploratory_signed_output(result, request=request)
+                    return result
                 return model.export(format="tflite", **args)
         raise MobileExportError(f"Nieobsługiwany runtime eksportu: {runtime}")
 
@@ -1857,17 +2368,9 @@ class MobileModelExporter:
                 except Exception:
                     pass
 
-        if request.calibration_data is None:
-            raise MobileExportError("Eksport ONNX INT8 wymaga datasetu kalibracyjnego data.yaml.")
-        data_yaml = Path(request.calibration_data).resolve()
-        if not data_yaml.exists() or not data_yaml.is_file():
-            raise MobileExportError(f"Dataset kalibracyjny ONNX INT8 nie istnieje: {data_yaml}")
-
-        notify(0.05, "Czytam data.yaml i wybieram obrazy kalibracyjne ONNX INT8.")
-        images = _collect_calibration_images(data_yaml)
-        if not images:
-            raise MobileExportError(f"Dataset kalibracyjny ONNX INT8 nie zawiera obrazów: {data_yaml}")
-        notify(0.18, f"Kalibracja ONNX INT8 użyje {len(images)} obrazów.")
+        notify(0.05, "Weryfikuję SHA i niezależność manifestu kalibracji ONNX INT8.")
+        calibration = self._calibration_for_request(request)
+        notify(0.18, f"Kalibracja ONNX INT8 użyje {len(calibration['samples'])} zatwierdzonych obrazów train.")
 
         try:
             import onnx  # type: ignore
@@ -1876,7 +2379,9 @@ class MobileModelExporter:
             raise MobileExportError(f"Brak bibliotek do kwantyzacji ONNX INT8: {exc}") from exc
 
         input_name, image_size = _onnx_input_name_and_size(onnx_path, request.image_size)
-        reader = _OnnxImageCalibrationReader(input_name=input_name, image_paths=images, image_size=image_size)
+        if image_size != _normalize_image_size(request.image_size):
+            raise MobileExportError("Wejście ONNX różni się od zatwierdzonego imgsz kalibracji.")
+        reader = ApprovedOnnxReader(calibration, input_name)
         notify(0.28, f"Przygotowałem wejście kalibracji: {input_name}, rozmiar {image_size[0]}x{image_size[1]}.")
 
         excluded_nodes: list[str] = []
@@ -1908,6 +2413,7 @@ class MobileModelExporter:
                 per_channel=False,
                 nodes_to_exclude=excluded_nodes or None,
             )
+            reader.assert_complete()
             notify(0.92, "Kwantyzacja ONNX INT8 zakończona, sprawdzam plik wynikowy.")
         except Exception as exc:
             raise MobileExportError(f"Nie udało się wykonać kwantyzacji ONNX INT8: {exc}") from exc
@@ -1941,18 +2447,18 @@ class MobileModelExporter:
                     files.extend(candidate.rglob("*.bin"))
 
         if runtime == "tflite":
-            filtered = []
-            for file_path in files:
-                lower = file_path.name.lower()
-                is_int8 = any(token in lower for token in ("int8", "integer", "quant"))
-                if precision == "int8" and is_int8:
-                    filtered.append(file_path)
-                elif precision == "fp32" and not is_int8:
-                    filtered.append(file_path)
-            files = filtered or files
-            if not files:
-                raise MobileExportError("Eksport LiteRT/TFLite nie zwrócił pliku .tflite.")
-            return (sorted(files, key=lambda item: len(str(item)))[0],)
+            matching, diagnostics = [], []
+            for file_path in sorted(set(files), key=lambda p: str(p).lower()):
+                if file_path.suffix.lower() != ".tflite":
+                    continue
+                report = analyze_tflite_file(file_path)
+                diagnostics.append(f"{file_path.name}: {report['classification']} SHA={report['artifact_sha256']}")
+                if not manifest_precision_issues(report, precision):
+                    matching.append(file_path)
+            if not matching:
+                raise MobileExportError("Brak TFLite z potwierdzoną precyzją grafu " + precision.upper()
+                                        + ". " + "; ".join(diagnostics))
+            return (matching[0],)
 
         if runtime == "onnx":
             files = [item for item in files if item.suffix.lower() == ".onnx"]
@@ -2107,6 +2613,13 @@ class MobileModelExporter:
                 "precision": variant.precision,
                 "sha256": sha_map,
             }
+            if variant.runtime == "tflite" and variant.precision_report:
+                _require_tflite_precision(variant.precision_report, variant.precision, variant.input_spec)
+                if variant.precision_report["artifact_sha256"] != sha_map[variant.relative_files[0]]:
+                    raise MobileExportError("TFLite zmienił się po analizie grafu (SHA-256).")
+                item["graph_precision"] = dict(compact_evidence(variant.precision_report),
+                                               report_file=_precision_report_path(variant.id),
+                                               report_sha256=hashlib.sha256(_precision_report_bytes(variant.precision_report)).hexdigest())
             if len(variant.relative_files) == 1:
                 item["file"] = variant.relative_files[0]
             else:
@@ -2214,6 +2727,39 @@ class MobileModelExporter:
         variants = list(manifest.get("variants") or [])
         if not variants:
             raise MobileExportError("Manifest nie zawiera wariantów.")
+        if any(isinstance(item, dict) and (
+            (item.get("output") or output).get("output_format") == "raw_split_ltrb_scores_v1"
+        ) for item in variants):
+            # Legacy single-output formats are unaffected. Research split is
+            # bound to ONE known immutable TFLite and exact ordered labels.
+            research = manifest.get("research_mz_int8") or {}
+            expected_labels = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            expected_sha = "a2f715399bdcb574da899e202388b5324d66f574b8519626cb611bf0e263e792"
+            source_sha = "631bb1453554cdb6b15eca724baa392e2acffb350899107f892dc11f937dbbf8"
+            path = "variants/tflite_int8/model.tflite"
+            profile = manifest.get("input") or {}
+            selected = variants[0]
+            if (role != "character" or task != "detect" or len(variants) != 1
+                    or labels != expected_labels or selected.get("runtime") != "tflite"
+                    or selected.get("precision") != "int8"
+                    or selected.get("file") != path or selected.get("files") is not None
+                    or selected.get("sha256") != {path: expected_sha}
+                    or selected.get("input") is not None or selected.get("output") is not None
+                    or (manifest.get("source") or {}).get("checkpoint_sha256") != source_sha
+                    or [profile.get(key) for key in ("width", "height", "channels", "layout", "color", "data_type")]
+                       != [320, 320, 3, "NHWC", "RGB", "INT8"]
+                    or (profile.get("quantization") or {}).get("zero_point") != -128
+                    or abs(float((profile.get("quantization") or {}).get("scale", 0)) - 0.003921568859368563) > 1e-8
+                    or not isinstance(research, dict)
+                    or research.get("schema") != "alpr.mz_clean_int8_research_package.v1"
+                    or research.get("status") != "EXPLORATORY_ONLY"
+                    or research.get("android_import_approved") is not False
+                    or research.get("production_deployment_approved") is not False
+                    or research.get("final_test") != "NOT_VERIFIED"
+                    or research.get("calibration_usage") != "NOT_ATTESTED_DURING_REUSE"):
+                raise MobileExportError("MZ_SPLIT_RESEARCH_PACKAGE_PINNED_CONTRACT_MISMATCH")
+            if (manifest.get("output") or {}).get("output_format") != "raw_split_ltrb_scores_v1":
+                raise MobileExportError("MZ_SPLIT_ROOT_OUTPUT_REQUIRED")
         for variant in variants:
             runtime = str(variant.get("runtime") or "").strip().lower()
             precision = str(variant.get("precision") or "").strip().lower()
@@ -2536,20 +3082,29 @@ class MobileAlprPackageExporter:
                 character_item=character_item,
             )
             self._validate_manifest_basic(manifest)
+            manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
+            manifest_bytes = manifest_text.encode("utf-8")
+            if len(manifest_bytes) > MAX_ANDROID_ROOT_MANIFEST_BYTES:
+                raise MobileExportError(
+                    "Manifest główny pakietu ALPR przekracza limit importera Androida "
+                    f"2 MiB: {len(manifest_bytes)} B > {MAX_ANDROID_ROOT_MANIFEST_BYTES} B. "
+                    "Pełna proweniencja modeli musi pozostać w manifestach potomnych."
+                )
             manifest_path = package_root / "manifest.json"
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            manifest_path.write_bytes(manifest_bytes)
 
             notify(76.0, f"Pakuje kompletny zestaw ALPR {package_label}.")
             temp_package = temp_root / destination.name
             self._write_zip(package_root, temp_package)
             notify(90.0, "Sprawdzam kompletny pakiet po ponownym otwarciu.")
-            self.validate_package(temp_package)
+            self.validate_package(temp_package, require_precision=True)
 
-            os.replace(str(temp_package), str(destination))
+            _publish_package_with_destination_acl(temp_package, destination)
             notify(100.0, f"Kompletny pakiet ALPR gotowy: {destination.name}")
             return destination
 
-    def validate_package(self, package_path: Path) -> None:
+    def validate_package(self, package_path: Path, *, precision_reports: list[dict] | None = None,
+                         require_precision: bool = False) -> None:
         package = Path(package_path)
         if not package.exists() or not package.is_file():
             raise MobileExportError(f"Brak pakietu ALPR: {package}")
@@ -2598,16 +3153,80 @@ class MobileAlprPackageExporter:
 
             with tempfile.TemporaryDirectory(prefix="alpr_nested_validate_") as temp_name:
                 temp_root = Path(temp_name)
+
                 for role in roles_to_validate:
                     item = dict(models.get(role) or {})
-                    package_file = str(item.get("package_file") or "").replace("\\", "/")
-                    nested_path = temp_root / f"{role}.alprmodel"
-                    nested_path.write_bytes(archive.read(package_file))
-                    self.single_model_exporter.validate_package(nested_path)
-                    nested_manifest = self._read_single_manifest(nested_path)
-                    if _normalize_role(str(nested_manifest.get("role") or "")) != role:
-                        raise MobileExportError(f"Zagniezdzony pakiet {role} ma niewlasciwa role.")
 
+                    package_file = str(
+                        item.get("package_file") or ""
+                    ).replace("\\", "/")
+
+                    manifest_file = str(
+                        item.get("manifest_file") or ""
+                    ).replace("\\", "/")
+
+                    nested_path = temp_root / f"{role}.alprmodel"
+
+                    nested_path.write_bytes(
+                        archive.read(package_file)
+                    )
+
+                    # Najpierw pełna walidacja samego pakietu dziecka.
+                    self.single_model_exporter.validate_package(
+                        nested_path, precision_reports=precision_reports, require_precision=require_precision
+                    )
+
+                    nested_manifest = self._read_single_manifest(
+                        nested_path
+                    )
+
+                    # Kompletny pakiet przechowuje również kopię
+                    # manifestu dziecka jako osobny plik.
+                    sidecar_manifest = json.loads(
+                        archive.read(manifest_file).decode("utf-8")
+                    )
+
+                    actual_role = _normalize_role(
+                        str(nested_manifest.get("role") or "")
+                    )
+
+                    if actual_role != role:
+                        raise MobileExportError(
+                            f"Zagniezdzony pakiet {role} ma niewlasciwa role."
+                        )
+
+                    # Metadane modelu w głównym manifeście muszą
+                    # odpowiadać faktycznie zagnieżdżonemu modelowi.
+                    for field in (
+                        "model_id",
+                        "role",
+                        "task",
+                        "schema",
+                    ):
+                        outer_value = str(
+                            item.get(field) or ""
+                        )
+
+                        nested_value = str(
+                            nested_manifest.get(field) or ""
+                        )
+
+                        if outer_value != nested_value:
+                            raise MobileExportError(
+                                f"Model {role} ma niespojny {field} "
+                                f"miedzy manifestem pakietu "
+                                f"i zagniezdzonym modelem."
+                            )
+
+                    # models/<role>/manifest.json nie może być
+                    # inną wersją manifestu niż ta znajdująca się
+                    # wewnątrz models/<role>/model.alprmodel.
+                    if sidecar_manifest != nested_manifest:
+                        raise MobileExportError(
+                            f"Model {role}: kopia manifestu "
+                            f"nie odpowiada manifestowi "
+                            f"zagniezdzonego pakietu."
+                        )
     def _preflight_model_source(self, request: MobileAlprPackageRequest, role: str, *, required: bool) -> list[str]:
         if role == "vehicle":
             package = request.vehicle_package
@@ -2741,7 +3360,10 @@ class MobileAlprPackageExporter:
         plate_item: dict[str, Any],
         character_item: dict[str, Any],
     ) -> dict[str, Any]:
-        models = {
+        from ..training.source_inventory import strip_embedded_inventory
+
+        request = replace(request, metadata=strip_embedded_inventory(request.metadata))
+        source_models = {
             "plate": plate_item,
             "character": character_item,
         }
@@ -2762,9 +3384,9 @@ class MobileAlprPackageExporter:
                     "include_class_indices": list(vehicle_detection.get("include_class_indices") or []),
                     "fallback_coco_class_indices": list(vehicle_detection.get("fallback_coco_class_indices") or []),
                 }
-            models = {
+            source_models = {
                 "vehicle": vehicle_item,
-                **models,
+                **source_models,
             }
             pipeline = [
                 vehicle_stage,
@@ -2782,7 +3404,12 @@ class MobileAlprPackageExporter:
         created_at = _utc_now_iso()
         model_refs = {
             role: _package_model_ref_payload(role, item)
-            for role, item in models.items()
+            for role, item in source_models.items()
+            if isinstance(item, Mapping)
+        }
+        models = {
+            role: _compact_package_model_entry(role, item)
+            for role, item in source_models.items()
             if isinstance(item, Mapping)
         }
         manifest = {
@@ -2808,7 +3435,7 @@ class MobileAlprPackageExporter:
                 request=request,
                 package_id=package_id,
                 created_at=created_at,
-                models=models,
+                models=source_models,
                 pipeline=pipeline,
             ),
         }

@@ -9,10 +9,85 @@ from __future__ import annotations
 from typing import List, Tuple
 
 from ..config import CV2_AVAILABLE, cv2, np
+from .polygon_validator import PolygonValidator
 
 
 class PlateRectifier:
     INTERPOLATIONS = {"nearest": 0, "linear": 1, "cubic": 2, "lanczos4": 4}
+
+    @staticmethod
+    def predicted_quad_geometry(raw_points, image_size):
+        """Deterministic homography plan, reusable to validate persisted evidence."""
+        from math import floor, hypot
+        from .quad_geometry import analyze_quad, canonicalize_polygon
+
+        if not CV2_AVAILABLE or cv2 is None:
+            raise RuntimeError("E2E_OPENCV_REQUIRED")
+        width, height = image_size
+        analysis = analyze_quad(raw_points, (width, height))
+        evidence = {"policy": "predicted_quad_anchor_k0_aspect320_v1",
+                    "raw_quad_status": analysis.status, "status": "QUAD_INVALID",
+                    "permutation": None, "homography": None, "size": None, "pixel_sha256": None}
+        if not analysis.is_geometrically_valid:
+            return evidence
+        ordered = canonicalize_polygon(raw_points, anchor_index=0, image_size=(width, height))
+        if ordered.polygon is None:
+            return evidence
+        q = ordered.polygon
+        evidence["permutation"] = ordered.permutation
+        w = max(hypot(q[1][0]-q[0][0], q[1][1]-q[0][1]), hypot(q[2][0]-q[3][0], q[2][1]-q[3][1]))
+        h = max(hypot(q[3][0]-q[0][0], q[3][1]-q[0][1]), hypot(q[2][0]-q[1][0], q[2][1]-q[1][1]))
+        scale = 320 / max(w, h)
+        out_w, out_h = floor(scale*w + .5), floor(scale*h + .5)
+        evidence["size"] = [out_w, out_h]
+        evidence["status"] = "RECTIFICATION_FAILED"
+        if min(out_w, out_h) < 2:
+            evidence["reason"] = "CROP_TOO_THIN"
+            return evidence
+        try:
+            source = np.array(q, dtype=np.float32)
+            destination = np.array([[0, 0], [out_w-1, 0], [out_w-1, out_h-1], [0, out_h-1]], dtype=np.float32)
+            matrix = cv2.getPerspectiveTransform(source, destination)
+            if not np.isfinite(matrix).all() or np.linalg.matrix_rank(matrix) != 3:
+                evidence["reason"] = "SINGULAR_HOMOGRAPHY"
+                return evidence
+        except cv2.error as exc:
+            # Resource/backend failures must stop execution, never become NO_READ.
+            if getattr(exc, "code", None) == getattr(getattr(cv2, "Error", None), "StsNoMem", -4):
+                raise
+            evidence["reason"] = "HOMOGRAPHY_ERROR: " + str(exc)
+            return evidence
+        evidence.update(status="RECTIFIED", homography=matrix.tolist())
+        return evidence
+
+    @classmethod
+    def rectify_predicted_quad(cls, image_bgr, raw_points):
+        """Strict E2E: k0 anchor, aspect320, no legacy sorting or auto rotation."""
+        import hashlib
+        if not CV2_AVAILABLE or cv2 is None:
+            raise RuntimeError("E2E_OPENCV_REQUIRED")
+        if (not isinstance(image_bgr, np.ndarray) or image_bgr.dtype != np.uint8
+                or image_bgr.ndim != 3 or image_bgr.shape[2] != 3 or min(image_bgr.shape[:2]) < 1):
+            raise ValueError("E2E_INVALID_BGR_INPUT")
+        height, width = image_bgr.shape[:2]
+        evidence = cls.predicted_quad_geometry(raw_points, (width, height))
+        if evidence["status"] != "RECTIFIED":
+            return None, evidence
+        out_w, out_h = evidence["size"]
+        try:
+            crop = cv2.warpPerspective(image_bgr, np.asarray(evidence["homography"], dtype=np.float64), (out_w, out_h),
+                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        except cv2.error as exc:
+            if getattr(exc, "code", None) == getattr(getattr(cv2, "Error", None), "StsNoMem", -4):
+                raise
+            evidence.update(status="RECTIFICATION_FAILED", reason="HOMOGRAPHY_ERROR: " + str(exc))
+            return None, evidence
+        if crop is None or crop.shape != (out_h, out_w, 3):
+            evidence["status"] = "RECTIFICATION_FAILED"
+            evidence["reason"] = "INVALID_WARP_RESULT"
+            return None, evidence
+        evidence["pixel_sha256"] = hashlib.sha256(crop.tobytes()).hexdigest()
+        return crop, evidence
 
     @staticmethod
     def polygon_wh_px(pts: List[Tuple[float, float]]) -> Tuple[float, float]:
@@ -26,24 +101,15 @@ class PlateRectifier:
     @staticmethod
     def order_quad_points(pts: List[Tuple[float, float]]) -> np.ndarray:
         """
-        Ustawia punkty w kolejności: top-left, top-right, bottom-right, bottom-left.
+        Buduje bezpieczny obwód do transformacji, z kotwicą ekranową min(X+Y).
 
-        Dla mocno skośnych tablic podział po samym Y bywa zawodny, bo obie lewe
-        albo obie prawe krawędzie mogą wpaść do różnych połówek obrazu. Stabilniej
-        działa najpierw rozdzielenie lewej i prawej pary po osi X, a dopiero potem
-        ułożenie każdej pary po osi Y.
+        Jest to orientacja obrazu użytkowego, a nie certyfikat tożsamości
+        surowych keypointów modelu. Nigdy nie dzieli punktów na pary po X/Y.
         """
-        p = np.array(pts, dtype="float32")
-        if p.shape != (4, 2):
-            raise ValueError("Do rektyfikacji wymagane są dokładnie 4 punkty.")
-
-        x_sorted = p[np.argsort(p[:, 0])]
-        left_pair = x_sorted[:2][np.argsort(x_sorted[:2, 1])]
-        right_pair = x_sorted[2:][np.argsort(x_sorted[2:, 1])]
-
-        top_left, bottom_left = left_pair
-        top_right, bottom_right = right_pair
-        return np.array([top_left, top_right, bottom_right, bottom_left], dtype="float32")
+        ordered = PolygonValidator.order_points(pts)
+        if not PolygonValidator.is_valid_quad(ordered):
+            raise ValueError("Do rektyfikacji wymagany jest wypukły, niesamoprzecinający czworokąt.")
+        return np.array(ordered, dtype="float32")
 
     @classmethod
     def deskew(cls, image_bgr: np.ndarray) -> np.ndarray:

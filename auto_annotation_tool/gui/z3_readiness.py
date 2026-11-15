@@ -8,6 +8,35 @@ from ..campaign_manager import CAMPAIGN
 from ..config import CONFIG, logger
 from ..validators import validate_yolo_dataset
 from .z3_metadata_cache import readiness_key
+from . import z3_dataset_provenance
+
+
+
+def step3_export_summary_matches_current_gold_contract(
+    summary: dict | None,
+    annotation_readiness: dict | None,
+) -> bool:
+    """
+    New summaries are bound to the exact GOLD source snapshot used for export.
+    Legacy summaries without a source fingerprint remain backward compatible.
+    """
+    source_summary = summary if isinstance(summary, dict) else {}
+    source_readiness = (
+        annotation_readiness
+        if isinstance(annotation_readiness, dict)
+        else {}
+    )
+
+    stored_hash = str(
+        source_summary.get("gold_source_contract_sha256") or ""
+    ).strip()
+    if not stored_hash:
+        return True
+
+    current_hash = str(
+        source_readiness.get("gold_source_contract_sha256") or ""
+    ).strip()
+    return bool(current_hash and current_hash == stored_hash)
 
 
 def get_step3_yolo_export_readiness_snapshot(host, *, selected_strategies=None, selected_sources=None) -> dict:
@@ -47,18 +76,20 @@ def _compute_step3_yolo_export_readiness(host, *, selected_strategies=None, sele
         "candidate_count": 0,
         "min_exportable_plate_count": int(min_exportable_plate_count),
         "missing_exportable_plate_count": int(min_exportable_plate_count),
+        "gold_source_contract_schema": "",
+        "gold_source_contract_sha256": "",
     }
 
     if not selected_buckets:
         result.update(
             reason="missing_strategy_filter",
-            message="PZ3 nie ma wybranej strategii gold packa, więc eksport datasetu znaków nie jest możliwy.",
+            message="Nie wybrano sposobu przygotowania danych, dlatego nie można jeszcze utworzyć zbioru znaków.",
         )
         return result
     if not selected_source_buckets:
         result.update(
             reason="missing_source_filter",
-            message="PZ3 nie ma wybranego źródła gold packa, więc eksport datasetu znaków nie jest możliwy.",
+            message="Nie wybrano źródła danych, dlatego nie można jeszcze utworzyć zbioru znaków.",
         )
         return result
 
@@ -73,6 +104,18 @@ def _compute_step3_yolo_export_readiness(host, *, selected_strategies=None, sele
             message=f"Nie udało się sprawdzić gotowości eksportu PZ3: {exc}",
         )
         return result
+
+    source_contract = (
+        z3_dataset_provenance.build_gold_source_contract_fingerprint(
+            plate_entries
+        )
+    )
+    result["gold_source_contract_schema"] = str(
+        source_contract.get("schema") or ""
+    )
+    result["gold_source_contract_sha256"] = str(
+        source_contract.get("sha256") or ""
+    )
 
     exportable_plate_count = 0
     exportable_char_count = 0
@@ -98,22 +141,22 @@ def _compute_step3_yolo_export_readiness(host, *, selected_strategies=None, sele
             message = (
                 (
                     f"Bramka E3 pozostaje zamknięta. Minimum kampanii to {min_exportable_plate_count} "
-                    f"eksportowalnych tablic perfect, obecnie PZ3 widzi {exportable_plate_count}. "
+                    f"zatwierdzonych tablic gotowych do eksportu, obecnie PZ3 widzi {exportable_plate_count}. "
                     f"Brakuje {missing_exportable}."
                 )
                 if in_campaign
                 else (
-                    f"PZ3 potrzebuje co najmniej {min_exportable_plate_count} eksportowalnej tablicy perfect, "
+                    f"PZ3 potrzebuje co najmniej {min_exportable_plate_count} zatwierdzonej tablicy gotowej do eksportu, "
                     f"obecnie widzi {exportable_plate_count}."
                 )
             )
         else:
             message = (
                 "Bramka E3 pozostaje zamknięta, bo PZ3 nie ma jeszcze poprawnych boxów znaków i etykiet "
-                "objętych aktualnym zakresem gold packa."
+                "objętych aktualnie wybranym zakresem danych."
                 if in_campaign
                 else (
-                    "PZ3 nie ma jeszcze poprawnych boxów znaków, etykiet i aktualnego zakresu gold packa."
+                    "Brakuje poprawnych ramek znaków, etykiet albo właściwie wybranego zakresu danych."
                 )
             )
         result.update(
@@ -130,13 +173,15 @@ def get_campaign_step3_annotation_readiness(host) -> dict:
         "reason": "missing_char_boxes",
         "message": (
             "Warunek eksportu PZ3 nie jest jeszcze spełniony. W kampanii potrzeba co najmniej 10 tablic "
-            "ze statusem perfect, z poprawnymi boxami znaków i etykietami, objętych aktualnym zakresem gold packa."
+            "ze statusem perfect, z poprawnymi boxami znaków i etykietami, objętych aktualnie wybranym zakresem danych."
         ),
         "exportable_plate_count": 0,
         "exportable_char_count": 0,
         "perfect_count": 0,
         "min_exportable_plate_count": 10,
         "missing_exportable_plate_count": 10,
+        "gold_source_contract_schema": "",
+        "gold_source_contract_sha256": "",
     }
 
     try:
@@ -151,17 +196,33 @@ def get_campaign_step3_annotation_readiness(host) -> dict:
         min_exportable_plates = int(export_readiness.get("min_exportable_plate_count", 10) or 10)
         missing_exportable_plates = int(export_readiness.get("missing_exportable_plate_count", 0) or 0)
         export_message = str(export_readiness.get("message", "") or "")
+        source_contract_schema = str(
+            export_readiness.get("gold_source_contract_schema", "") or ""
+        )
+        source_contract_sha256 = str(
+            export_readiness.get("gold_source_contract_sha256", "") or ""
+        )
     except Exception:
         exportable_chars = 0
         selected_plates = 0
         min_exportable_plates = 10
         missing_exportable_plates = 10
         export_message = ""
+        source_contract_schema = ""
+        source_contract_sha256 = ""
 
     try:
-        perfect_count = int(self._count_preview_statuses().get("perfect", 0) or 0)
+        preview_perfect_count = int(self._count_preview_statuses().get("perfect", 0) or 0)
     except Exception:
-        perfect_count = 0
+        preview_perfect_count = 0
+
+    # Przy bezpośrednim wejściu do PZ3 preview_metadata może nie być już
+    # załadowane w pamięci, mimo że gotowy materiał PZ2 istnieje na dysku.
+    # selected_plates pochodzi z collect_gold_export_plate_candidates(),
+    # które dopuszcza wyłącznie rekordy gold-eligible, a więc status=perfect
+    # (oraz aktualne zatwierdzenie człowieka dla nowych rekordów).
+    # Jest zatem bezpiecznym dolnym ograniczeniem liczby perfectów.
+    perfect_count = max(int(preview_perfect_count), int(selected_plates))
 
     result.update(
         exportable_plate_count=int(selected_plates),
@@ -169,6 +230,8 @@ def get_campaign_step3_annotation_readiness(host) -> dict:
         perfect_count=int(perfect_count),
         min_exportable_plate_count=int(min_exportable_plates),
         missing_exportable_plate_count=int(max(0, int(min_exportable_plates) - int(selected_plates or 0))),
+        gold_source_contract_schema=source_contract_schema,
+        gold_source_contract_sha256=source_contract_sha256,
     )
     if perfect_count < int(min_exportable_plates):
         missing_perfect = max(0, int(min_exportable_plates) - int(perfect_count or 0))
@@ -349,6 +412,12 @@ def get_campaign_step3_training_readiness(host) -> dict:
         exportable_plate_count=int(annotation_readiness.get("exportable_plate_count", 0) or 0),
         exportable_char_count=int(annotation_readiness.get("exportable_char_count", 0) or 0),
         perfect_count=int(annotation_readiness.get("perfect_count", 0) or 0),
+        gold_source_contract_schema=str(
+            annotation_readiness.get("gold_source_contract_schema", "") or ""
+        ),
+        gold_source_contract_sha256=str(
+            annotation_readiness.get("gold_source_contract_sha256", "") or ""
+        ),
     )
     if not bool(annotation_readiness.get("ok")):
         default_result.update(
@@ -360,6 +429,24 @@ def get_campaign_step3_training_readiness(host) -> dict:
         summary = self._read_step3_export_summary()
         if not isinstance(summary, dict) or not summary:
             return default_result
+
+        if not step3_export_summary_matches_current_gold_contract(
+            summary,
+            annotation_readiness,
+        ):
+            stale = dict(default_result)
+            stale.update(
+                ok=False,
+                reason="stale_gold_dataset",
+                validation_message=(
+                    "Zatwierdzony materiał zmienił się po utworzeniu zbioru znaków."
+                ),
+                message=(
+                    "Istniejący zbiór znaków pochodzi ze starszej wersji zatwierdzonych danych. "
+                    "Po zmianie znaków, informacji referencyjnej lub geometrii utwórz zbiór znaków ponownie."
+                ),
+            )
+            return stale
 
         dataset_path_raw = str(summary.get("gold_dataset_path", "") or "").strip()
         dataset_path = Path(dataset_path_raw) if dataset_path_raw else None
@@ -419,7 +506,7 @@ def get_campaign_step3_training_readiness(host) -> dict:
                     validation_message=validation_message,
                     message=(
                         f"Dataset znaków istnieje, ale E3 nie ma wymaganego minimum {min_exportable_plates} tablic ze statusem perfect. "
-                        "W PZ2 oznacz znaki na tablicach, doprowadź je do statusu perfect, "
+                        "Sprawdź znaki na tablicach i zatwierdź poprawne próbki, "
                         "a następnie ponownie wykonaj eksport w PZ3."
                     ),
                 )

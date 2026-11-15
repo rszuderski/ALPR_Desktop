@@ -10,6 +10,8 @@ from auto_annotation_tool.gui.tab_character_annotation import CharacterAnnotatio
 from auto_annotation_tool.gui import z3_preview_layout_control as control
 from auto_annotation_tool.gui import z3_preview_events as events
 from auto_annotation_tool.gui import z3_plate_layout_runtime as layouts
+from auto_annotation_tool.gui import z3_preview_ui as preview
+from auto_annotation_tool.gui import z3_preview_dock_ui as dock_ui
 
 
 @pytest.fixture(scope="module")
@@ -87,18 +89,76 @@ def test_selection_stays_on_same_character_after_reordering(host):
     assert host._get_preview_active_data()["characters"][host._preview_char_selected_index]["character"] == "B"
 
 
-def test_frame_control_stays_inside_canvas_and_does_not_accumulate_callbacks(host):
+def test_switch_1r_to_2r_ignores_stale_single_row_assignments_and_preserves_boxes(host):
+    data = host._get_preview_active_data()
+    data["plate_layout"] = "single_row"
+    for index, rec in enumerate(data["characters"], start=1):
+        rec["reading_row"] = 1
+        rec["reading_col"] = index
+        rec["reading_index"] = index
+
+    before = {rec["character"]: list(rec["bbox"]) for rec in data["characters"]}
+
+    assert control.toggle_plate_rows(host) == "break"
+
+    assert data["plate_layout_override"] == "two_row"
+    assert {rec["character"]: list(rec["bbox"]) for rec in data["characters"]} == before
+    assert [(rec["character"], rec["reading_row"]) for rec in data["characters"]] == [
+        ("A", 1),
+        ("B", 1),
+        ("C", 2),
+        ("D", 2),
+    ]
+    assert data["layout_separator"]["y1"] == data["layout_separator"]["y2"] == 50
+
+
+def test_frame_control_is_retained_vertical_and_right_of_frame(host):
     canvas = host.preview_canvas
     data = host._get_preview_active_data()
-    control.draw_plate_layout_control(host, data, right=490, top=-40)
-    initial = len(canvas._tclCommands)
-    for _ in range(15):
-        control.draw_plate_layout_control(host, data, right=700, top=40)
-    assert len(canvas._tclCommands) == initial
+
+    control.draw_plate_layout_control(host, data, right=420, top=90)
+    initial_items = canvas.find_withtag(control.CONTROL_TAG)
+    initial_callbacks = len(canvas._tclCommands)
+
     x1, y1, x2, y2 = canvas.bbox(control.CONTROL_TAG)
-    assert 0 <= x1 < x2 <= 500 and 0 <= y1 < y2 <= 300
+    assert float(x1) >= 425.0
+    assert abs(float(y1) - 90.0) <= 2.0
+    assert (float(y2) - float(y1)) > (float(x2) - float(x1))
+
+    texts = {
+        str(canvas.itemcget(item, "text"))
+        for item in initial_items
+        if canvas.type(item) == "text"
+    }
+    assert {"1R", "2R"}.issubset(texts)
+
+    text_items = {
+        str(canvas.itemcget(item, "text")): canvas.coords(item)
+        for item in initial_items
+        if canvas.type(item) == "text"
+    }
+    assert text_items["1R"][1] < text_items["2R"][1]
+
+    for _ in range(15):
+        control.draw_plate_layout_control(host, data, right=450, top=115)
+
+    assert canvas.find_withtag(control.CONTROL_TAG) == initial_items
+    assert len(canvas._tclCommands) == initial_callbacks
+
+    moved_x1, moved_y1, moved_x2, moved_y2 = canvas.bbox(control.CONTROL_TAG)
+    assert float(moved_x1) >= 455.0
+    assert abs(float(moved_y1) - 115.0) <= 2.0
+    assert (float(moved_y2) - float(moved_y1)) > (float(moved_x2) - float(moved_x1))
+
+    anchor = host._preview_layout_control_anchor
+    assert anchor["right"] == 450.0
+    assert anchor["top"] == 115.0
+    assert anchor["left"] > anchor["right"]
+    assert anchor["height"] > anchor["width"]
+
     for item in canvas.find_withtag(control.CONTROL_TAG):
         assert "preview_action::toggle_plate_rows" in canvas.gettags(item)
+
 
 
 def test_header_status_refresh_keeps_hover_control_and_tooltip_timer(host):
@@ -146,3 +206,34 @@ def test_layout_before_detection_still_has_frame_control(host):
     host._derive_preview_status_from_data.return_value = "unknown"
     assert host._draw_preview_plate_status_frame()
     assert host.preview_canvas.find_withtag(control.CONTROL_TAG)
+
+
+def test_plate_status_frame_uses_hud_status_colour(host):
+    canvas = host.preview_canvas
+    data = host._get_preview_active_data()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            preview,
+            "resolve_inline_hud_plate_status",
+            lambda _host, _data: ("ZATWIERDŹ", "#5aa8e8"),
+        )
+        assert host._draw_preview_plate_status_frame(data)
+
+    items = canvas.find_withtag("preview_plate_status_frame")
+    rectangles = [item for item in items if canvas.type(item) == "rectangle"]
+    assert rectangles
+    assert canvas.itemcget(rectangles[0], "outline").lower() == "#5aa8e8"
+
+
+def test_plate_status_row_is_not_exposed_by_dock_runtime():
+    host = SimpleNamespace(
+        _get_preview_step3_gate_overlay_state=lambda: {"visible": False},
+    )
+    state = dock_ui._get_preview_dock_row_runtime_state(
+        host,
+        "plate_status",
+        {},
+        gate_state={"visible": False},
+    )
+    assert state["visible"] is False

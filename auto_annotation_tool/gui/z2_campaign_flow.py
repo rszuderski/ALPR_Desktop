@@ -773,6 +773,15 @@ def open_campaign_step2_entry(
                 bootstrap["input_source"] = "raw_current_iteration"
 
         input_dir = Path(bootstrap.get("input_dir") or input_dir)
+        try:
+            from . import z2_gt_companion_flow
+
+            z2_gt_companion_flow.activate_campaign_gt_binding(host, input_dir)
+        except Exception as exc:
+            try:
+                logger.debug(f"Nie udało się aktywować GT companion dla kampanii: {exc}")
+            except Exception:
+                pass
         manual_template = bool(bootstrap.get("manual_template", target == "plate"))
         plate_bootstrap_model = str(bootstrap.get("plate_model_path") or "").strip()
         restore_run_dir = bootstrap.get("restore_run_dir")
@@ -1087,27 +1096,8 @@ def open_campaign_step2_entry(
             except Exception:
                 pass
 
-        if (
-            effective_manual_template
-            and not opened_existing_run
-            and str(host._get_workflow_route() or "").strip().lower() == "manual"
-            and str(host._get_manual_entry_mode() or "").strip().lower() == "new"
-            and Path(input_dir).exists()
-            and not t04_plate_work_entry
-            and not bool(getattr(host, "_campaign_manual_prepare_pending", False))
-        ):
-            try:
-                host._campaign_manual_prepare_pending = True
-
-                def _prepare_campaign_manual_package() -> None:
-                    try:
-                        host._ensure_campaign_manual_package_ready(iteration_target=target)
-                    finally:
-                        host._campaign_manual_prepare_pending = False
-
-                host.frame.after_idle(_prepare_campaign_manual_package)
-            except Exception:
-                host._campaign_manual_prepare_pending = False
+        # Entering Z2 only restores the workspace. Creating a manual XML or
+        # running models requires the user's start action after Z2 is visible.
         _mark_phase("refresh_ui")
 
         host._campaign_context_project_name = str(active_project or "").strip()
@@ -1117,6 +1107,7 @@ def open_campaign_step2_entry(
             and not opened_existing_run
             and not bool(getattr(host, "current_annotations", None))
         )
+        host._campaign_step2_transition_defer_source_preview = deferred_preview_load
 
         return {
             "ok": True,
@@ -1128,8 +1119,7 @@ def open_campaign_step2_entry(
             "restored_snapshot": bool(restored_snapshot),
             "opened_existing_run": bool(opened_existing_run),
             "manual_prepare_deferred_to_user": bool(
-                t04_plate_work_entry
-                and effective_manual_template
+                effective_manual_template
                 and not opened_existing_run
             ),
             "restore_run_dir": str(restore_run_dir or ""),
@@ -1413,12 +1403,6 @@ def build_z2_cta_state_campaign(
         )
     except Exception:
         t04_plate_work_entry = bool(graph_gate_id == "T04")
-    manual_auto_bootstrap = bool(
-        manual_setup
-        and input_dir_ready
-        and not manual_run_already_created
-        and not t04_plate_work_entry
-    )
     campaign_auto_start_ready = bool(
         route == "auto"
         and current_step == "auto_start"
@@ -1476,13 +1460,13 @@ def build_z2_cta_state_campaign(
             start_text = "Wybierz obrazy"
             start_command = host._select_input_dir
         else:
-            if t04_plate_work_entry:
-                start_enabled = not host.is_processing
-                start_text = "Przygotuj roboczy XML Z2"
-                start_command = host._start_annotation
-            else:
-                start_enabled = False
-                start_text = "Przygotowuję Z2"
+            # Ręczny run kampanijny bez XML musi zawsze zostawić użytkownikowi
+            # jawną drogę utworzenia roboczego annotations.xml. Automatyczny
+            # bootstrap może nadal zadziałać wcześniej, ale jego brak/awaria
+            # nie może pozostawić Z2 w stanie tylko-do-podglądu bez CTA.
+            start_enabled = not host.is_processing
+            start_text = "Przygotuj roboczy XML Z2"
+            start_command = host._start_annotation
 
     if route == "auto" and input_dir_ready:
         start_command = _start_campaign_auto_action
@@ -1498,8 +1482,7 @@ def build_z2_cta_state_campaign(
         next_text="Dalej",
         suppress_duplicate_start_cta=bool(
             not host.is_processing and start_text in {"Wybierz tor", "Run istnieje"}
-        )
-        or manual_auto_bootstrap,
+        ),
     )
 
 

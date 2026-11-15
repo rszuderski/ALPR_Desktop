@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ZakĹ‚adka: Panel kampanii i etapow projektu.
@@ -609,6 +609,8 @@ class CampaignTab:
         return campaign_step1_assets._summarize_project_start_annotation_import_origin(self, *args, **kwargs)
     def _format_project_start_annotation_import_origin_table(self, *args, **kwargs):
         return campaign_step1_assets._format_project_start_annotation_import_origin_table(self, *args, **kwargs)
+    def _show_project_start_annotation_import_modal(self, *args, **kwargs):
+        return campaign_step1_assets._show_project_start_annotation_import_modal(self, *args, **kwargs)
     def _choose_project_start_annotation_import_mode(self, *args, **kwargs):
         return campaign_step1_assets._choose_project_start_annotation_import_mode(self, *args, **kwargs)
     def _promote_project_start_annotation_import_to_approved_set(self, *args, **kwargs):
@@ -757,7 +759,22 @@ class CampaignTab:
             "Weryfikuję wybrany katalog obrazów.",
             "Sprawdzam, czy wskazany folder zawiera obrazy i czy nie jest zbyt szeroki.",
         )
-        if not CAMPAIGN.set_master_pool_dir(selected):
+        # replace_old_e1_image_state_before_new_source
+        try:
+            active_project = str(CAMPAIGN.get_active_project_name() or "").strip()
+        except Exception:
+            active_project = ""
+        try:
+            resolved_selected = str(
+                CAMPAIGN._resolve_valid_image_source_dir(
+                    selected,
+                    project_name=active_project or None,
+                )
+                or ""
+            ).strip()
+        except Exception:
+            resolved_selected = ""
+        if not resolved_selected:
             campaign_step1_ingest._hide_ingest_plan_progress_dialog(self)
             self.app.themed_info(
                 "Nieprawidłowy katalog zdjęć",
@@ -769,24 +786,62 @@ class CampaignTab:
                 tone="warning",
             )
             return False
+
+        # Nowe O zastępuje poprzedni roboczy kontrakt tej iteracji. Najpierw
+        # usuń plan/manifest/powiązanie poprzedniego O, a dopiero potem zapisz
+        # nowe źródło. Dzięki temu stary current_ingest_plan nie może przeciec
+        # do licznika ani tokenu nowego katalogu.
         try:
-            campaign_step1_ingest._update_ingest_plan_progress_dialog(
-                self,
-                12,
-                "Aktualizuję kontrakt zasobów E1.",
-                "Synchronizuję wybrane obrazy z aktualną iteracją projektu.",
-            )
-            self._sync_iteration_artifact_registry_from_project_start(
-                progress_callback=lambda _count, detail: campaign_step1_ingest._update_ingest_plan_progress_dialog(
-                    self,
-                    14,
-                    "Buduję opis wybranego zbioru obrazów.",
-                    str(detail or "Zbieram nazwy obrazów do kontraktu O."),
-                )
-            )
+            CAMPAIGN.clear_step1_image_source_state(project_name=active_project or None)
+        except Exception as exc:
+            logger.debug(f"Nie udało się wyczyścić poprzedniego stanu O przed podmianą źródła: {exc}")
+        self.current_ingest_plan = {}
+        self.ingest_plan_items = []
+        try:
+            self._existing_iteration_ingest_plan_signature = None
         except Exception:
             pass
-        self.current_ingest_plan = {}
+
+        if not CAMPAIGN.set_master_pool_dir(resolved_selected, project_name=active_project or None):
+            campaign_step1_ingest._hide_ingest_plan_progress_dialog(self)
+            self.app.themed_info(
+                "Nieprawidłowy katalog zdjęć",
+                (
+                    "Nie udało się zapisać wybranego katalogu zdjęć. "
+                    "Wskaż folder ponownie."
+                ),
+                parent=self.frame,
+                tone="warning",
+            )
+            return False
+
+        campaign_step1_ingest._update_ingest_plan_progress_dialog(
+            self,
+            12,
+            "Przygotowuję nowy zbiór obrazów O.",
+            "Poprzedni plan został odłączony. Analiza nowego katalogu rozpocznie się za chwilę.",
+        )
+
+        # O is a complete image resource: discover portable GT companions at the
+        # same entry point used by E1 and the graph resource modal.
+        try:
+            from . import z2_gt_companion_flow
+
+            resolved_pool = CAMPAIGN.get_master_pool_dir() or Path(selected)
+            campaign_step1_ingest._update_ingest_plan_progress_dialog(
+                self,
+                18,
+                "Sprawdzam dane Ground Truth przy zasobie O.",
+                "Szukam bezpośrednich katalogów *.alprgt obok obrazów.",
+            )
+            z2_gt_companion_flow.offer_campaign_gt_import(
+                self,
+                Path(resolved_pool),
+                parent=parent or self.frame,
+            )
+        except Exception as exc:
+            logger.debug(f"Nie udało się obsłużyć companionów GT zasobu O: {exc}")
+
         iter_image_count = self._get_iteration_image_count()
 
         if iter_image_count == 0:
@@ -802,6 +857,10 @@ class CampaignTab:
                 "Odświeżam informacje o wybranym zbiorze obrazów.",
                 "W tej iteracji istnieją już obrazy, więc nie tworzę nowego planu E1.",
             )
+            try:
+                self._sync_iteration_artifact_registry_from_project_start()
+            except Exception as exc:
+                logger.debug(f"Nie udało się zsynchronizować istniejącego O po wyborze źródła: {exc}")
             self._refresh_ingest_panel()
             campaign_step1_ingest._update_ingest_plan_progress_dialog(
                 self,
@@ -967,17 +1026,9 @@ class CampaignTab:
                 _report_processed_progress(processed_count)
                 continue
 
-            gt_texts = planner.extract_true_texts_from_filename(image_path.name)
-            if not gt_texts:
-                skipped_invalid_gt += 1
-                _report_processed_progress(processed_count)
-                continue
-
-            char_hist = planner.build_char_histogram(gt_texts)
-            if not char_hist:
-                skipped_invalid_gt += 1
-                _report_processed_progress(processed_count)
-                continue
+            text_fields = planner.normalize_text_metadata(image_path.name)
+            gt_texts = text_fields["ground_truth_texts"]
+            char_hist = text_fields["char_histogram"]
 
             try:
                 source_path = str(image_path.resolve())
@@ -991,6 +1042,7 @@ class CampaignTab:
                     "source_path": source_path,
                     "source_key": planner.make_source_key(image_path, master_pool_dir=master_pool_dir),
                     "ground_truth_texts": list(gt_texts),
+                    **text_fields,
                     "char_histogram": dict(char_hist),
                     "score": 0.0,
                     "score_details": {},
@@ -1020,6 +1072,7 @@ class CampaignTab:
             "raw_total": raw_total,
             "candidates_total": raw_total,
             "selected_total": len(selected_items),
+            **planner.gt_statistics(selected_items),
             "new_to_project_total": new_to_project_total,
             "source_new_to_project_total": source_new_to_project_total,
             "skipped_used": skipped_duplicate_filenames,
@@ -1061,6 +1114,7 @@ class CampaignTab:
         proposal_summary: dict = None,
         progress_callback=None,
         selected_source_metadata=None,
+        prepared_manifest=None,
     ) -> int:
         started_at = perf_counter()
         manifest_ms = 0.0
@@ -1139,24 +1193,20 @@ class CampaignTab:
             force=True,
         )
         manifest_started = perf_counter()
-        try:
-            CAMPAIGN.record_iteration_ingest(
-                source_dir=source_root,
-                selected_source_files=selected_files,
-                selection_mode=selection_mode,
-                proposal_summary=summary_payload,
-                selected_source_metadata=selected_source_metadata,
-                progress_callback=lambda value, message="", **kwargs: _progress(
-                    20.0 + (float(value or 0.0) * 0.60),
-                    message,
-                    detail=str(kwargs.get("detail", "") or ""),
-                    force=bool(kwargs.get("force", False)),
-                ),
+        if prepared_manifest is None:
+            path = CAMPAIGN.record_iteration_ingest(
+                source_dir=source_root, selected_source_files=selected_files,
+                selection_mode=selection_mode, proposal_summary=summary_payload,
+                selected_source_metadata=selected_source_metadata, progress_callback=_progress,
             )
-        except Exception as e:
-            logger.debug(f"Nie udaĹ‚o siÄ™ zapisaÄ‡ manifestu E1 dla {target_iter_dir}: {e}")
-        finally:
-            manifest_ms = max(0.0, (perf_counter() - manifest_started) * 1000.0)
+            if path is None:
+                raise ValueError("E1 manifest save failed")
+            prepared_manifest = CAMPAIGN.load_ingest_manifest()
+        if not isinstance(prepared_manifest, dict) or not prepared_manifest.get("selected_images"):
+            raise ValueError("E1 manifest contains no accepted images")
+        selected_files = [Path(item["source_path"]) for item in prepared_manifest["selected_images"]]
+        package_count = len(selected_files)
+        manifest_ms = max(0.0, (perf_counter() - manifest_started) * 1000.0)
 
         _progress(84, "Zatwierdzam E1.", "Zmieniam status wejścia i odblokowuję kolejny etap.", force=True)
         approve_started = perf_counter()
@@ -2479,7 +2529,7 @@ class CampaignTab:
         statuses.append(
             WizardStageStatus(
                 key="step3",
-                title=str(getattr(step3_vm, "title", "") or "").strip() or "E3. Znaki i gold pack",
+                title=str(getattr(step3_vm, "title", "") or "").strip() or "E3. Przygotowanie znaków",
                 state=step3_state,
                 summary=step3_summary,
                 details=step3_details,
@@ -3337,6 +3387,8 @@ class CampaignTab:
         return campaign_project_browser._ensure_project_context_is_switchable(self, *args, **kwargs)
     def _reset_campaign_graph_runtime_state(self, *args, **kwargs):
         return campaign_project_browser._reset_campaign_graph_runtime_state(self, *args, **kwargs)
+    def _reset_campaign_project_runtime_state(self, *args, **kwargs):
+        return campaign_project_browser._reset_campaign_project_runtime_state(self, *args, **kwargs)
     def _add_new_project(self, *args, **kwargs):
         return campaign_project_browser._add_new_project(self, *args, **kwargs)
     def _get_selected_projects_from_list(self, *args, **kwargs):

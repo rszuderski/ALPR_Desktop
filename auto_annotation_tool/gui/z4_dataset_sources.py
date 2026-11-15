@@ -186,9 +186,64 @@ def _find_ready_dataset_candidates(self, base_dir: Path | None = None) -> list[t
 
     return candidates
 
+# Z4DATASETUI001: hide intermediate augmentation parents
+def _dataset_variant_resolved_key(path: str | Path | None) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(Path(raw).resolve()).replace("\\", "/").casefold()
+    except Exception:
+        return os.path.normcase(os.path.normpath(raw))
+
+
+def _load_dataset_augmentation_scope(path: str | Path | None) -> dict:
+    try:
+        scope_path = Path(path) / "augmentation_scope.json"
+        if not scope_path.exists() or not scope_path.is_file():
+            return {}
+        payload = json.loads(scope_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _collect_augmented_parent_dataset_keys(candidates: list[tuple[Path, str, float]]) -> set[str]:
+    parents = set()
+    for path, _target, _stamp in list(candidates or []):
+        scope = _load_dataset_augmentation_scope(path)
+        source_raw = str(scope.get("source_dataset_dir") or "").strip()
+        if not source_raw:
+            continue
+        key = _dataset_variant_resolved_key(source_raw)
+        if key:
+            parents.add(key)
+    return parents
+
+
+def _dataset_variant_role(path: str | Path | None) -> tuple[str, str]:
+    root = Path(path)
+    scope = _load_dataset_augmentation_scope(root)
+    if scope:
+        try:
+            requested = max(0, int(scope.get("requested_extra", 0) or 0))
+        except Exception:
+            requested = 0
+        try:
+            generated = max(0, int(scope.get("generated", 0) or 0))
+        except Exception:
+            generated = 0
+        count = requested or generated
+        return "augmented", (f"AUG +{count}" if count > 0 else "AUG")
+    if "_Split_" in root.name:
+        return "base", "BAZA"
+    return "variant", "WARIANT"
+
+
 def _get_free_dataset_variant_choices(self) -> list[dict]:
     selected_target = self._get_selected_training_target()
     candidates = self._find_ready_dataset_candidates(self._get_datasets_base_dir())
+    intermediate_parent_keys = _collect_augmented_parent_dataset_keys(candidates)
     variants: list[dict] = []
     campaign_active = bool(CAMPAIGN.get_active_project_name())
     approved_plate_images = 0
@@ -208,6 +263,8 @@ def _get_free_dataset_variant_choices(self) -> list[dict]:
 
     for path, target, stamp in candidates:
         if target != selected_target:
+            continue
+        if _dataset_variant_resolved_key(path) in intermediate_parent_keys:
             continue
         readiness = get_training_dataset_readiness(path, target=target)
         if not bool(readiness.get("ok", True)):
@@ -254,7 +311,8 @@ def _get_free_dataset_variant_choices(self) -> list[dict]:
         except Exception:
             label_path = str(path)
         display_ref = build_dataset_display_ref(path, target_hint=target, counts=counts)
-        label = display_ref.combo_label
+        variant_role, role_label = _dataset_variant_role(path)
+        label = f"{display_ref.id} | {role_label} | {display_ref.split_label}"
         variants.append(
             {
                 "label": label,
@@ -262,6 +320,8 @@ def _get_free_dataset_variant_choices(self) -> list[dict]:
                 "display_path": label_path,
                 "dataset_id": display_ref.id,
                 "dataset_label": display_ref.detail_label,
+                "variant_role": variant_role,
+                "role_label": role_label,
                 "stamp": float(stamp or 0),
             }
         )
@@ -270,6 +330,10 @@ def _get_free_dataset_variant_choices(self) -> list[dict]:
     return variants
 
 def _refresh_dataset_variant_choices(self):
+    from . import z4_mz_experiment
+    if z4_mz_experiment.is_active(self):
+        z4_mz_experiment.refresh_controls(self)
+        return
     combo = getattr(self, "dataset_variant_combo", None)
     if combo is None:
         return
@@ -300,6 +364,7 @@ def _refresh_dataset_variant_choices(self):
             ):
                 counts = self._get_dataset_split_image_counts(current_root)
                 display_ref = build_dataset_display_ref(current_root, target_hint=current_target, counts=counts)
+                current_variant_role, current_role_label = _dataset_variant_role(current_root)
                 try:
                     stamp = float(current_root.stat().st_mtime)
                 except Exception:
@@ -311,11 +376,13 @@ def _refresh_dataset_variant_choices(self):
                 variants.insert(
                     0,
                     {
-                        "label": display_ref.combo_label,
+                        "label": f"{display_ref.id} | {current_role_label} | {display_ref.split_label}",
                         "path": str(current_root),
                         "display_path": label_path,
                         "dataset_id": display_ref.id,
                         "dataset_label": display_ref.detail_label,
+                        "variant_role": current_variant_role,
+                        "role_label": current_role_label,
                         "stamp": stamp,
                     },
                 )
@@ -386,6 +453,9 @@ def _sync_dataset_variant_selection(self):
         pass
 
 def _on_dataset_variant_selected(self, event=None):
+    from . import z4_mz_experiment
+    if z4_mz_experiment.is_active(self):
+        return
     selected = str(getattr(self, "dataset_variant_var", tk.StringVar()).get() or "").strip()
     if not selected:
         return
@@ -1477,6 +1547,9 @@ def _apply_saved_step4_training_model_selection(self, target: str | None = None)
     return True
 
 def _remember_current_step4_training_model_selection(self) -> None:
+    from . import z4_mz_experiment
+    if bool(getattr(self, "_mz_applying_protocol", False)) or z4_mz_experiment.is_active(self):
+        return
     if not CAMPAIGN.get_active_project_name():
         return
     if bool(getattr(self, "_step4_suppress_base_model_state_save", False)):

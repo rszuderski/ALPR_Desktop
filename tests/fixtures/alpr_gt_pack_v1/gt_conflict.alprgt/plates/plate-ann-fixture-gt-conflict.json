@@ -1,0 +1,21 @@
+{
+  "geometry_heads": [
+    "geom-sha256-d89823c347ae86cb0368ebf05df4fa46e8610140e888539e31026fc422ac8098"
+  ],
+  "geometry_revision_ids": [
+    "geom-sha256-d89823c347ae86cb0368ebf05df4fa46e8610140e888539e31026fc422ac8098"
+  ],
+  "image_id": "img-sha256-0f8b6327327aa97711d20804dc230cba1940816aedbdc27c4e95726635dc1562",
+  "legacy_ids": [],
+  "plate_id": "plate-ann-fixture-gt-conflict",
+  "revision_heads": [
+    "rev-sha256-b38f07120c66b84453bf521c620a66e1b0b56ea6b16a002c9958be5aeb635661",
+    "rev-sha256-db6c3cd4ad480f2db97f75aef6c7a0dee98ede1f8f6168d8d9a37bd6479936de"
+  ],
+  "revision_ids": [
+    "rev-sha256-b38f07120c66b84453bf521c620a66e1b0b56ea6b16a002c9958be5aeb635661",
+    "rev-sha256-db6c3cd4ad480f2db97f75aef6c7a0dee98ede1f8f6168d8d9a37bd6479936de",
+    "rev-sha256-eaac9cfe8f2e6aaf66c59b8bcc5d8133d6c8b62a8cb1567914eec132edde2d51"
+  ],
+  "schema": "alpr.gt.plate.v1"
+}

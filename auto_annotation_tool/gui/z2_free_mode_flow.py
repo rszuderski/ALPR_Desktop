@@ -19,20 +19,20 @@ if TYPE_CHECKING:
     from .tab_annotation import AnnotationTab
 
 
-AUTO_REVIEW_FOLLOWUP_TITLE = "Korekta i decyzja po autoanotacji"
+AUTO_REVIEW_FOLLOWUP_TITLE = "Korekta i decyzja"
 AUTO_REVIEW_FOLLOWUP_TEXT = (
     "Masz gotowy wynik autoanotacji zapisany w runie Z2. Najpierw sprawdź ramki lub poligony tablic, "
     "popraw błędy i zatwierdź poprawne obrazy statusem [OK]. Status [OK] jest wymagany dla "
-    "„Wyodrębnij tablice” oraz dla eksportu datasetu YOLO Pose ze splitem, bo obie ścieżki "
+    "„Przejdź do Z3” oraz dla eksportu datasetu YOLO Pose ze splitem, bo obie ścieżki "
     "operują na danych treningowych. Wyjątkiem jest eksport samych anotacji XML: możesz go wykonać "
     "po zapisaniu co najmniej jednej tablicy, nawet bez statusu [OK]. Run Z2 pozostaje zapisany, "
     "więc możesz wrócić do niego z historii runów bez utraty pracy."
 )
-MANUAL_REVIEW_FOLLOWUP_TITLE = "Korekta i decyzja po anotacji ręcznej"
+MANUAL_REVIEW_FOLLOWUP_TITLE = "Korekta i decyzja"
 MANUAL_REVIEW_FOLLOWUP_TEXT = (
     "Masz gotowy ręczny run anotacji tablic zapisany do pliku xml. Jeśli chcesz przejść do pracy "
-    "nad znakami, wybierz „Wyodrębnij tablice”. Jeśli chcesz trenować model tablic na tym etapie, "
-    "otwórz eksport i wybierz wariant datasetu YOLO Pose ze splitem. Run Z2 pozostaje zapisany, "
+    "nad znakami, wybierz „Przejdź do Z3”. Jeśli chcesz trenować model tablic na tym etapie, "
+    "wybierz „Przejdź do eksportu” i wariant datasetu YOLO Pose ze splitem. Run Z2 pozostaje zapisany, "
     "więc później możesz wrócić do niego z historii runów bez utraty pracy. Status [OK] jest "
     "wymagany dla wyodrębniania tablic i datasetu YOLO Pose. Eksport samych anotacji XML jest "
     "wyjątkiem: wystarczy co najmniej jedna zapisana tablica, nawet bez statusu [OK]."
@@ -338,7 +338,7 @@ def get_manual_review_history_display_entries(host: "AnnotationTab") -> list[dic
 
 
 def refresh_manual_review_history_ui(host: "AnnotationTab") -> None:
-    if host._is_free_mode_session_context() and host._get_manual_entry_mode() != "continue":
+    if host._get_workflow_route() != "manual" or host._get_manual_entry_mode() != "continue":
         return
     values = []
     label_map = {}
@@ -591,8 +591,29 @@ def build_z2_cta_state_free_mode(
         except Exception:
             return False
 
+    manual_entry_mode = host._get_manual_entry_mode()
+    manual_new_flow = bool(
+        route == "manual"
+        and manual_setup
+        and manual_entry_mode == "new"
+    )
+    manual_new_prepare_step = bool(
+        manual_new_flow
+        and current_step in {"manual_entry", "manual_input"}
+    )
+    manual_new_resume = bool(
+        manual_new_flow
+        and current_step == "manual_start"
+        and manual_run_already_created
+        and bool(getattr(host, "_manual_template_ready_for_review", False))
+    )
+
     show_start_controls = bool(
-        show_workflow_steps and current_step in {"auto_start", "manual_start"}
+        show_workflow_steps
+        and (
+            current_step in {"auto_start", "manual_start"}
+            or manual_new_prepare_step
+        )
     )
     show_nav_controls = bool(show_workflow_steps and current_step and not host.is_processing)
 
@@ -613,7 +634,11 @@ def build_z2_cta_state_free_mode(
     if route == "auto" and input_dir_ready:
         start_text = "Start autoanotacji"
     elif manual_setup:
-        if manual_run_already_created:
+        if manual_new_resume:
+            start_enabled = not host.is_processing
+            start_text = "Wróć do korekty"
+            start_command = host._go_to_next_workflow_step
+        elif manual_run_already_created:
             start_enabled = False
             start_text = "Run istnieje"
         elif not input_dir_ready:
@@ -622,9 +647,9 @@ def build_z2_cta_state_free_mode(
             start_command = host._select_input_dir
         else:
             start_text = (
-                "Utwórz XML + boxy pojazdów"
+                "Rozpocznij anotację + boxy pojazdów"
                 if host._manual_vehicle_assist_enabled()
-                else "Utwórz XML anotacji"
+                else "Rozpocznij anotację"
             )
 
     back_text = "Wstecz"
@@ -654,11 +679,23 @@ def build_z2_cta_state_free_mode(
             and manual_setup
             and bool(getattr(host, "_manual_template_ready_for_review", False))
         ):
-            next_enabled = bool(not host.is_processing)
-            next_text = "Dalej"
+            next_enabled = False
+            next_text = ""
+        if (
+            manual_new_flow
+            and current_step in {"manual_entry", "manual_input", "manual_start"}
+            and not host._dataset_export_completed
+        ):
+            next_enabled = False
+            next_text = ""
         if host._dataset_export_completed:
             next_text = "Powrot"
-        if route == "manual" and current_step == "manual_entry" and not host._dataset_export_completed:
+        if (
+            route == "manual"
+            and current_step == "manual_entry"
+            and not host._dataset_export_completed
+            and not manual_new_flow
+        ):
             next_text = "Dalej"
         elif route == "manual" and current_step == "manual_history" and not host._dataset_export_completed:
             next_text = "Dalej" if host._manual_review_active else "Otworz run"
@@ -674,7 +711,7 @@ def build_z2_cta_state_free_mode(
         back_enabled = bool(not host.is_processing)
         next_enabled = bool(not host.is_processing and export_choice_ready)
         back_text = "Wstecz"
-        next_text = "Otwórz eksport"
+        next_text = "Przejdź do eksportu"
     elif free_mode_screen == "manual_review":
         approved_ready = _has_approved_plate_positions()
         if route == "manual":
@@ -718,6 +755,8 @@ def build_z2_left_panel_copy_payload_free_mode(
     current_step = str(ctx.current_step or "")
     vehicle_assist_enabled = bool(ctx.vehicle_assist_enabled)
     auto_vehicle_choice = str(ctx.auto_vehicle_choice or "")
+    # GT is optional data; there is no GT ON/OFF mode.
+    gt_enabled = True
     has_manual_history = bool(ctx.has_manual_history)
     auto_completed = bool(ctx.auto_completed)
     auto_setup_pending = bool(ctx.auto_setup_pending)
@@ -883,7 +922,7 @@ def build_z2_left_panel_copy_payload_free_mode(
 
     elif route == "manual":
         payload["run_title"] = (
-            "Praca ręczna na runie Z2"
+            "Przygotowanie pracy ręcznej"
             if bool(ctx.manual_setup) and not bool(ctx.manual_review_active)
             else "Ręczna korekta runu Z2"
         )
@@ -952,18 +991,18 @@ def build_z2_left_panel_copy_payload_free_mode(
         else:
             payload["workflow_input_title"] = "Wskaż katalog obrazów"
             payload["workflow_input_hint"] = (
-                "Tutaj wybierasz wyłącznie katalog zdjęć wejściowych. Po kliknięciu Dalej program wczyta listę i podgląd Z2."
+                "Wybierz katalog zdjęć wejściowych. Po wskazaniu obrazów program przejdzie "
+                "bezpośrednio do akcji Rozpocznij anotację."
             )
-            payload["workflow_start_title"] = "Utwórz XML anotacji"
+            payload["workflow_start_title"] = "Rozpocznij anotację"
             payload["workflow_start_intro"] = (
-                "W tym kroku tworzysz nowy run ręcznej anotacji Z2 i powiązany z nim plik XML "
-                "ze współrzędnymi ramek tablic dla wybranego katalogu zdjęć. Po udanym utworzeniu XML "
-                "kliknij Dalej, aby przejść do kroku Korekta i tam rysować albo poprawiać ramki. "
-                "Eksport samych anotacji będzie możliwy po zapisaniu pierwszej ramki; dataset YOLO Pose "
-                "i wyodrębnianie tablic wymagają pozycji ze statusem [OK]."
+                "Ta akcja tworzy nowy ręczny run Z2 i techniczny plik annotations.xml. "
+                "Po przygotowaniu runu program automatycznie przejdzie do kroku Korekta i decyzja — "
+                "bez dodatkowego przycisku Dalej. Eksport samych anotacji będzie możliwy po zapisaniu "
+                "pierwszej ramki; dataset YOLO Pose i wyodrębnianie tablic wymagają pozycji ze statusem [OK]."
             )
             payload["route_text"] = "Ręcznie oznaczysz tablice w wybranym katalogu zdjęć."
-            payload["action_text"] = "Kliknij przycisk poniżej, aby utworzyć XML anotacji dla nowego runu ręcznej pracy."
+            payload["action_text"] = "Kliknij przycisk poniżej, aby rozpocząć anotację nowego ręcznego runu Z2."
             payload["manual_hint"] = "Ten tor tworzy nowy run ręcznej anotacji Z2 i nie nadpisuje starszych XML-i."
             payload["manual_hint_tone"] = "muted"
             payload["manual_template_hint"] = "Nowy run ręcznej anotacji Z2 nie nadpisuje starszych XML-i i jest zapisywany w workspace Z2."
@@ -993,14 +1032,26 @@ def build_z2_left_panel_copy_payload_free_mode(
             payload["manual_template_tone"] = "muted"
 
         if current_step == "manual_entry" and manual_entry_mode == "new":
-            payload["route_text"] = "Wybrano utworzenie nowego runu recznej anotacji Z2 dla tej iteracji."
-            payload["action_text"] = "Kliknij Dalej, aby przejsc do wyboru obrazow i przygotowac nowy XML do recznej pracy."
+            payload["route_text"] = "Przygotujesz nowy ręczny run Z2 dla wybranego katalogu obrazów."
+            payload["action_text"] = "Kliknij Wybierz obrazy. Po wskazaniu folderu od razu przejdziesz do akcji Rozpocznij anotację."
             payload["manual_hint"] = (
-                "Nowy run zapisze sie jako osobny katalog w workspace Z2. "
-                f"Domyslny katalog runow Z2: {host._get_annotation_run_storage_display_path()}."
+                "Nowy run zapisze się jako osobny katalog w workspace Z2. "
+                f"Domyślny katalog runów Z2: {host._get_annotation_run_storage_display_path()}."
             )
             payload["manual_hint_tone"] = "muted"
             payload["manual_template_hint"] = ""
             payload["manual_template_tone"] = "muted"
+
+        if manual_entry_mode == "new" and gt_enabled:
+            gt_note = (
+                "GT znaków: WŁĄCZONE. current_work.alprgt zostanie utworzony albo otwarty "
+                "automatycznie po wskazaniu obrazów; tekst GT i układ 1R/2R uzupełnisz w kroku Korekta."
+            )
+            payload["manual_hint"] = (
+                f"{payload.manual_hint}\n\n{gt_note}"
+                if payload.manual_hint
+                else gt_note
+            )
+            payload["manual_hint_tone"] = "success"
 
     return payload

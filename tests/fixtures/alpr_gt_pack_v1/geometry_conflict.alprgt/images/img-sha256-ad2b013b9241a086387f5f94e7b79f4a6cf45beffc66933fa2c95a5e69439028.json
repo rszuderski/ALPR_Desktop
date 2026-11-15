@@ -1,0 +1,23 @@
+{
+  "aliases": [
+    "source_green.ppm"
+  ],
+  "blob_refs": [],
+  "height": 20,
+  "image_id": "img-sha256-ad2b013b9241a086387f5f94e7b79f4a6cf45beffc66933fa2c95a5e69439028",
+  "perceptual_dhash64s": [
+    "0000000000000000"
+  ],
+  "pixel_sha256s": [
+    "ffb603a97d071880e554cd90e420c38e31c8198009760bbaae5f9380829f13c3"
+  ],
+  "plate_ids": [
+    "plate-ann-fixture-geometry-conflict"
+  ],
+  "producers": [
+    "auto_annotation_tool"
+  ],
+  "schema": "alpr.gt.image.v1",
+  "source_file_sha256": "ad2b013b9241a086387f5f94e7b79f4a6cf45beffc66933fa2c95a5e69439028",
+  "width": 40
+}

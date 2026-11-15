@@ -464,15 +464,9 @@ def _build_ingest_plan_from_manifest_for_display(
             target_path_text = str((Path(target_dir) / name).resolve())
 
         source_path_text = str(item.get("source_path", "") or "").strip() or target_path_text
-        ground_truth_texts = list(item.get("ground_truth_texts", []) or [])
-        if not ground_truth_texts:
-            ground_truth_texts = planner.extract_true_texts_from_filename(name)
-
-        char_hist = item.get("char_histogram", {}) or {}
-        if not isinstance(char_hist, dict) or not char_hist:
-            char_hist = planner.build_char_histogram(ground_truth_texts)
-        if not char_hist:
-            continue
+        text_fields = planner.normalize_text_metadata(name, item)
+        ground_truth_texts = text_fields["ground_truth_texts"]
+        char_hist = text_fields["char_histogram"]
 
         selected_hist.update(char_hist)
         selected_items.append(
@@ -482,6 +476,7 @@ def _build_ingest_plan_from_manifest_for_display(
                 "source_key": str(item.get("source_key", "") or ""),
                 "target_path": target_path_text,
                 "ground_truth_texts": list(ground_truth_texts),
+                **text_fields,
                 "char_histogram": {ch: int(value) for ch, value in char_hist.items()},
                 "score": 0.0,
                 "score_details": {},
@@ -516,6 +511,7 @@ def _build_ingest_plan_from_manifest_for_display(
         "raw_total": selected_count,
         "candidates_total": selected_count,
         "selected_total": len(selected_items),
+        **planner.gt_statistics(selected_items),
         "new_to_project_total": int((manifest.get("proposal_summary") or {}).get("new_to_project_total", len(selected_items)) or len(selected_items)),
         "skipped_used": int((manifest.get("proposal_summary") or {}).get("skipped_used", 0) or 0),
         "skipped_duplicate_filenames": int((manifest.get("proposal_summary") or {}).get("skipped_duplicate_filenames", 0) or 0),
@@ -553,10 +549,9 @@ def _build_ingest_plan_from_iteration_dir_for_display(
 
     master_pool_dir = CAMPAIGN.get_master_pool_dir()
     for image_path in image_paths:
-        ground_truth_texts = planner.extract_true_texts_from_filename(image_path.name)
-        char_hist = planner.build_char_histogram(ground_truth_texts)
-        if not char_hist:
-            continue
+        text_fields = planner.normalize_text_metadata(image_path.name)
+        ground_truth_texts = text_fields["ground_truth_texts"]
+        char_hist = text_fields["char_histogram"]
 
         selected_hist.update(char_hist)
         try:
@@ -570,6 +565,7 @@ def _build_ingest_plan_from_iteration_dir_for_display(
                 "source_key": planner.make_source_key(image_path, master_pool_dir=master_pool_dir),
                 "target_path": source_path,
                 "ground_truth_texts": list(ground_truth_texts),
+                **text_fields,
                 "char_histogram": dict(char_hist),
                 "score": 0.0,
                 "score_details": {},
@@ -596,6 +592,7 @@ def _build_ingest_plan_from_iteration_dir_for_display(
         "raw_total": len(image_paths),
         "candidates_total": len(image_paths),
         "selected_total": len(selected_items),
+        **planner.gt_statistics(selected_items),
         "new_to_project_total": len(selected_items),
         "skipped_used": 0,
         "skipped_duplicate_filenames": 0,
@@ -1577,6 +1574,14 @@ def _finish_generated_ingest_plan(self, plan: dict, snapshot: dict | None = None
     except Exception:
         pass
 
+    # deferred_e1_artifact_sync_after_plan
+    # Synchronizuj kontrakt dopiero z gotowego planu. _collect_project_start_image_names
+    # pobierze wtedy 1000 nazw z pamięci zamiast ponownie skanować katalog na dysku.
+    try:
+        self._sync_iteration_artifact_registry_from_project_start()
+    except Exception as exc:
+        logger.debug(f"Nie udało się zsynchronizować kontraktu O po analizie planu E1: {exc}")
+
     try:
         self._refresh_project_start_assets_table_theme(self._get_step1_ingest_frame_bg())
     except Exception:
@@ -1588,16 +1593,16 @@ def _finish_generated_ingest_plan(self, plan: dict, snapshot: dict | None = None
             messagebox.showwarning(
                 "Brak nowych zdjęć do iteracji",
                 (
-                    f"Wybrany folder zawiera {raw_total} zdjęć, ale wszystkie zostały odrzucone jako duble po nazwie.\n\n"
-                    "Ten zestaw zdjęć nie wnosi nowych obrazów do projektu."
+                    f"Wybrany folder zawiera {raw_total} zdjęć, których nazwy są już używane w projekcie.\n\n"
+                    "Rozwiąż kolizje nazw lub wybierz inną pulę obrazów."
                 ),
             )
             return
         messagebox.showwarning(
             "Brak poprawnych pozycji w wybranym folderze zdjęć",
             (
-                "Nie znaleziono zdjęć z poprawnym ground truth w nazwie pliku.\n"
-                "Sprawdź nazewnictwo plików w głównej puli."
+                "Nie znaleziono dostępnych obrazów do dodania.\n"
+                "Sprawdź folder i obsługiwane rozszerzenia plików."
             ),
         )
         return
@@ -1607,9 +1612,11 @@ def _finish_generated_ingest_plan(self, plan: dict, snapshot: dict | None = None
         if raw_total != selected_total:
             status_text += f" Do planu E1 weszło {selected_total}."
         if skipped_duplicates > 0:
-            status_text += f" Pominięto {skipped_duplicates} dubli po nazwie."
-        if skipped_invalid > 0:
-            status_text += f" Pominięto {skipped_invalid} plików bez poprawnego GT w nazwie."
+            status_text += f" Kolizje nazw: {skipped_duplicates}."
+        gt_counts = CampaignIngestPlanner.gt_statistics(plan.get("selected") or [])
+        status_text += (f" Jawne numery: {gt_counts['explicit_gt_count']}; "
+                        f"bez numeru: {gt_counts['missing_explicit_gt_count']}; "
+                        f"podpowiedzi z nazw: {gt_counts['filename_hint_count']}.")
         self.app.update_status(status_text, "info")
     except Exception:
         pass
@@ -1858,10 +1865,9 @@ def _build_step1_source_reuse_plan(self, base_plan: dict | None = None) -> dict:
     selected_items = []
     skipped_invalid_gt = 0
     for image_path in image_paths:
-        gt_texts = planner.extract_true_texts_from_filename(image_path.name)
-        char_hist = planner.build_char_histogram(gt_texts)
-        if not gt_texts or not char_hist:
-            skipped_invalid_gt += 1
+        text_fields = planner.normalize_text_metadata(image_path.name)
+        gt_texts = text_fields["ground_truth_texts"]
+        char_hist = text_fields["char_histogram"]
         selected_hist.update(char_hist)
         try:
             source_path = str(image_path.resolve())
@@ -1873,6 +1879,7 @@ def _build_step1_source_reuse_plan(self, base_plan: dict | None = None) -> dict:
                 "source_path": source_path,
                 "source_key": planner.make_source_key(image_path, master_pool_dir=master_pool),
                 "ground_truth_texts": list(gt_texts or []),
+                **text_fields,
                 "char_histogram": dict(char_hist or {}),
                 "score": 0.0,
                 "score_details": {"source_reuse": True},
@@ -1896,6 +1903,7 @@ def _build_step1_source_reuse_plan(self, base_plan: dict | None = None) -> dict:
         "raw_total": raw_total,
         "candidates_total": raw_total,
         "selected_total": len(selected_items),
+        **planner.gt_statistics(selected_items),
         "new_to_project_total": source_new_total,
         "source_new_to_project_total": source_new_total,
         "skipped_used": 0,
@@ -1914,12 +1922,44 @@ def _build_step1_source_reuse_plan(self, base_plan: dict | None = None) -> dict:
     }
 
 def _ensure_current_ingest_plan_from_master_pool(self) -> bool:
+    try:
+        active_project = str(CAMPAIGN.get_active_project_name() or "").strip()
+        active_iteration = int(CAMPAIGN.get_current_iteration_num() or 1)
+    except Exception:
+        active_project = ""
+        active_iteration = 1
+
+    runtime_plan = self.current_ingest_plan if isinstance(self.current_ingest_plan, dict) else {}
+    try:
+        runtime_project = str(runtime_plan.get("project", "") or "").strip()
+        runtime_iteration = int(runtime_plan.get("iteration", 0) or 0)
+    except Exception:
+        runtime_project = ""
+        runtime_iteration = 0
+
+    runtime_matches_context = bool(
+        runtime_plan
+        and active_project
+        and runtime_project == active_project
+        and runtime_iteration == active_iteration
+    )
     if (
-        isinstance(self.current_ingest_plan, dict)
-        and int(self.current_ingest_plan.get("selected_total", 0) or 0) > 0
-        and self.current_ingest_plan.get("selected")
+        runtime_matches_context
+        and int(runtime_plan.get("selected_total", 0) or 0) > 0
+        and runtime_plan.get("selected")
     ):
         return True
+
+    if runtime_plan and not runtime_matches_context:
+        self.current_ingest_plan = {}
+        try:
+            self.ingest_plan_items = []
+        except Exception:
+            pass
+        try:
+            self._existing_iteration_ingest_plan_signature = None
+        except Exception:
+            pass
 
     plan = self._load_latest_ingest_plan_for_current_iteration()
     if isinstance(plan, dict) and int(plan.get("selected_total", 0) or 0) > 0 and plan.get("selected"):
@@ -2207,27 +2247,11 @@ def _apply_current_ingest_plan(self):
                 eyebrow="ZATWIERDZANIE E1",
                 initial_detail="Zapisuję manifest obrazów i aktualizuję graf kampanii.",
             )
-            try:
-                self._approve_current_iteration_package(
-                    target_iter_dir=target_iter_dir,
-                    source_dir=source_dir,
-                    selected_source_files=selected_images,
-                    selection_mode=selection_mode,
-                    progress_callback=lambda value, message="", **kwargs: _update_ingest_plan_progress_dialog(
-                        self,
-                        value,
-                        message,
-                        str(kwargs.get("detail", "") or ""),
-                    ),
-                )
-                _update_ingest_plan_progress_dialog(
-                    self,
-                    100,
-                    "E1 zatwierdzone.",
-                    "Manifest został zapisany, a graf odświeżony.",
-                )
-            finally:
-                _hide_ingest_plan_progress_dialog(self, delay_ms=650)
+            from .campaign_ingest_identity import approve_ingest_async
+            approve_ingest_async(self, target_iter_dir=target_iter_dir, source_dir=source_dir,
+                                 selected_source_files=selected_images, selection_mode=selection_mode,
+                                 selected_source_metadata=(manifest or {}).get("selected_images"))
+
         return
 
     selected_items = list(self.current_ingest_plan.get("selected", []) or [])
@@ -2310,57 +2334,18 @@ def _apply_current_ingest_plan(self):
             source_dir = selected_source_files[0].parent
     except Exception:
         source_dir = selected_source_files[0].parent
-    try:
-        self._approve_current_iteration_package(
-            target_iter_dir=target_iter_dir,
-            source_dir=source_dir,
-            selected_source_files=selected_source_files,
-            selection_mode=selection_mode,
-            selected_source_metadata=selected_items,
-            proposal_summary={
-                "planner_version": self.current_ingest_plan.get("planner_version", ""),
-                "generated_at": self.current_ingest_plan.get("generated_at", ""),
-                "source_total": self.current_ingest_plan.get("raw_total", 0),
-                "selected_total": self.current_ingest_plan.get("selected_total", 0),
-                "current_iteration_package_count": self.current_ingest_plan.get("selected_total", 0),
-                "batch_size": self.current_ingest_plan.get("batch_size", 0),
-                "skipped_duplicate_filenames": self.current_ingest_plan.get("skipped_duplicate_filenames", self.current_ingest_plan.get("skipped_used", 0)),
-                "skipped_duplicate_approved_filenames": self.current_ingest_plan.get("skipped_duplicate_approved_filenames", 0),
-                "project_overlap_filenames": self.current_ingest_plan.get("project_overlap_filenames", 0),
-                "new_to_project_count": self.current_ingest_plan.get("new_to_project_total", 0),
-                "skipped_invalid_ground_truth": self.current_ingest_plan.get("skipped_invalid_ground_truth", 0),
-            },
-            progress_callback=lambda value, message="", **kwargs: _update_ingest_plan_progress_dialog(
-                self,
-                value,
-                message,
-                str(kwargs.get("detail", "") or ""),
-            ),
-        )
-        _update_ingest_plan_progress_dialog(
-            self,
-            100,
-            "E1 zatwierdzone.",
-            "Manifest został zapisany, a graf odświeżony.",
-        )
-    finally:
-        _hide_ingest_plan_progress_dialog(self)
-
-    try:
-        self.app.update_status(
-            f"Zatwierdzono E1 manifestem: {len(selected_source_files)} zdjęć z wybranego katalogu. Odblokowano Krok 2.",
-            "info",
-        )
-    except Exception:
-        pass
-
-    adoption_scope_notice = self._format_step1_adopted_annotations_z2_scope_notice(selected_source_files)
-    messagebox.showinfo(
-        "E1 zatwierdzone",
-        f"Zapisano manifest iteracji {iter_num:03d}: {len(selected_source_files)} zdjęć.\n\n"
-        "Zdjęcia nie są kopiowane do kolejnej iteracji. Program będzie korzystał z wybranego katalogu źródłowego."
-        f"{adoption_scope_notice}",
+    from .campaign_ingest_identity import approve_ingest_async
+    return approve_ingest_async(
+        self, target_iter_dir=target_iter_dir, source_dir=source_dir,
+        selected_source_files=selected_source_files, selection_mode=selection_mode,
+        selected_source_metadata=selected_items,
+        proposal_summary={
+            "planner_version": self.current_ingest_plan.get("planner_version", ""),
+            "source_total": self.current_ingest_plan.get("raw_total", 0),
+            "selected_total": len(selected_source_files),
+        },
     )
+
 
 def _format_step1_selection_mode_label(selection_mode: str) -> str:
     normalized = str(selection_mode or "").strip().lower()

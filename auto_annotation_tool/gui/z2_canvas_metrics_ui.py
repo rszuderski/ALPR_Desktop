@@ -61,11 +61,14 @@ def render_preview_metrics_table(
 ) -> None:
     if body is None:
         return
-    for child in list(body.winfo_children()):
-        try:
+    widgets = getattr(body, "_z2_metric_rows", None)
+    if widgets is None or not all(row.winfo_exists() for row, _key, _value in widgets):
+        widgets = []
+        for child in list(body.winfo_children()):
             child.destroy()
-        except Exception:
-            pass
+    while len(widgets) > len(rows):
+        row, _key, _value = widgets.pop()
+        row.destroy()
 
     fill = str(colors.get("fill", "#101419"))
     row_fill = str(colors.get("row_fill", fill))
@@ -79,21 +82,6 @@ def render_preview_metrics_table(
 
     for idx, (label_text, value_text, tone) in enumerate(rows):
         row_bg = row_fill if idx % 2 == 0 else row_alt
-        row = tk.Frame(body, bg=row_bg, bd=0, highlightthickness=1, highlightbackground=outline)
-        row.pack(fill=tk.X, padx=6, pady=(0 if idx == 0 else 2, 2))
-        key = tk.Label(
-            row,
-            text=str(label_text or ""),
-            bg=row_bg,
-            fg=muted,
-            anchor="w",
-            justify=tk.LEFT,
-            font=("Segoe UI", 8),
-            width=13,
-            padx=6,
-            pady=3,
-        )
-        key.pack(side=tk.LEFT, fill=tk.Y)
         tone_key = str(tone or "").strip().lower()
         if tone_key == "warning":
             value_fg = warning
@@ -103,16 +91,21 @@ def render_preview_metrics_table(
             value_fg = error
         else:
             value_fg = text_fill
-        value = tk.Label(
-            row,
-            text=str(value_text or ""),
-            bg=row_bg,
-            fg=value_fg,
-            anchor="w",
-            justify=tk.LEFT,
-            font=("Segoe UI Semibold", 8),
-            padx=6,
-            pady=3,
-            wraplength=260,
-        )
-        value.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        if idx >= len(widgets):
+            row = tk.Frame(body, bd=0, highlightthickness=1)
+            row.pack(fill=tk.X, padx=6, pady=(0 if idx == 0 else 2, 2))
+            key = tk.Label(row, anchor="w", justify=tk.LEFT, font=("Segoe UI", 8),
+                           width=13, padx=6, pady=3)
+            key.pack(side=tk.LEFT, fill=tk.Y)
+            value = tk.Label(row, anchor="w", justify=tk.LEFT, font=("Segoe UI Semibold", 8),
+                             padx=6, pady=3, wraplength=260)
+            value.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            widgets.append((row, key, value))
+        row, key, value = widgets[idx]
+        signature = (str(label_text or ""), str(value_text or ""), row_bg, outline, muted, value_fg)
+        if getattr(row, "_z2_metric_signature", None) != signature:
+            row.configure(bg=row_bg, highlightbackground=outline)
+            key.configure(text=signature[0], bg=row_bg, fg=muted)
+            value.configure(text=signature[1], bg=row_bg, fg=value_fg)
+            row._z2_metric_signature = signature
+    body._z2_metric_rows = widgets
