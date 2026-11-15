@@ -62,7 +62,7 @@ class VehicleAnnotator(BaseAnnotator):
     
     def process_image(self, image_path: Path) -> ImageAnnotation:
         """Wykrywa pojazdy na obrazie."""
-        width, height = get_image_size(image_path)
+        width, height = 0, 0
         
         annotation = ImageAnnotation(
             filename=image_path.name,
@@ -77,6 +77,8 @@ class VehicleAnnotator(BaseAnnotator):
                     image_path,
                     self._describe_image_read_error(image_path),
                 )
+            width, height = self._model_input_size(image_path, image_source)
+            annotation.width, annotation.height = width, height
             if image_source is True:
                 image_source = str(image_path)
 

@@ -115,8 +115,9 @@ def test_pool_scan_preserves_order_keys_exclusions_and_counts(tmp_path):
                 if p.is_file() and p.suffix.lower() in planner.image_extensions]
     assert list(planner._pool_images(tmp_path)) == expected
     result = planner.plan_from_master_pool(tmp_path, used_filenames=["AB1234_001.jpg"], batch_size=0)
-    assert result["selected_total"] == 2 and result["skipped_used"] == 1
-    assert result["skipped_invalid_ground_truth"] == 1
+    assert result["selected_total"] == 3 and result["skipped_used"] == 1
+    assert result["skipped_invalid_ground_truth"] == 0
+    assert result["missing_explicit_gt_count"] == 3
 
 
 def test_iteration_finish_resets_hidden_z2_and_renders_new_graph_once(monkeypatch):

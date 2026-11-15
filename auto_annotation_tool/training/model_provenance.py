@@ -35,8 +35,11 @@ _SIDE_CAR_NAMES = (
     "metadata.json",
 )
 _DATASET_MANIFEST_NAMES = (
+    "split_assignment_manifest.json",
     "training_variant_manifest.json",
+    "mz_training_variant_manifest.json",
     "dataset_manifest.json",
+    "metadata_manifest.json",
     "augmentation_manifest.json",
     "stage_manifest.json",
     "manifest.json",
@@ -226,6 +229,9 @@ def build_model_training_provenance(
         "base_model": str(_value(run, "base_model", "") or ""),
         "img_size": _int_or_none(_value(run, "img_size")),
         "batch_size": _int_or_none(_value(run, "batch_size")),
+        "experiment_id": str(_value(run, "experiment_id", "") or ""),
+        "strict_experiment": bool(_value(run, "strict_experiment", False)),
+        "training_protocol_snapshot": _mapping_copy(_value(run, "training_protocol_snapshot")),
         "started_at": str(_value(run, "started_at", "") or ""),
         "finished_at": str(_value(run, "finished_at", "") or ""),
         "created_at": str(_value(run, "created_at", "") or ""),
@@ -258,6 +264,7 @@ def build_dataset_training_provenance(
     data_yaml_sha = _file_sha256(yaml_path)
     manifests = _dataset_manifest_refs(root)
     manifest_sha = _json_sha256(manifests) if manifests else ""
+    semantic_manifest = _dataset_semantic_manifest_summary(root)
     split_sha = ""
     split_file_count = 0
     if include_content_fingerprint:
@@ -292,6 +299,42 @@ def build_dataset_training_provenance(
             "offline_augmentation_train_added": int(augmentation_meta.get("offline_augmentation_train_added", 0) or 0),
             "split_seed": augmentation_meta.get("split_seed"),
             "manifests": manifests,
+            "source_manifest_name": str(
+                semantic_manifest.get("source_manifest_name") or ""
+            ),
+            "source_sample_provenance_schema": str(
+                semantic_manifest.get(
+                    "source_sample_provenance_schema"
+                )
+                or ""
+            ),
+            "source_sample_provenance_counts": dict(
+                semantic_manifest.get(
+                    "source_sample_provenance_counts"
+                )
+                or {}
+            ),
+            "source_raw_benchmark": dict(
+                semantic_manifest.get("source_raw_benchmark") or {}
+            ),
+            "source_gt_contract_fingerprint_sha256": str(
+                semantic_manifest.get(
+                    "source_gt_contract_fingerprint_sha256"
+                )
+                or ""
+            ),
+            "source_gt_revision_ids": list(
+                semantic_manifest.get(
+                    "source_gt_revision_ids"
+                )
+                or []
+            ),
+            "source_geometry_revision_ids": list(
+                semantic_manifest.get(
+                    "source_geometry_revision_ids"
+                )
+                or []
+            ),
             "local_path_hint": str(root),
             "data_yaml": str(yaml_path) if yaml_path.exists() else "",
             "dataset_id_strategy": "composite_v2",
@@ -318,6 +361,14 @@ def build_training_dataset_snapshot(
     snapshot.setdefault("schema", "alpr.training_dataset_snapshot.v1")
     snapshot.setdefault("captured_at", _utc_now_iso())
     snapshot.setdefault("snapshot_source", "frozen_at_training_start")
+    from .source_inventory import SNAPSHOT_KEY, build_source_inventory
+
+    if dataset_path:
+        snapshot[SNAPSHOT_KEY] = build_source_inventory(
+            dataset_path,
+            role={"char": "character", "car": "vehicle"}.get(snapshot.get("target"), snapshot.get("target")),
+            dataset_id=snapshot.get("dataset_id", ""),
+        )
     return _json_safe(snapshot)
 
 
@@ -398,6 +449,7 @@ def build_output_checkpoint_training_snapshot(
     last_checkpoint: Path | str | None = None,
     best_epoch: int | None = None,
     best_epoch_source: str = "",
+    inspect_checkpoint_epoch: bool = True,
 ) -> dict[str, Any]:
     """Freeze output checkpoint hashes after training finishes."""
 
@@ -405,7 +457,11 @@ def build_output_checkpoint_training_snapshot(
     last_snapshot = build_checkpoint_training_snapshot(last_checkpoint, name="last.pt", kind="last_checkpoint")
     best_sha = str(best_snapshot.get("sha256") or "")
     last_sha = str(last_snapshot.get("sha256") or "")
-    checkpoint_best_epoch = _checkpoint_completed_epoch(best_checkpoint)
+    checkpoint_best_epoch = (
+        _checkpoint_completed_epoch(best_checkpoint)
+        if inspect_checkpoint_epoch
+        else None
+    )
     resolved_best_epoch = checkpoint_best_epoch if checkpoint_best_epoch is not None else _int_or_none(best_epoch)
     resolved_best_epoch_source = "checkpoint" if checkpoint_best_epoch is not None else str(best_epoch_source or "").strip()
     if not resolved_best_epoch_source:
@@ -1229,6 +1285,94 @@ def _count_images_in_source(source: Path) -> int:
     return 0
 
 
+def _dataset_semantic_manifest_summary(root: Path) -> dict[str, Any]:
+    for name in ("metadata_manifest.json", "manifest.json"):
+        path = root / name
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+
+        provenance_schema = str(
+            payload.get("provenance_schema") or ""
+        ).strip()
+        provenance_counts = payload.get("provenance_counts")
+        raw_benchmark = payload.get("raw_benchmark")
+        if (
+            not provenance_schema
+            and not isinstance(provenance_counts, Mapping)
+            and not isinstance(raw_benchmark, Mapping)
+        ):
+            continue
+
+        benchmark = (
+            dict(raw_benchmark)
+            if isinstance(raw_benchmark, Mapping)
+            else {}
+        )
+        def _safe_revision_ids(value) -> list[str]:
+            if not isinstance(value, (list, tuple, set)):
+                return []
+            return sorted(
+                {
+                    str(item or "").strip()
+                    for item in value
+                    if str(item or "").strip()
+                }
+            )
+
+        def _safe_revision_ids(value) -> list[str]:
+            if not isinstance(value, (list, tuple, set)):
+                return []
+            return sorted(
+                {
+                    str(item or "").strip()
+                    for item in value
+                    if str(item or "").strip()
+                }
+            )
+
+        return {
+            "source_manifest_name": name,
+            "source_sample_provenance_schema": provenance_schema,
+            "source_sample_provenance_counts": (
+                {
+                    str(key): int(value or 0)
+                    for key, value in dict(provenance_counts or {}).items()
+                }
+                if isinstance(provenance_counts, Mapping)
+                else {}
+            ),
+            "source_raw_benchmark": benchmark,
+            "source_gt_contract_fingerprint_sha256": str(
+                payload.get("gt_contract_fingerprint_sha256")
+                or benchmark.get(
+                    "gt_contract_fingerprint_sha256"
+                )
+                or ""
+            ).strip(),
+            "source_gt_revision_ids": _safe_revision_ids(
+                payload.get("gt_revision_ids")
+            ),
+            "source_geometry_revision_ids": _safe_revision_ids(
+                payload.get("geometry_revision_ids")
+            ),
+        }
+    return {
+        "source_manifest_name": "",
+        "source_sample_provenance_schema": "",
+        "source_sample_provenance_counts": {},
+        "source_raw_benchmark": {},
+        "source_gt_contract_fingerprint_sha256": "",
+        "source_gt_revision_ids": [],
+        "source_geometry_revision_ids": [],
+    }
+
+
 def _dataset_manifest_refs(root: Path) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     for name in _DATASET_MANIFEST_NAMES:
@@ -1451,6 +1595,10 @@ def _run_like_dict(run_like: Any) -> dict[str, Any]:
         "dataset_preparation",
         "input_checkpoint_snapshot",
         "output_checkpoint_snapshot",
+        "strict_experiment",
+        "experiment_id",
+        "training_protocol_requested",
+        "training_protocol_snapshot",
     ):
         try:
             value = getattr(run_like, key)

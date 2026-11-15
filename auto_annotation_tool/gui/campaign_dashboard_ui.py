@@ -67,6 +67,7 @@ from . import campaign_stage_logic
 from . import campaign_navigation
 from . import campaign_iteration_flow
 from . import campaign_graph_actions
+from .campaign_gate_fields import gate_field_copy, field_layout, draw_field, text_height
 from .dataset_display import build_dataset_display_ref
 from .model_display import build_model_display_ref
 from .run_display import build_run_display_ref
@@ -2883,12 +2884,19 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
         plates_count = 0
         if run_dir is not None:
             try:
-                annotation_tab = getattr(self.app, "tabs", {}).get("annotation")
-                counter = getattr(annotation_tab, "_get_run_plate_annotation_counts", None)
-                if callable(counter):
-                    images_count, plates_count = counter(run_dir)
+                xml_summary = campaign_step1_assets._scan_project_start_plate_xml_summary(self, run_dir)
+                images_count = int(xml_summary.get("plate_images", 0) or 0)
+                plates_count = int(xml_summary.get("plate_count", 0) or 0)
             except Exception:
                 images_count, plates_count = 0, 0
+            if images_count <= 0 and plates_count <= 0:
+                try:
+                    annotation_tab = getattr(self.app, "tabs", {}).get("annotation")
+                    counter = getattr(annotation_tab, "_get_run_plate_annotation_counts", None)
+                    if callable(counter):
+                        images_count, plates_count = counter(run_dir)
+                except Exception:
+                    images_count, plates_count = 0, 0
 
         try:
             image_source = dict(self._get_project_start_effective_images_source() or {})
@@ -4175,6 +4183,53 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             session_substep = str(session.get("substep") or session.get("target_substep") or "").strip().lower()
             session_targets_pz2 = session_substep in {"2", "detect", "pz2", "z3_pz2"}
             session_targets_pz3 = session_substep in {"3", "dataset", "pz3", "z3_pz3"}
+
+            # Samonaprawa starszego stanu zapisanego już jako interrupted:
+            # jeśli PZ2 jest rozliczone, realnym następnym krokiem jest PZ3.
+            if (
+                pz2_contract_ready
+                and not pz3_export_ready_current
+                and session_gate_id in CHAR_WORK_GATE_SESSION_IDS
+                and session_work_area == "z3"
+                and session_targets_pz2
+                and session_state == "interrupted"
+                and str(session.get("reason") or "").strip().lower()
+                == "app_closed_from_z3"
+            ):
+                now = datetime.now().isoformat(timespec="seconds")
+                previous_interrupted_at = str(
+                    session.get("interrupted_at") or ""
+                ).strip()
+                session.update(
+                    {
+                        "active": False,
+                        "state": "ready_for_pz3",
+                        "working_gate_id": CHAR_WORK_GATE_DISPLAY_ID,
+                        "reason": "restore_after_app_close_pz2_ready",
+                        "interrupted_at": "",
+                        "closed_at": now,
+                        "updated_at": now,
+                    }
+                )
+                if previous_interrupted_at:
+                    session.setdefault(
+                        "resolved_interrupted_at",
+                        previous_interrupted_at,
+                    )
+                try:
+                    CAMPAIGN.upsert_iteration_state(
+                        updates={"t06_work_session": session}
+                    )
+                    CAMPAIGN.invalidate_step3_char_source_state_cache()
+                    CAMPAIGN.clear_project_iteration_ui_snapshots()
+                except Exception as exc:
+                    logger.debug(
+                        "Nie udało się znormalizować sesji T05 po "
+                        f"zakończonym PZ2: {exc}"
+                    )
+                _t06_interrupted_work_cache = {}
+                return {}
+
             controlled_pz2_return = bool(
                 session_gate_id in CHAR_WORK_GATE_SESSION_IDS
                 and session_work_area == "z3"
@@ -4471,7 +4526,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     fallback_label=campaign_resource_label(row_key),
                     fallback_requirement="optional",
                     fallback_validation=(
-                        "Opcjonalne | import anotacji znaków jest zasobem planowanym."
+                        "Opcjonalne | stan AZ jest odczytywany z registry projektu."
                         if row_key == "char_run" and row is None
                         else "Brak"
                     ),
@@ -4659,6 +4714,16 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             approved_min_plates = 10
         approved_missing = max(0, int(approved_min_plates) - int(approved_plates))
         approved_ready = bool(approved_plates >= approved_min_plates)
+        try:
+            from .z2_gt_readiness import build_char_gt_readiness
+            annotation_tab = getattr(self.app, "tabs", {}).get("annotation")
+            gt_summary = build_char_gt_readiness(
+                annotation_tab, run_dir=getattr(annotation_tab, "current_annotation_run_dir", None)
+            )
+        except Exception:
+            gt_summary = {}
+        approved_gt_count = min(approved_plates, int(gt_summary.get("gt_plates", 0) or 0))
+        missing_text_count = max(0, approved_plates - approved_gt_count)
         approved_source_parts = []
         if project_approved_images > 0 or project_approved_plates > 0:
             approved_source_parts.append(
@@ -4685,7 +4750,8 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             label=campaign_resource_label("approved_plates"),
             requirement="required",
             source=(" + ".join(approved_source_parts) if approved_source_parts else "Nie wskazano"),
-            validation=approved_validation,
+            validation=(approved_validation + f" Numery dostępne: {approved_gt_count}. "
+                        f"Numery do utworzenia w Z3: {missing_text_count}."),
             tone=("success" if approved_ready else "warning"),
             counter_text=str(approved_plates) if approved_plates > 0 else "",
             description="Anotacje tablic zatwierdzone statusem [OK].",
@@ -4694,6 +4760,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 "contract_ready": bool(approved_ready),
                 "approved_images": int(approved_images or 0),
                 "approved_plates": int(approved_plates or 0),
+                "plate_geometry_count": int(approved_plates or 0),
+                "plate_gt_present_count": approved_gt_count,
+                "plate_gt_missing_count": missing_text_count,
                 "min_plates": int(min_plates or 10),
             },
         )
@@ -5716,6 +5785,11 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
         except Exception:
             pending_t06 = {}
         if pending_t06:
+            # Gotowy eksport PZ3 zamyka wymaganą pracę T05. Ewentualny
+            # przerwany PZ2 pozostaje widoczny tylko jako opcjonalny szkic
+            # w modalu pracy, nie jako stan całej bramki na grafie.
+            if bool(pending_t06.get("valid_export_exists")):
+                return "WYKONANE"
             work_area = str(pending_t06.get("work_area") or pending_t06.get("interrupted_kind") or "").strip().lower()
             try:
                 session = dict(pending_t06.get("t06_work_session") or {})
@@ -5746,7 +5820,8 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             gate = {}
         ready_dataset = str(gate.get("ready_dataset") or gate.get("dataset_hint") or "").strip()
         if bool(gate.get("ok")) and ready_dataset:
-            return _edge_current_iteration_work_status(edge)
+            current_work_status = _edge_current_iteration_work_status(edge)
+            return current_work_status or "WYKONANE"
 
         try:
             current_iter = int(current_iteration or CAMPAIGN.get_current_iteration_num() or 1)
@@ -7609,11 +7684,11 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
         dialog = tk.Toplevel(self.frame)
         dialog._campaign_graph_dialog = True
         try:
-            self.app.style_dialog_window(dialog, title=f"Praca {display_gate_id}", geometry="700x680", parent=self.frame)
+            self.app.style_dialog_window(dialog, title=f"Praca {display_gate_id}", geometry="840x720", parent=self.frame)
         except Exception:
             dialog.title(f"Praca {display_gate_id}")
         try:
-            dialog.minsize(680, 640)
+            dialog.minsize(800, 680)
         except Exception:
             pass
         build_surface = getattr(self.app, "_build_themed_dialog_surface", None)
@@ -7803,7 +7878,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "title": "DO ROZLICZENIA",
                     "detail": f"{pending_repair_images} zdjęć [OK] czeka na pulę YOLO",
                     "tone": warning,
-                    "mark_tone": error,
+                    "mark_tone": warning,
                     "fill": 0.16,
                 }
             if is_repair_resume:
@@ -7812,7 +7887,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "title": "PRZERWANE",
                     "detail": "wróć do Z2 albo rozlicz [OK]",
                     "tone": warning,
-                    "mark_tone": error,
+                    "mark_tone": warning,
                     "fill": 0.14,
                 }
             is_dataset_variant_action = bool(
@@ -7827,7 +7902,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         "title": "PRZERWANE: KROK 1",
                         "detail": "wróć do PZ1 i domknij wariant",
                         "tone": warning,
-                        "mark_tone": error,
+                        "mark_tone": warning,
                         "fill": 0.13,
                     }
                 if _t07_has_current_iteration_dataset():
@@ -7844,7 +7919,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         "mark": "→",
                         "title": "ŹRÓDŁO GOTOWE",
                         "detail": "utwórz wariant train/val/test",
-                        "tone": success if is_recommended else muted,
+                        "tone": warning if is_recommended else muted,
                         "fill": 0.10 if is_recommended else 0.055,
                     }
                 return {
@@ -7861,7 +7936,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         "title": "PRZERWANE: KROK 2",
                         "detail": "wróć do PZ2 i domknij trening",
                         "tone": warning,
-                        "mark_tone": error,
+                        "mark_tone": warning,
                         "fill": 0.13,
                     }
                 finish_state = _current_t07_training_finish_state()
@@ -7902,7 +7977,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         "mark": "→" if is_recommended else "○",
                         "title": "GOTOWE DO STARTU" if is_recommended else "CZEKA NA START",
                         "detail": "wariant tej iteracji jest dostępny",
-                        "tone": success if is_recommended else muted,
+                        "tone": warning if is_recommended else muted,
                         "fill": 0.10 if is_recommended else 0.045,
                     }
                 return {
@@ -7959,7 +8034,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             text=f"Praca bramki {display_gate_id}",
             fg=fg,
             bg=body_bg,
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             anchor="w",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(
@@ -7967,7 +8042,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             text=display_gate_id,
             fg=palette["accent_text"],
             bg=blend_hex_colors(success, field_bg, 0.25),
-            font=("Segoe UI", 8, "bold"),
+            font=("Segoe UI", 9, "bold"),
             padx=10,
             pady=4,
         ).pack(side=tk.RIGHT)
@@ -7977,16 +8052,17 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             text="Wybierz akcję, która ma otworzyć bramkę.",
             fg=muted,
             bg=body_bg,
+            font=("Segoe UI", 10),
             justify=tk.LEFT,
             anchor="w",
-            wraplength=500,
+            wraplength=680,
         ).pack(fill=tk.X, padx=16, pady=(0, 6))
         tk.Label(
             body,
             text=campaign_ui_helpers._repair_polish_text(recommendation_text),
-            fg=success if recommended_label else muted,
-            bg=blend_hex_colors(body_bg, success, 0.09) if recommended_label else body_bg,
-            font=("Segoe UI", 9, "bold"),
+            fg=warning if recommended_label else muted,
+            bg=blend_hex_colors(body_bg, warning, 0.09) if recommended_label else body_bg,
+            font=("Segoe UI", 10, "bold"),
             anchor="w",
             padx=10,
             pady=5,
@@ -8063,8 +8139,8 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 *list(buttons or []),
             ]
 
-        suggestion_frame_width = 286
-        suggestion_detail_wrap = 226
+        suggestion_frame_width = 340
+        suggestion_detail_wrap = 280
 
         for index, (label, command, tone) in enumerate(buttons, start=1):
             normalized_label = campaign_ui_helpers._repair_polish_text(str(label or "").strip())
@@ -8105,7 +8181,19 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 disabled_reason = str(repair_material_state.get("reason") or "Brak materiału do uzupełnienia anotacji tablic")
                 is_recommended = False
             is_enabled = not disabled_reason
-            tone_color = success if str(tone or "").strip() != "warning" else warning
+            semantic_state = (
+                "blocked"
+                if not is_enabled
+                else (
+                    "attention"
+                    if (is_repair_resume or is_repair_settlement)
+                    else ("current" if is_recommended else "neutral")
+                )
+            )
+            tone_color = campaign_ui_helpers.campaign_workflow_semantic_color(
+                palette,
+                semantic_state,
+            )
             if is_repair_resume or is_repair_settlement:
                 tone_color = warning
             row_bg = blend_hex_colors(field_bg, tone_color, 0.075 if is_recommended else 0.035)
@@ -8138,7 +8226,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 font=("Segoe UI", 10, "bold"),
                 anchor="w",
                 justify=tk.LEFT,
-                wraplength=245,
+                wraplength=310,
             ).grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=7)
             status = _t07_action_status(
                 normalized_label,
@@ -8175,7 +8263,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=str(status.get("mark") or "○"),
                 fg=mark_fg,
                 bg=mark_bg,
-                font=("Segoe UI Semibold", 8),
+                font=("Segoe UI Semibold", 9),
                 anchor="center",
                 padx=0,
                 pady=0,
@@ -8185,7 +8273,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=campaign_ui_helpers._repair_polish_text(str(status.get("title") or "")),
                 fg=status_tone if is_enabled else muted,
                 bg=status_bg,
-                font=("Segoe UI Semibold", 7),
+                font=("Segoe UI Semibold", 9),
                 anchor="w",
                 justify=tk.LEFT,
                 wraplength=suggestion_detail_wrap,
@@ -8195,7 +8283,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=_format_gate_work_suggestion_text(status.get("detail")),
                 fg=fg if is_enabled else muted,
                 bg=status_bg,
-                font=("Segoe UI", 7),
+                font=("Segoe UI", 9),
                 anchor="w",
                 wraplength=suggestion_detail_wrap,
                 justify=tk.LEFT,
@@ -8208,6 +8296,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 bg=btn_bg,
                 fg=fg if is_enabled else muted,
                 relief=tk.FLAT,
+                font=("Segoe UI", 10, "bold"),
                 padx=12,
                 pady=5,
                 width=10,
@@ -8224,6 +8313,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             bg=field_bg,
             fg=fg,
             relief=tk.FLAT,
+            font=("Segoe UI", 10),
             padx=12,
             pady=6,
         ).pack(side=tk.RIGHT)
@@ -8234,8 +8324,8 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             pass
 
     def _open_t06_actions_modal(_body_text: str, buttons: list[tuple[str, object, str]]) -> None:
-        modal_width = 760
-        modal_height = 520
+        modal_width = 940
+        modal_height = 620
         modal_content_wrap = modal_width - 104
         dialog = tk.Toplevel(self.frame)
         dialog._campaign_graph_dialog = True
@@ -8249,7 +8339,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
         except Exception:
             dialog.title(f"Praca {CHAR_WORK_GATE_DISPLAY_ID}")
         try:
-            dialog.minsize(720, 500)
+            dialog.minsize(900, 590)
         except Exception:
             pass
         build_surface = getattr(self.app, "_build_themed_dialog_surface", None)
@@ -8805,7 +8895,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             text=f"Praca bramki {CHAR_WORK_GATE_DISPLAY_ID}",
             fg=fg,
             bg=body_bg,
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             anchor="w",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(
@@ -8813,7 +8903,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             text=CHAR_WORK_GATE_DISPLAY_ID,
             fg=palette["accent_text"],
             bg=blend_hex_colors(success, field_bg, 0.25),
-            font=("Segoe UI", 8, "bold"),
+            font=("Segoe UI", 9, "bold"),
             padx=10,
             pady=4,
         ).pack(side=tk.RIGHT)
@@ -8853,7 +8943,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             text=campaign_ui_helpers._repair_polish_text(intro),
             fg=warning if pending_work else muted,
             bg=blend_hex_colors(body_bg, warning, 0.08) if pending_work else body_bg,
-            font=("Segoe UI", 9, "bold" if pending_work else "normal"),
+            font=("Segoe UI", 10, "bold" if pending_work else "normal"),
             justify=tk.LEFT,
             anchor="w",
             wraplength=modal_content_wrap,
@@ -8864,9 +8954,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
         tk.Label(
             body,
             text=campaign_ui_helpers._repair_polish_text(recommendation_text),
-            fg=success if recommended_label else muted,
-            bg=blend_hex_colors(body_bg, success, 0.09) if recommended_label else body_bg,
-            font=("Segoe UI", 9, "bold"),
+            fg=warning if recommended_label else muted,
+            bg=blend_hex_colors(body_bg, warning, 0.09) if recommended_label else body_bg,
+            font=("Segoe UI", 10, "bold"),
             anchor="w",
             justify=tk.LEFT,
             wraplength=modal_content_wrap,
@@ -8904,7 +8994,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "title": "SZKIC: PZ2 PRZERWANE",
                     "detail": "gotowy eksport AZ nadal obowiązuje",
                     "tone": warning,
-                    "mark_tone": error,
+                    "mark_tone": warning,
                     "fill": 0.14,
                 }
             if _t06_pz2_draft_after_ready_export() and is_z3_action:
@@ -8921,7 +9011,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "title": "CEL: WZNÓW PZ2",
                     "detail": "dokończ ramki i etykiety znaków",
                     "tone": warning,
-                    "mark_tone": error,
+                    "mark_tone": warning,
                     "fill": 0.16,
                 }
             if pending_z3_work and _t06_pending_z3_targets_pz3() and is_char_pz2:
@@ -8939,7 +9029,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "title": "CEL: WZNÓW PZ3",
                     "detail": "brak eksportu AZ z PZ3" if interrupted_detail else "dokończ i wyeksportuj dataset AZ",
                     "tone": warning,
-                    "mark_tone": error,
+                    "mark_tone": warning,
                     "fill": 0.16,
                 }
             if pending_z3_work and _t06_pending_z3_targets_pz2() and is_z3_action:
@@ -8964,7 +9054,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "title": "CEL: ROZLICZ [OK]",
                     "detail": f"{pending_images} zdjęć / {pending_plates} tablic do źródła Z3",
                     "tone": warning,
-                    "mark_tone": error,
+                    "mark_tone": warning,
                     "fill": 0.16,
                 }
             if pending_ok_work and (is_z3_action or is_char_pz2):
@@ -8972,7 +9062,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "mark": "+",
                     "title": "CEL: UŻYJ [OK]",
                     "detail": f"+{pending_images} [OK] zasili źródło Z3",
-                    "tone": success,
+                    "tone": warning,
                     "fill": 0.12,
                 }
             if pending_ok_work and not is_resume:
@@ -9000,7 +9090,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "mark": "1",
                     "title": "KROK 1: ANOTACJE ZNAKÓW",
                     "detail": "uzupełnij ramki i etykiety znaków",
-                    "tone": success,
+                    "tone": warning,
                     "fill": 0.12,
                 }
             if is_z3_action and pz3_ready:
@@ -9029,7 +9119,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "mark": "2",
                     "title": "KROK 2: DATASET ZNAKÓW",
                     "detail": "utwórz i wyeksportuj AZ w PZ3",
-                    "tone": success,
+                    "tone": warning,
                     "fill": 0.12,
                 }
             if is_z3_action:
@@ -9045,7 +9135,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "mark": "+",
                     "title": "PULA DOSTĘPNA",
                     "detail": f"{pool_images} [OK] / {pool_plates} tablic jest już w źródle Z3",
-                    "tone": success,
+                    "tone": warning if is_recommended else muted,
                     "fill": 0.12,
                 }
             if "dataset" in label_lower:
@@ -9053,7 +9143,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "mark": "→",
                     "title": "CEL: DATASET ZNAKÓW",
                     "detail": "utwórz zbiór po wyodrębnieniu i detekcji",
-                    "tone": success,
+                    "tone": warning if is_recommended else muted,
                     "fill": 0.10,
                 }
             if "z3" in label_lower or "detek" in label_lower or "wyodr" in label_lower:
@@ -9061,7 +9151,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "mark": "→",
                     "title": "CEL: PRACA W Z3",
                     "detail": "wyodrębnij tablice i przygotuj znaki",
-                    "tone": success,
+                    "tone": warning if is_recommended else muted,
                     "fill": 0.10,
                 }
             if is_recommended:
@@ -9069,7 +9159,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     "mark": "→",
                     "title": "ZALECANE",
                     "detail": "najbardziej naturalny następny krok",
-                    "tone": success,
+                    "tone": warning,
                     "fill": 0.12,
                 }
             if is_resume:
@@ -9107,9 +9197,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             if disabled_reason:
                 return _badge(f"NIEDOSTĘPNE IT{current_iter}", muted, fill=0.07)
             if pending_z3_work and _t06_pending_z3_targets_pz2() and is_char_pz2:
-                return _badge(f"PRZERWANE IT{current_iter}", error, fill=0.18)
+                return _badge(f"PRZERWANE IT{current_iter}", warning, fill=0.16)
             if pending_z3_work and _t06_pending_z3_targets_pz3() and is_z3_action:
-                return _badge(f"PRZERWANE IT{current_iter}", error, fill=0.18)
+                return _badge(f"PRZERWANE IT{current_iter}", warning, fill=0.16)
             if pending_ok_work and is_resume:
                 return _badge(f"DO ROZLICZENIA IT{current_iter}", warning, fill=0.16)
             if pending_ok_work and (is_char_pz2 or is_z3_action):
@@ -9118,12 +9208,12 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 return _badge(f"WYKONANE IT{current_iter}", success, fill=0.18)
             if is_z3_action and _t06_pz3_contract_ready_current():
                 return _badge(f"WYKONANE IT{current_iter}", success, fill=0.18)
-            return _badge(f"DO WYKONANIA IT{current_iter}", muted, fill=0.08)
+            return _badge(f"DO WYKONANIA IT{current_iter}", warning, fill=0.12)
 
         list_host = tk.Frame(body, bg=body_bg)
         list_host.pack(fill=tk.X, padx=16, pady=(0, 12))
-        suggestion_frame_width = 276
-        suggestion_detail_wrap = 214
+        suggestion_frame_width = 360
+        suggestion_detail_wrap = 300
 
         def _abandon_interrupted_t06_ok() -> None:
             nonlocal _t06_interrupted_work_cache
@@ -9395,14 +9485,34 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 disabled_reason = "Najpierw przygotuj anotacje znaków w PZ2."
             is_enabled = not disabled_reason
             is_recommended = bool(recommended_label and normalized_label == recommended_label)
-            tone_color = (
-                success
-                if (
-                    is_recommended
-                    or (pending_ok_work and is_z3_action)
-                    or (draft_after_ready_export and is_z3_action)
+            action_done = bool(
+                (is_char_pz2 and _t06_pz2_contract_ready_current())
+                or (is_z3_action and _t06_pz3_contract_ready_current())
+            )
+            semantic_state = (
+                "blocked"
+                if not is_enabled
+                else (
+                    "done"
+                    if action_done
+                    else (
+                        "attention"
+                        if pending_work
+                        else (
+                            "current"
+                            if (
+                                is_recommended
+                                or (pending_ok_work and is_z3_action)
+                                or (draft_after_ready_export and is_z3_action)
+                            )
+                            else "neutral"
+                        )
+                    )
                 )
-                else (warning if pending_work else (success if str(tone or "").strip() != "warning" else warning))
+            )
+            tone_color = campaign_ui_helpers.campaign_workflow_semantic_color(
+                palette,
+                semantic_state,
             )
             row_bg = blend_hex_colors(field_bg, tone_color, 0.10 if (pending_work or is_recommended) else 0.045)
             btn_bg = blend_hex_colors(field_bg, tone_color, 0.22 if is_enabled else 0.10)
@@ -9449,10 +9559,10 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=f"{index}. {normalized_label}",
                 fg=fg if is_enabled else muted,
                 bg=row_bg,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 9, "bold"),
                 anchor="w",
                 justify=tk.LEFT,
-                wraplength=300,
+                wraplength=330,
             ).grid(row=0, column=0, sticky="ew")
             badge_tone = str(completion_badge.get("tone") or muted)
             badge_bg = blend_hex_colors(row_bg, badge_tone, float(completion_badge.get("fill", 0.10) or 0.10))
@@ -9462,7 +9572,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=str(completion_badge.get("text") or ""),
                 fg=badge_tone if is_enabled else muted,
                 bg=badge_bg,
-                font=("Segoe UI Semibold", 7),
+                font=("Segoe UI Semibold", 10),
                 anchor="center",
                 padx=7,
                 pady=2,
@@ -9498,7 +9608,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=str(status.get("mark") or "○"),
                 fg=mark_fg,
                 bg=mark_bg,
-                font=("Segoe UI Semibold", 8),
+                font=("Segoe UI Semibold", 9),
                 anchor="center",
                 padx=0,
                 pady=0,
@@ -9508,7 +9618,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=campaign_ui_helpers._repair_polish_text(str(status.get("title") or "")),
                 fg=status_tone if is_enabled else muted,
                 bg=status_bg,
-                font=("Segoe UI Semibold", 7),
+                font=("Segoe UI Semibold", 9),
                 anchor="w",
             ).grid(row=0, column=1, sticky="ew")
             tk.Label(
@@ -9516,7 +9626,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 text=_format_gate_work_suggestion_text(status.get("detail")),
                 fg=fg if is_enabled else muted,
                 bg=status_bg,
-                font=("Segoe UI", 7),
+                font=("Segoe UI", 9),
                 anchor="w",
                 wraplength=suggestion_detail_wrap,
                 justify=tk.LEFT,
@@ -9536,8 +9646,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 bg=btn_bg,
                 fg=fg if is_enabled else muted,
                 relief=tk.FLAT,
+                font=("Segoe UI", 10),
                 padx=12,
-                pady=5,
+                pady=6,
                 width=10,
                 state=tk.NORMAL if is_enabled else tk.DISABLED,
             ).grid(row=0, column=2, sticky="e", padx=(2, 10), pady=7)
@@ -9552,8 +9663,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             bg=field_bg,
             fg=fg,
             relief=tk.FLAT,
+            font=("Segoe UI", 10),
             padx=12,
-            pady=6,
+            pady=7,
         ).pack(side=tk.RIGHT)
         try:
             dialog.transient(self.frame)
@@ -9943,10 +10055,18 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     else:
                         previous_plates, current_plates, all_plates = _balance_counts(total_plates, origin_iteration)
                         previous_units, current_units, all_units = _balance_counts(total_units, origin_iteration)
+                    if all(
+                        str(value).lstrip('+') == '0'
+                        for value in (
+                            previous_plates, current_plates, all_plates,
+                            previous_units, current_units, all_units,
+                        )
+                    ):
+                        return f"Razem: 0 gotowych tablic / 0 {unit_label}"
                     return (
-                        f"Aktualna iteracja (IT{current_iter_num}): {current_plates} tablic / {current_units} {unit_label}\n"
-                        f"Dziedziczone z poprzednich iteracji: {previous_plates} tablic / {previous_units} {unit_label}\n"
-                        f"Łącznie dostępne: {all_plates} tablic / {all_units} {unit_label}"
+                        f"W tej iteracji (IT{current_iter_num}): {current_plates} gotowych tablic / {current_units} {unit_label}\n"
+                        f"Z poprzednich iteracji: {previous_plates} gotowych tablic / {previous_units} {unit_label}\n"
+                        f"Razem: {all_plates} gotowych tablic / {all_units} {unit_label}"
                     )
 
                 pz2_total_plates = max(
@@ -9983,29 +10103,29 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 if pz2_ready:
                     if pz2_plate_count > 0:
                         pz2_state = (
-                            f"Kontrakt PZ2 spełniony: {pz2_plate_count} tablic z ramkami znaków "
-                            f"(minimum: {min_plates}). "
-                            f"ramek znaków: {char_boxes}."
+                            f"Gotowe: {pz2_plate_count} tablic ma zatwierdzone ramki i oznaczenia znaków. "
+                            f""
+                            f"Razem ramek: {char_boxes}."
                         )
                     else:
                         pz2_state = (
-                            "Kontrakt PZ2 spełniony: istnieje dataset z PZ3, więc ramki znaków zostały rozliczone wcześniej. "
-                            f"Ramek znaków w datasecie: {char_boxes}."
+                            "Anotacje znaków zostały przygotowane wcześniej i są już wykorzystane w zapisanym datasecie. "
+                            f"Ramek znaków: {char_boxes}."
                         )
                     pz2_tone = "success"
                     pz2_fulfillment = "Spełnione"
                 elif pz2_minimum_ready:
                     pz2_state = (
-                        f"Minimum PZ2 jest spełnione: {pz2_plate_count} tablic z ramkami znaków "
-                        f"(minimum: {min_plates}), "
-                        f"ramek znaków: {char_boxes}. Przejdź w Z3 z PZ2 do PZ3, aby jawnie rozliczyć kontrakt PZ2."
+                        f"Materiał PZ2 jest gotowy: {pz2_plate_count} tablic z anotacjami znaków "
+                        f"(wymagane: {min_plates}), "
+                        f"ramek: {char_boxes}. W Praca T05 przejdź do PZ3, aby utworzyć dataset znaków."
                     )
                     pz2_tone = "info"
                     pz2_fulfillment = "Do zatwierdzenia"
                 elif char_boxes <= 0:
                     pz2_state = (
-                        f"Brakuje ramek i etykiet znaków na tablicach. W Praca {CHAR_WORK_GATE_DISPLAY_ID} wybierz "
-                        "„Przygotuj dataset znaków w Z3” i wykonaj boksowanie w PZ2."
+                        "Brak gotowych anotacji znaków. "
+                        "Możesz przygotować je w PZ2 albo wykorzystać wcześniejsze anotacje."
                     )
                     pz2_tone = "warning"
                     pz2_fulfillment = "Niespełnione"
@@ -10025,7 +10145,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                             target_hint="char",
                         )
                         pz3_state = (
-                            "Kontrakt PZ3 spełniony: utworzono źródłowy dataset znaków. "
+                            "Gotowe: utworzono dataset znaków dla tej pracy. "
                             f"Dataset: {dataset_id or 'DS-ZN'}."
                         )
                     else:
@@ -10034,36 +10154,128 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     pz3_fulfillment = "Spełnione"
                 elif pz2_ready:
                     pz3_state = (
-                        "Do wykonania: kontrakt PZ2 jest rozliczony, ale brakuje eksportu datasetu. "
-                        "Przejdź do PZ3 i utwórz źródłowy dataset znaków YOLO Detect."
+                        "Anotacje znaków są gotowe. "
+                        "W PZ3 utwórz dataset znaków."
                     )
                     pz3_tone = "warning"
                     pz3_fulfillment = "Niespełnione"
                 else:
                     pz3_state = (
-                        "Czeka na kontrakt PZ2. Dataset znaków powstaje dopiero po jawnym przejściu "
-                        "z boksowania znaków do eksportu w PZ3."
+                        "Dataset nie został jeszcze utworzony. Będzie dostępny po zakończeniu "
+                        "lokalnej kontroli anotacji znaków w PZ2."
                     )
                     pz3_tone = "muted"
                     pz3_fulfillment = "Niespełnione"
 
                 def _contract_badge(tone: str) -> str:
                     normalized_tone = str(tone or "").strip().lower()
-                    return "Jest" if normalized_tone == "success" else "-"
+                    return {"success": "Gotowe", "info": "Gotowe", "warning": "W toku", "error": "Błąd"}.get(normalized_tone, "Czeka")
+
+
+                def _t05_az_reuse_ui_state() -> dict:
+                    from ..registry.az_campaign_resource import summarize_project_az_resource
+                    from ..registry.az_project_import import list_project_az_import_sources
+                    from ..registry.az_registry import AZRegistry, project_id_from_folder_name
+
+                    state = {
+                        "mode": "unavailable",
+                        "target_crop_count": 0,
+                        "importable_count": 0,
+                        "already_bound_count": 0,
+                        "conflict_count": 0,
+                        "pending_review_count": 0,
+                    }
+
+                    active_project = str(CAMPAIGN.get_active_project_name() or "").strip()
+                    if not active_project:
+                        return state
+
+                    project_data = dict(
+                        (CAMPAIGN.state.get("projects", {}) or {}).get(active_project, {}) or {}
+                    )
+                    folder_name = str(project_data.get("folder_name") or "").strip()
+                    target_project_id = project_id_from_folder_name(folder_name)
+                    if not target_project_id:
+                        return state
+
+                    try:
+                        registry = AZRegistry.for_workspace(CONFIG.WORKSPACE_DIR)
+                        registry.initialize()
+                        target_state = summarize_project_az_resource(
+                            registry,
+                            project_id=target_project_id,
+                        )
+                        candidates = list(
+                            list_project_az_import_sources(
+                                registry,
+                                target_project_id=target_project_id,
+                            )
+                            or ()
+                        )
+                    except Exception:
+                        return state
+
+                    target_crop_count = int(target_state.crop_count or 0)
+                    pending_review_count = int(target_state.pending_review_count or 0)
+                    source_count = len(candidates)
+                    importable_count = max(
+                        [int(getattr(candidate, "importable_count", 0) or 0) for candidate in candidates]
+                        or [0]
+                    )
+                    already_bound_count = max(
+                        [int(getattr(candidate, "already_bound_count", 0) or 0) for candidate in candidates]
+                        or [0]
+                    )
+                    conflict_count = max(
+                        [int(getattr(candidate, "conflict_count", 0) or 0) for candidate in candidates]
+                        or [0]
+                    )
+
+                    state.update(
+                        target_crop_count=target_crop_count,
+                        importable_count=importable_count,
+                        already_bound_count=already_bound_count,
+                        conflict_count=conflict_count,
+                        pending_review_count=pending_review_count,
+                    )
+
+                    if target_crop_count <= 0:
+                        state["mode"] = "hidden"
+                    elif importable_count > 0:
+                        state["mode"] = "importable"
+                    elif source_count > 0:
+                        state["mode"] = "browse"
+                    else:
+                        state["mode"] = "no_match"
+                    return state
+
+                az_reuse_ui = _t05_az_reuse_ui_state()
+                pz2_next_cell_ref = {"cell": None}
+
+                pending_import_review_count = int(
+                    az_reuse_ui.get("pending_review_count", 0) or 0
+                )
+                if pending_import_review_count > 0:
+                    pz2_state = (
+                        f"Zaimportowane anotacje ({pending_import_review_count}) "
+                        "czekają na sprawdzenie."
+                    )
+                    pz2_tone = "warning"
+                    pz2_fulfillment = "Do kontroli"
 
                 rows = [
                     (
                         _contract_badge(pz2_tone),
-                        "Krok 1 / PZ2",
-                        "Ramki znaków na tablicach",
+                        "1. PZ2",
+                        "Anotacje znaków",
                         pz2_balance,
                         pz2_tone,
                         pz2_state,
                     ),
                     (
                         _contract_badge(pz3_tone),
-                        "Krok 2 / PZ3",
-                        "Źródłowy dataset znaków",
+                        "2. PZ3",
+                        "Dataset znaków",
                         pz3_balance,
                         pz3_tone,
                         pz3_state,
@@ -10073,9 +10285,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 dialog = tk.Toplevel(self.frame)
                 dialog._campaign_graph_dialog = True
                 try:
-                    self.app.style_dialog_window(dialog, title=f"Zasoby bramki {CHAR_WORK_GATE_DISPLAY_ID}", geometry="1080x500", parent=self.frame)
+                    self.app.style_dialog_window(dialog, title=f"Stan pracy {CHAR_WORK_GATE_DISPLAY_ID}", geometry="1080x350", parent=self.frame)
                 except Exception:
-                    dialog.title(f"Zasoby bramki {CHAR_WORK_GATE_DISPLAY_ID}")
+                    dialog.title(f"Stan pracy {CHAR_WORK_GATE_DISPLAY_ID}")
                 build_surface = getattr(self.app, "_build_themed_dialog_surface", None)
                 if callable(build_surface):
                     body = build_surface(dialog, tone="info")
@@ -10084,11 +10296,22 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     body.pack(fill=tk.BOTH, expand=True)
                 body_bg = str(body.cget("bg") or card_bg)
                 status_text, status_color = _edge_status(edge)
+                operator_status_text = {
+                    "ZAMKNIĘTA": "Warunki jeszcze niespełnione",
+                    "OTWARTA": "Gotowe do zatwierdzenia",
+                    "DO KONTROLI": "Wymaga kontroli",
+                    "PRZERWANE": "Praca wymaga dokończenia",
+                    "WYBIERZ": "Wybierz wariant pracy",
+                    "WYBIERZ WYNIK": "Wybierz wynik pracy",
+                }.get(
+                    str(status_text or "").strip().upper(),
+                    str(status_text or "Nieaktywne").strip(),
+                )
                 repair = campaign_ui_helpers._repair_polish_text
 
                 tk.Label(
                     body,
-                    text=repair(f"Zasoby bramki {CHAR_WORK_GATE_DISPLAY_ID}"),
+                    text=repair(f"Stan pracy {CHAR_WORK_GATE_DISPLAY_ID}"),
                     fg=fg,
                     bg=body_bg,
                     font=("Segoe UI", 12, "bold"),
@@ -10096,7 +10319,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 ).pack(fill=tk.X, padx=16, pady=(16, 2))
                 tk.Label(
                     body,
-                    text=repair(f"Status bramki: {status_text or 'nieaktywna'}"),
+                    text=repair(f"Status: {operator_status_text}"),
                     fg=status_color,
                     bg=body_bg,
                     font=("Segoe UI", 9, "bold"),
@@ -10105,8 +10328,8 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 tk.Label(
                     body,
                     text=repair(
-                        f"{CHAR_WORK_GATE_DISPLAY_ID} wymaga dwóch kolejnych produktów: najpierw ramek znaków na tablicach w PZ2, "
-                        "a potem źródłowego datasetu znaków utworzonego w PZ3."
+                        f"Aby zakończyć {CHAR_WORK_GATE_DISPLAY_ID}, najpierw przygotuj i zatwierdź anotacje znaków w PZ2, "
+                        "a następnie utwórz dataset znaków w PZ3."
                     ),
                     fg=muted,
                     bg=body_bg,
@@ -10116,11 +10339,11 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 ).pack(fill=tk.X, padx=16, pady=(0, 10))
 
                 table = tk.Frame(body, bg=body_bg, bd=0, highlightthickness=1, highlightbackground=border, highlightcolor=border)
-                table.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 14))
+                table.pack(fill=tk.X, padx=16, pady=(0, 12))
                 for col, weight in enumerate((0, 0, 2, 4, 4)):
                     table.grid_columnconfigure(col, weight=weight)
                 header_bg = blend_hex_colors(field_bg, accent, 0.10)
-                for col, header in enumerate(("Stan", "Krok", "Produkt", "Przyrost / dziedziczone", "Aktualny stan")):
+                for col, header in enumerate(("Stan", "Krok", "Potrzebny materiał", "Stan materiału", "Co dalej")):
                     tk.Label(
                         table,
                         text=repair(header),
@@ -10146,38 +10369,26 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         (1, step_label, accent, 90),
                         (2, product, fg, 180),
                         (3, balance_text, state_color, 300),
-                        (4, state_text, state_color, 390),
+                        (4, state_text, fg if row_idx == 1 else muted, 390),
                     ):
                         cell = tk.Frame(table, bg=row_bg, bd=0, highlightthickness=1, highlightbackground=border, highlightcolor=border)
                         cell.grid(row=row_idx, column=col, sticky="nsew")
+                        if row_idx == 1 and col == 4:
+                            pz2_next_cell_ref["cell"] = cell
                         if col == 3:
-                            balance_colors = (success, muted, accent)
-                            balance_fills = (
-                                blend_hex_colors(row_bg, success, 0.14),
-                                blend_hex_colors(row_bg, muted, 0.065),
-                                blend_hex_colors(row_bg, accent, 0.11),
-                            )
-                            for line_idx, line in enumerate(str(text or "").splitlines()):
-                                segment_color = balance_colors[min(line_idx, len(balance_colors) - 1)]
-                                segment_bg = balance_fills[min(line_idx, len(balance_fills) - 1)]
-                                segment = tk.Frame(
-                                    cell,
-                                    bg=segment_bg,
-                                    highlightthickness=1 if line_idx == 0 else 0,
-                                    highlightbackground=blend_hex_colors(segment_color, row_bg, 0.36),
-                                    highlightcolor=blend_hex_colors(segment_color, row_bg, 0.36),
-                                )
-                                segment.pack(fill=tk.X, padx=6, pady=(6 if line_idx == 0 else 3, 2))
+                            balance_lines = list(str(text or "").splitlines())
+                            for line_idx, line in enumerate(balance_lines):
+                                is_total = bool(line_idx == len(balance_lines) - 1)
                                 tk.Label(
-                                    segment,
+                                    cell,
                                     text=repair(line),
-                                    fg=segment_color,
-                                    bg=segment_bg,
+                                    fg=fg if is_total else muted,
+                                    bg=row_bg,
                                     anchor="w",
                                     justify=tk.LEFT,
-                                    font=("Segoe UI", 9 if line_idx == 0 else 8, "bold" if line_idx in (0, 2) else "normal"),
+                                    font=("Segoe UI", 8, "bold" if is_total else "normal"),
                                     padx=8,
-                                    pady=4,
+                                    pady=2,
                                     wraplength=wrap,
                                 ).pack(fill=tk.X)
                             continue
@@ -10190,22 +10401,516 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                             justify=(tk.CENTER if col == 0 else tk.LEFT),
                             font=("Segoe UI", 8),
                             padx=(4 if col == 0 else 8),
-                            pady=8,
+                            pady=6,
                             wraplength=wrap,
                         ).pack(fill=tk.X)
-                footer = tk.Frame(body, bg=body_bg)
-                footer.pack(fill=tk.X, padx=16, pady=(0, 16))
-                tk.Button(
+
+                def _open_t05_az_project_import_browser() -> bool:
+                    from ..registry.az_project_import import (
+                        import_project_az_bindings,
+                        list_project_az_import_sources,
+                    )
+                    from ..registry.az_registry import (
+                        AZRegistry,
+                        project_id_from_folder_name,
+                    )
+
+                    active_project = str(CAMPAIGN.get_active_project_name() or "").strip()
+                    if not active_project:
+                        self.app.themed_error(
+                            "Import AZ",
+                            "Brak aktywnego projektu kampanii.",
+                            parent=dialog,
+                        )
+                        return False
+
+                    project_data = dict(
+                        (CAMPAIGN.state.get("projects", {}) or {}).get(
+                            active_project,
+                            {},
+                        )
+                        or {}
+                    )
+                    folder_name = str(project_data.get("folder_name") or "").strip()
+                    target_project_id = project_id_from_folder_name(folder_name)
+                    if not target_project_id:
+                        self.app.themed_error(
+                            "Import AZ",
+                            "Nie udało się ustalić project_id projektu docelowego.",
+                            parent=dialog,
+                        )
+                        return False
+
+                    try:
+                        registry = AZRegistry.for_workspace(CONFIG.WORKSPACE_DIR)
+                        registry.initialize()
+                        candidates = list(
+                            list_project_az_import_sources(
+                                registry,
+                                target_project_id=target_project_id,
+                            )
+                            or ()
+                        )
+                    except Exception as exc:
+                        self.app.themed_error(
+                            "Import AZ",
+                            f"Nie udało się przygotować listy projektów źródłowych AZ.\n\n{exc}",
+                            parent=dialog,
+                        )
+                        return False
+
+                    if not candidates:
+                        self.app.themed_info(
+                            "Import AZ",
+                            "Brak projektów z AZ w registry.",
+                            parent=dialog,
+                            tone="info",
+                        )
+                        return False
+
+                    browser = tk.Toplevel(dialog)
+                    try:
+                        self.app.style_dialog_window(
+                            browser,
+                            title="Import AZ z projektu",
+                            geometry="1040x560",
+                            parent=dialog,
+                        )
+                    except Exception:
+                        browser.title("Import AZ z projektu")
+
+                    build_surface = getattr(self.app, "_build_themed_dialog_surface", None)
+                    if callable(build_surface):
+                        browser_body = build_surface(browser, tone="info")
+                    else:
+                        browser_body = tk.Frame(browser, bg=card_bg)
+                        browser_body.pack(fill=tk.BOTH, expand=True)
+                    browser_bg = str(browser_body.cget("bg") or card_bg)
+
+                    tk.Label(
+                        browser_body,
+                        text="Wybierz projekt źródłowy AZ",
+                        fg=fg,
+                        bg=browser_bg,
+                        font=("Segoe UI", 12, "bold"),
+                        anchor="w",
+                    ).pack(fill=tk.X, padx=14, pady=(14, 4))
+                    tk.Label(
+                        browser_body,
+                        text=(
+                            "Import obejmuje wyłącznie tablice, które program rozpoznał "
+                            "jako dokładnie te same w obu projektach. Nie uruchamia ponownej "
+                            "detekcji znaków. Zaimportowane anotacje wymagają lokalnej kontroli w PZ2."
+                        ),
+                        fg=muted,
+                        bg=browser_bg,
+                        font=("Segoe UI", 8),
+                        anchor="w",
+                        justify=tk.LEFT,
+                        wraplength=990,
+                    ).pack(fill=tk.X, padx=14, pady=(0, 10))
+
+                    table_shell = tk.Frame(
+                        browser_body,
+                        bg=browser_bg,
+                        bd=0,
+                        highlightthickness=1,
+                        highlightbackground=border,
+                        highlightcolor=border,
+                    )
+                    table_shell.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 10))
+
+                    columns = (
+                        "project",
+                        "source_az",
+                        "importable",
+                        "already",
+                        "conflicts",
+                        "missing",
+                        "status",
+                    )
+                    headings = (
+                        "Projekt",
+                        "AZ źródła",
+                        "Do importu",
+                        "Już przypięte",
+                        "Konflikty",
+                        "Brak cropa targetu",
+                        "Status",
+                    )
+                    widths = (260, 90, 90, 105, 90, 135, 180)
+
+                    tree = ttk.Treeview(
+                        table_shell,
+                        columns=columns,
+                        show="headings",
+                        selectmode="browse",
+                        height=13,
+                    )
+                    scroll = ttk.Scrollbar(
+                        table_shell,
+                        orient=tk.VERTICAL,
+                        command=tree.yview,
+                    )
+                    tree.configure(yscrollcommand=scroll.set)
+                    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
+                    scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=8)
+
+                    for column, heading, width in zip(columns, headings, widths):
+                        tree.heading(column, text=heading)
+                        tree.column(
+                            column,
+                            width=width,
+                            minwidth=70,
+                            anchor=(tk.W if column in {"project", "status"} else tk.CENTER),
+                            stretch=(column in {"project", "status"}),
+                        )
+
+                    candidate_by_iid = {}
+                    selected_state = {"candidate": None}
+                    summary_var = tk.StringVar(value="Wybierz projekt z listy.")
+                    import_button_ref = {"button": None}
+
+                    def _candidate_status(candidate) -> str:
+                        if bool(candidate.can_import):
+                            if int(candidate.conflict_count) > 0:
+                                return "Można importować częściowo"
+                            return "Można importować"
+                        if int(candidate.already_bound_count) > 0 and int(candidate.conflict_count) == 0:
+                            return "AZ już przypięte"
+                        if int(candidate.conflict_count) > 0:
+                            return "Konflikty"
+                        if int(candidate.target_missing_crop_count) > 0:
+                            return "Brak zgodnych cropów targetu"
+                        return "Brak bezpiecznego importu"
+
+                    for index, candidate in enumerate(candidates, start=1):
+                        iid = f"az-source-{index}"
+                        candidate_by_iid[iid] = candidate
+                        tree.insert(
+                            "",
+                            "end",
+                            iid=iid,
+                            values=(
+                                str(candidate.source_display_name or candidate.source_project_id),
+                                int(candidate.source_az_count),
+                                int(candidate.importable_count),
+                                int(candidate.already_bound_count),
+                                int(candidate.conflict_count),
+                                int(candidate.target_missing_crop_count),
+                                _candidate_status(candidate),
+                            ),
+                        )
+
+                    def _refresh_selection(_event=None) -> None:
+                        selected = list(tree.selection() or ())
+                        candidate = candidate_by_iid.get(selected[0]) if selected else None
+                        selected_state["candidate"] = candidate
+                        button = import_button_ref.get("button")
+                        if candidate is None:
+                            summary_var.set("Wybierz projekt z listy.")
+                            if button is not None:
+                                button.config(state=tk.DISABLED)
+                            return
+                        summary_var.set(
+                            (
+                                f"Do importu: {int(candidate.importable_count)} | "
+                                f"już przypięte: {int(candidate.already_bound_count)} | "
+                                f"konflikty: {int(candidate.conflict_count)} | "
+                                f"brak cropa targetu: {int(candidate.target_missing_crop_count)} | "
+                                f"nieprawidłowe źródło: {int(candidate.invalid_source_count)}"
+                            )
+                        )
+                        if button is not None:
+                            button.config(
+                                state=(tk.NORMAL if bool(candidate.can_import) else tk.DISABLED)
+                            )
+
+                    def _close_browser() -> None:
+                        try:
+                            browser.grab_release()
+                        except Exception:
+                            pass
+                        try:
+                            browser.destroy()
+                        except Exception:
+                            pass
+                        try:
+                            if dialog.winfo_exists():
+                                dialog.grab_set()
+                        except Exception:
+                            pass
+
+                    def _perform_import() -> None:
+                        candidate = selected_state.get("candidate")
+                        if candidate is None or not bool(candidate.can_import):
+                            return
+
+                        confirmed = messagebox.askyesno(
+                            "Import AZ",
+                            (
+                                f"Zaimportować anotacje znaków dla {int(candidate.importable_count)} tablic "
+                                f"z projektu „{candidate.source_display_name}”?\n\n"
+                                "Zaimportowane anotacje będą wymagały lokalnej kontroli w projekcie docelowym. "
+                                "Status OK z projektu źródłowego nie zostanie przeniesiony. "
+                                "Istniejące konflikty nie zostaną nadpisane."
+                            ),
+                            parent=browser,
+                        )
+                        if not confirmed:
+                            return
+
+                        button = import_button_ref.get("button")
+                        if button is not None:
+                            button.config(state=tk.DISABLED)
+                        try:
+                            result = import_project_az_bindings(
+                                registry,
+                                source_project_id=candidate.source_project_id,
+                                target_project_id=target_project_id,
+                            )
+                        except Exception as exc:
+                            if button is not None:
+                                button.config(state=tk.NORMAL)
+                            self.app.themed_error(
+                                "Import AZ",
+                                f"Nie udało się zaimportować AZ.\n\n{exc}",
+                                parent=browser,
+                            )
+                            return
+
+                        result_text = (
+                            f"Zaimportowano: {int(result.imported)}\n"
+                            f"Już przypięte: {int(result.already_bound)}\n"
+                            f"Konflikty: {int(result.conflicts)}\n"
+                            f"Brak cropa targetu: {int(result.target_missing_crop)}\n"
+                            f"Nieprawidłowe źródło: {int(result.invalid_source)}\n"
+                            f"Do lokalnej kontroli w PZ2: {int(result.imported)}"
+                        )
+                        self.app.themed_info(
+                            "Import AZ zakończony",
+                            result_text
+                            + "\n\nOtwórz ponownie PZ2, aby zmaterializować AZ do lokalnej kontroli.",
+                            parent=browser,
+                            tone=("success" if int(result.imported) > 0 else "info"),
+                        )
+
+                        try:
+                            browser.grab_release()
+                        except Exception:
+                            pass
+                        try:
+                            browser.destroy()
+                        except Exception:
+                            pass
+                        try:
+                            dialog.destroy()
+                        except Exception:
+                            pass
+                        try:
+                            _refresh_graph_after_action()
+                        except Exception:
+                            try:
+                                self._refresh_dashboard()
+                            except Exception:
+                                pass
+
+                    tree.bind("<<TreeviewSelect>>", _refresh_selection, add="+")
+                    tree.bind("<Double-1>", lambda _event: _perform_import(), add="+")
+
+                    tk.Label(
+                        browser_body,
+                        textvariable=summary_var,
+                        fg=muted,
+                        bg=browser_bg,
+                        font=("Segoe UI", 8),
+                        anchor="w",
+                        justify=tk.LEFT,
+                    ).pack(fill=tk.X, padx=14, pady=(0, 8))
+
+                    browser_footer = tk.Frame(browser_body, bg=browser_bg)
+                    browser_footer.pack(fill=tk.X, padx=14, pady=(0, 14))
+                    import_button = tk.Button(
+                        browser_footer,
+                        text="Importuj",
+                        command=_perform_import,
+                        cursor="hand2",
+                        bg=blend_hex_colors(field_bg, success, 0.18),
+                        fg=fg,
+                        relief=tk.FLAT,
+                        padx=10,
+                        pady=6,
+                        state=tk.DISABLED,
+                    )
+                    import_button.pack(side=tk.RIGHT, padx=(8, 0))
+                    import_button_ref["button"] = import_button
+                    tk.Button(
+                        browser_footer,
+                        text="Zamknij",
+                        command=_close_browser,
+                        cursor="hand2",
+                        bg=field_bg,
+                        fg=fg,
+                        relief=tk.FLAT,
+                        padx=10,
+                        pady=6,
+                    ).pack(side=tk.RIGHT)
+
+                    try:
+                        browser.protocol("WM_DELETE_WINDOW", _close_browser)
+                        dialog.grab_release()
+                        browser.transient(dialog)
+                        browser.grab_set()
+                    except Exception:
+                        pass
+                    return True
+
+
+                az_reuse_mode = str(az_reuse_ui.get("mode") or "unavailable")
+                az_reuse_cell = pz2_next_cell_ref.get("cell")
+
+                if az_reuse_cell is not None and az_reuse_mode != "hidden":
+                    reuse_action_shell = tk.Frame(
+                        az_reuse_cell,
+                        bg=str(az_reuse_cell.cget("bg") or body_bg),
+                        bd=0,
+                        highlightthickness=0,
+                    )
+                    reuse_action_shell.pack(fill=tk.X, padx=8, pady=(2, 5))
+
+                    if az_reuse_mode == "importable":
+                        action_text = (
+                            "Użyj wcześniejszych anotacji "
+                            f"({int(az_reuse_ui.get('importable_count', 0) or 0)})"
+                        )
+                        action_enabled = True
+                        action_tone = accent
+                    elif az_reuse_mode == "browse":
+                        action_text = "Wcześniejsze anotacje…"
+                        action_enabled = True
+                        action_tone = accent
+                    elif az_reuse_mode == "no_match":
+                        action_text = "Brak wcześniejszych anotacji"
+                        action_enabled = False
+                        action_tone = muted
+                    else:
+                        action_text = "Sprawdzenie wcześniejszych anotacji niedostępne"
+                        action_enabled = False
+                        action_tone = muted
+
+
+                    reuse_button = tk.Button(
+                        reuse_action_shell,
+                        text=action_text,
+                        command=_open_t05_az_project_import_browser if action_enabled else (lambda: None),
+                        cursor="hand2" if action_enabled else "",
+                        bg=(
+                            blend_hex_colors(field_bg, accent, 0.36)
+                            if action_enabled
+                            else field_bg
+                        ),
+                        fg=fg if action_enabled else muted,
+                        activebackground=blend_hex_colors(field_bg, accent, 0.48) if action_enabled else field_bg,
+                        activeforeground=fg if action_enabled else muted,
+                        relief=tk.FLAT,
+                        font=("Segoe UI", 9, "bold" if action_enabled else "normal"),
+                        padx=14,
+                        pady=7,
+                        state=tk.NORMAL if action_enabled else tk.DISABLED,
+                    )
+                    if pending_import_review_count > 0:
+                        def _open_t05_work_from_resources():
+                            try:
+                                dialog.grab_release()
+                            except Exception:
+                                pass
+                            try:
+                                dialog.destroy()
+                            except Exception:
+                                pass
+                            try:
+                                self.frame.after_idle(lambda: _open_actions(edge_key))
+                            except Exception:
+                                _open_actions(edge_key)
+
+                        work_button_bg = blend_hex_colors(field_bg, accent, 0.44)
+                        work_button_hover_bg = blend_hex_colors(field_bg, accent, 0.58)
+                        work_button = tk.Button(
+                            reuse_action_shell,
+                            text="Przejdź do pracy T05",
+                            command=_open_t05_work_from_resources,
+                            cursor="hand2",
+                            bg=work_button_bg,
+                            activebackground=work_button_hover_bg,
+                            fg=fg,
+                            activeforeground=fg,
+                            relief=tk.FLAT,
+                            font=("Segoe UI", 9, "bold"),
+                            padx=14,
+                            pady=7,
+                        )
+                        work_button.pack(side=tk.RIGHT, padx=(8, 0))
+                        work_button.bind(
+                            "<Enter>",
+                            lambda _event, btn=work_button: btn.configure(bg=work_button_hover_bg),
+                            add="+",
+                        )
+                        work_button.bind(
+                            "<Leave>",
+                            lambda _event, btn=work_button: btn.configure(bg=work_button_bg),
+                            add="+",
+                        )
+
+                    reuse_button.pack(side=tk.RIGHT)
+                    if action_enabled:
+                        reuse_button.bind(
+                            "<Enter>",
+                            lambda _event, btn=reuse_button: btn.configure(
+                                bg=blend_hex_colors(field_bg, accent, 0.48)
+                            ),
+                            add="+",
+                        )
+                        reuse_button.bind(
+                            "<Leave>",
+                            lambda _event, btn=reuse_button: btn.configure(
+                                bg=blend_hex_colors(field_bg, accent, 0.36)
+                            ),
+                            add="+",
+                        )
+
+                footer = tk.Frame(body, bg=body_bg, bd=0, highlightthickness=0)
+                footer.pack(fill=tk.X, padx=16, pady=(8, 10))
+
+                close_bg = blend_hex_colors(body_bg, accent, 0.06)
+                close_hover_bg = blend_hex_colors(body_bg, accent, 0.14)
+                close_button = tk.Button(
                     footer,
                     text="Zamknij",
                     command=dialog.destroy,
                     cursor="hand2",
-                    bg=field_bg,
+                    bg=close_bg,
+                    activebackground=close_hover_bg,
                     fg=fg,
+                    activeforeground=fg,
                     relief=tk.FLAT,
-                    padx=10,
+                    bd=0,
+                    highlightthickness=0,
+                    font=("Segoe UI", 9, "bold"),
+                    padx=14,
                     pady=6,
-                ).pack(side=tk.RIGHT)
+                )
+                close_button.pack(side=tk.RIGHT)
+                close_button.bind(
+                    "<Enter>",
+                    lambda _event, btn=close_button: btn.configure(bg=close_hover_bg),
+                    add="+",
+                )
+                close_button.bind(
+                    "<Leave>",
+                    lambda _event, btn=close_button: btn.configure(bg=close_bg),
+                    add="+",
+                )
+
                 try:
                     dialog.transient(self.frame)
                     dialog.grab_set()
@@ -11563,7 +12268,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     None,
                     fallback_label=fallback_label or campaign_resource_label("char_run"),
                     fallback_requirement="optional",
-                    fallback_validation="Opcjonalne | import anotacji znaków jest zasobem planowanym.",
+                    fallback_validation="Opcjonalne | stan AZ jest odczytywany z registry projektu.",
                     fallback_tone="muted",
                 )
             return build_campaign_resource_snapshot(
@@ -11899,9 +12604,13 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             return bool(count > 0), str(source_label or "Nie wskazano"), int(count)
 
         def _annotation_dependency_message(row_key: str) -> str:
-            resource_code = "AZ" if str(row_key or "").strip() == "char_run" else "AT"
+            if str(row_key or "").strip() == "char_run":
+                return (
+                    "Najpierw przygotuj wyodrębnione tablice PZ1 dla projektu. "
+                    "AZ można importować wyłącznie dla zgodnych logical crop_id."
+                )
             return (
-                f"Najpierw wskaż obrazy O. {resource_code} jest zależne od aktualnej puli obrazów "
+                "Najpierw wskaż obrazy O. AT jest zależne od aktualnej puli obrazów "
                 "i musi zostać zweryfikowane względem tej bazy."
             )
 
@@ -13762,10 +14471,395 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 pass
             return True
 
+        def _active_az_registry_context():
+            active_project = str(CAMPAIGN.get_active_project_name() or "").strip()
+            if not active_project:
+                raise RuntimeError("Brak aktywnego projektu kampanii.")
+            project_data = dict(
+                (CAMPAIGN.state.get("projects", {}) or {}).get(
+                    active_project,
+                    {},
+                )
+                or {}
+            )
+            folder_name = str(project_data.get("folder_name") or "").strip()
+            if not folder_name:
+                raise RuntimeError("Aktywny projekt nie ma folder_name.")
+
+            from ..registry.az_registry import AZRegistry, project_id_from_folder_name
+
+            project_id = project_id_from_folder_name(folder_name)
+            if not project_id:
+                raise RuntimeError("Nie udało się wyliczyć project_id dla aktywnego projektu.")
+
+            registry = AZRegistry.for_workspace(CONFIG.WORKSPACE_DIR)
+            registry.initialize()
+            return registry, project_id
+
+        def _open_az_project_import_browser() -> bool:
+            from ..registry.az_project_import import (
+                import_project_az_bindings,
+                list_project_az_import_sources,
+            )
+
+            try:
+                registry, target_project_id = _active_az_registry_context()
+                candidates = list(
+                    list_project_az_import_sources(
+                        registry,
+                        target_project_id=target_project_id,
+                    )
+                    or ()
+                )
+            except Exception as exc:
+                try:
+                    self.app.themed_error(
+                        "Import AZ",
+                        f"Nie udało się przygotować listy projektów źródłowych AZ.\n\n{exc}",
+                        parent=dialog,
+                    )
+                except Exception:
+                    messagebox.showerror(
+                        "Import AZ",
+                        str(exc),
+                        parent=dialog,
+                    )
+                return False
+
+            if not candidates:
+                try:
+                    self.app.themed_info(
+                        "Import AZ",
+                        "Brak projektów z AZ w registry.",
+                        parent=dialog,
+                        tone="info",
+                    )
+                except Exception:
+                    messagebox.showinfo(
+                        "Import AZ",
+                        "Brak projektów z AZ w registry.",
+                        parent=dialog,
+                    )
+                return False
+
+            browser = tk.Toplevel(dialog)
+            try:
+                self.app.style_dialog_window(
+                    browser,
+                    title="Import AZ z projektu",
+                    geometry="1040x560",
+                    parent=dialog,
+                )
+            except Exception:
+                browser.title("Import AZ z projektu")
+
+            build_surface = getattr(self.app, "_build_themed_dialog_surface", None)
+            if callable(build_surface):
+                browser_body = build_surface(browser, tone="info")
+            else:
+                browser_body = tk.Frame(browser, bg=card_bg)
+                browser_body.pack(fill=tk.BOTH, expand=True)
+            browser_bg = str(browser_body.cget("bg") or card_bg)
+
+            tk.Label(
+                browser_body,
+                text="Wybierz projekt źródłowy AZ",
+                fg=fg,
+                bg=browser_bg,
+                font=("Segoe UI", 12, "bold"),
+                anchor="w",
+            ).pack(fill=tk.X, padx=14, pady=(14, 4))
+            tk.Label(
+                browser_body,
+                text=(
+                    "Program importuje wyłącznie AZ dla identycznych logical crop_id. "
+                    "Konflikty nie są nadpisywane, a nowe bindingi trafiają do kontroli PZ2."
+                ),
+                fg=muted,
+                bg=browser_bg,
+                font=("Segoe UI", 8),
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=990,
+            ).pack(fill=tk.X, padx=14, pady=(0, 10))
+
+            table_shell = tk.Frame(
+                browser_body,
+                bg=browser_bg,
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=border,
+                highlightcolor=border,
+            )
+            table_shell.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 10))
+
+            columns = (
+                "project",
+                "source_az",
+                "importable",
+                "already",
+                "conflicts",
+                "missing",
+                "status",
+            )
+            headings = (
+                "Projekt",
+                "AZ źródła",
+                "Do importu",
+                "Już przypięte",
+                "Konflikty",
+                "Brak cropa targetu",
+                "Status",
+            )
+            widths = (260, 90, 90, 105, 90, 135, 180)
+
+            tree = ttk.Treeview(
+                table_shell,
+                columns=columns,
+                show="headings",
+                selectmode="browse",
+                height=13,
+            )
+            scroll = ttk.Scrollbar(
+                table_shell,
+                orient=tk.VERTICAL,
+                command=tree.yview,
+            )
+            tree.configure(yscrollcommand=scroll.set)
+            tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=8)
+
+            for column, heading, width in zip(columns, headings, widths):
+                tree.heading(column, text=heading)
+                tree.column(
+                    column,
+                    width=width,
+                    minwidth=70,
+                    anchor=(tk.W if column in {"project", "status"} else tk.CENTER),
+                    stretch=(column in {"project", "status"}),
+                )
+
+            candidate_by_iid = {}
+            selected_state = {"candidate": None}
+            summary_var = tk.StringVar(value="Wybierz projekt z listy.")
+            import_button_ref = {"button": None}
+
+            def _candidate_status(candidate) -> str:
+                if bool(candidate.can_import):
+                    if int(candidate.conflict_count) > 0:
+                        return "Można importować częściowo"
+                    return "Można importować"
+                if int(candidate.already_bound_count) > 0 and int(candidate.conflict_count) == 0:
+                    return "AZ już przypięte"
+                if int(candidate.conflict_count) > 0:
+                    return "Konflikty"
+                if int(candidate.target_missing_crop_count) > 0:
+                    return "Brak zgodnych cropów targetu"
+                return "Brak bezpiecznego importu"
+
+            for index, candidate in enumerate(candidates, start=1):
+                iid = f"az-source-{index}"
+                candidate_by_iid[iid] = candidate
+                tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=(
+                        str(candidate.source_display_name or candidate.source_project_id),
+                        int(candidate.source_az_count),
+                        int(candidate.importable_count),
+                        int(candidate.already_bound_count),
+                        int(candidate.conflict_count),
+                        int(candidate.target_missing_crop_count),
+                        _candidate_status(candidate),
+                    ),
+                )
+
+            def _refresh_selection(_event=None) -> None:
+                selected = list(tree.selection() or ())
+                candidate = candidate_by_iid.get(selected[0]) if selected else None
+                selected_state["candidate"] = candidate
+                button = import_button_ref.get("button")
+                if candidate is None:
+                    summary_var.set("Wybierz projekt z listy.")
+                    if button is not None:
+                        button.config(state=tk.DISABLED)
+                    return
+
+                summary_var.set(
+                    (
+                        f"Do importu: {int(candidate.importable_count)} | "
+                        f"już przypięte: {int(candidate.already_bound_count)} | "
+                        f"konflikty: {int(candidate.conflict_count)} | "
+                        f"brak cropa targetu: {int(candidate.target_missing_crop_count)} | "
+                        f"nieprawidłowe źródło: {int(candidate.invalid_source_count)}"
+                    )
+                )
+                if button is not None:
+                    button.config(
+                        state=(
+                            tk.NORMAL
+                            if bool(candidate.can_import)
+                            else tk.DISABLED
+                        )
+                    )
+
+            def _restore_parent_grab() -> None:
+                try:
+                    if dialog.winfo_exists():
+                        dialog.grab_set()
+                except Exception:
+                    pass
+
+            def _close_browser() -> None:
+                try:
+                    browser.grab_release()
+                except Exception:
+                    pass
+                try:
+                    browser.destroy()
+                finally:
+                    _restore_parent_grab()
+
+            def _perform_import() -> None:
+                candidate = selected_state.get("candidate")
+                if candidate is None or not bool(candidate.can_import):
+                    return
+
+                try:
+                    confirmed = messagebox.askyesno(
+                        "Import AZ",
+                        (
+                            f"Zaimportować {int(candidate.importable_count)} AZ "
+                            f"z projektu „{candidate.source_display_name}”?\n\n"
+                            "Importowane AZ trafią do projektu docelowego jako "
+                            "imported_pending_review i będą wymagały kontroli w PZ2. "
+                            "Istniejące konflikty nie zostaną nadpisane."
+                        ),
+                        parent=browser,
+                    )
+                except Exception:
+                    confirmed = True
+                if not confirmed:
+                    return
+
+                button = import_button_ref.get("button")
+                if button is not None:
+                    button.config(state=tk.DISABLED)
+                try:
+                    result = import_project_az_bindings(
+                        registry,
+                        source_project_id=candidate.source_project_id,
+                        target_project_id=target_project_id,
+                    )
+                except Exception as exc:
+                    if button is not None:
+                        button.config(state=tk.NORMAL)
+                    try:
+                        self.app.themed_error(
+                            "Import AZ",
+                            f"Nie udało się zaimportować AZ.\n\n{exc}",
+                            parent=browser,
+                        )
+                    except Exception:
+                        messagebox.showerror(
+                            "Import AZ",
+                            str(exc),
+                            parent=browser,
+                        )
+                    return
+
+                result_text = (
+                    f"Zaimportowano: {int(result.imported)}\n"
+                    f"Już przypięte: {int(result.already_bound)}\n"
+                    f"Konflikty: {int(result.conflicts)}\n"
+                    f"Brak cropa targetu: {int(result.target_missing_crop)}\n"
+                    f"Nieprawidłowe źródło: {int(result.invalid_source)}"
+                )
+                try:
+                    self.app.themed_info(
+                        "Import AZ zakończony",
+                        result_text
+                        + "\n\nZaimportowane AZ będą wymagały kontroli w PZ2.",
+                        parent=browser,
+                        tone="success" if int(result.imported) > 0 else "info",
+                    )
+                except Exception:
+                    messagebox.showinfo(
+                        "Import AZ zakończony",
+                        result_text,
+                        parent=browser,
+                    )
+
+                try:
+                    browser.grab_release()
+                except Exception:
+                    pass
+                try:
+                    browser.destroy()
+                except Exception:
+                    pass
+
+                try:
+                    _invalidate_graph_resource_snapshot()
+                    _refresh_rows()
+                    _schedule_resource_modal_refreshes()
+                finally:
+                    _restore_parent_grab()
+
+            tree.bind("<<TreeviewSelect>>", _refresh_selection, add="+")
+            tree.bind("<Double-1>", lambda _event: _perform_import(), add="+")
+
+            tk.Label(
+                browser_body,
+                textvariable=summary_var,
+                fg=muted,
+                bg=browser_bg,
+                font=("Segoe UI", 8),
+                anchor="w",
+                justify=tk.LEFT,
+            ).pack(fill=tk.X, padx=14, pady=(0, 8))
+
+            footer = tk.Frame(browser_body, bg=browser_bg)
+            footer.pack(fill=tk.X, padx=14, pady=(0, 14))
+            import_button = tk.Button(
+                footer,
+                text="Importuj",
+                command=_perform_import,
+                cursor="hand2",
+                bg=blend_hex_colors(field_bg, success, 0.18),
+                fg=fg,
+                relief=tk.FLAT,
+                padx=10,
+                pady=6,
+                state=tk.DISABLED,
+            )
+            import_button.pack(side=tk.RIGHT, padx=(8, 0))
+            import_button_ref["button"] = import_button
+            tk.Button(
+                footer,
+                text="Zamknij",
+                command=_close_browser,
+                cursor="hand2",
+                bg=field_bg,
+                fg=fg,
+                relief=tk.FLAT,
+                padx=10,
+                pady=6,
+            ).pack(side=tk.RIGHT)
+
+            try:
+                browser.protocol("WM_DELETE_WINDOW", _close_browser)
+                browser.transient(dialog)
+                browser.grab_set()
+            except Exception:
+                pass
+            return True
+
         def _run_action(row_key: str, action_kind: str) -> None:
             before_windows = _resource_modal_toplevels()
             refresh_parent_rows = action_kind == "clear"
-            if action_kind == "primary" and row_key in {"plate_run", "char_run"}:
+            if action_kind == "primary" and row_key == "plate_run":
                 base_ready, _image_source_label, _expected_count = _annotation_base_ready_for_import()
                 if not base_ready:
                     try:
@@ -13788,6 +14882,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         refresh_parent_rows = bool(self._choose_master_pool_dir(parent=dialog))
                     elif row_key == "plate_run":
                         _open_annotation_candidate_browser(row_key)
+                        refresh_parent_rows = False
+                    elif row_key == "char_run":
+                        _open_az_project_import_browser()
                         refresh_parent_rows = False
                     elif row_key == "plate_model":
                         self._choose_project_start_model("plate", parent=dialog)
@@ -14873,6 +15970,9 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 resource_tree_state["actions"] = tree_actions
             tree_actions.clear()
             latest_snapshot_by_key: dict[str, object] = {}
+            annotation_base_state = None
+            if show_t02_resource_map:
+                resource_tree_state["snapshots"] = {}
             row_count = max(1, len(row_specs))
             for row_index, (row_key, label, primary_label) in enumerate(row_specs, start=1):
                 if show_t02_resource_map:
@@ -14883,9 +15983,18 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 snap_obj = _snapshot_object(row_key, label)
                 latest_snapshot_by_key[row_key] = snap_obj
                 try:
-                    latest_snapshot_by_key[str(getattr(snap_obj, "canonical_key", "") or row_key)] = snap_obj
+                    canonical_snapshot_key = str(getattr(snap_obj, "canonical_key", "") or row_key)
+                    latest_snapshot_by_key[canonical_snapshot_key] = snap_obj
                 except Exception:
-                    pass
+                    canonical_snapshot_key = row_key
+                if show_t02_resource_map:
+                    try:
+                        live_snapshots = resource_tree_state.get("snapshots")
+                        if isinstance(live_snapshots, dict):
+                            live_snapshots[row_key] = snap_obj
+                            live_snapshots[canonical_snapshot_key] = snap_obj
+                    except Exception:
+                        pass
                 snap = snap_obj.as_dict()
                 row_widgets = widgets.setdefault(row_key, {"row_label": label, "primary_label": primary_label})
                 tone_color = tone_colors.get(str(snap.get("tone") or "muted"), muted)
@@ -14925,29 +16034,49 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         fulfillment = "Do kontroli"
                         fulfillment_color = tone_colors.get("warning", warning)
                 annotation_dependency_blocked = False
-                if row_key in {"plate_run", "char_run"}:
-                    base_ready, _image_source_label, _expected_count = _annotation_base_ready_for_import()
+                if row_key == "plate_run":
+                    if annotation_base_state is None:
+                        annotation_base_state = _annotation_base_ready_for_import()
+                    base_ready, _image_source_label, _expected_count = annotation_base_state
                     annotation_dependency_blocked = not base_ready
-                    if annotation_dependency_blocked:
-                        pending_contract_review = False
-                        present = False
-                        fulfillment = _fulfillment_text(
-                            enabled=bool(spec_enabled),
-                            required=bool(required),
-                            present=False,
-                        )
-                        status_badge = _status_badge_text(
-                            enabled=bool(spec_enabled),
-                            required=bool(required),
-                            present=False,
-                        )
-                        fulfillment_color = tone_colors.get(_fulfillment_tone(fulfillment), muted)
-                primary_enabled = (
-                    spec_enabled
-                    and row_key != "char_run"
-                    and _button_enabled(old_buttons.get(row_key))
-                    and not annotation_dependency_blocked
-                )
+                elif row_key == "char_run":
+                    try:
+                        az_meta = dict(getattr(snap_obj, "meta", {}) or {})
+                    except Exception:
+                        az_meta = {}
+                    az_target_crop_count = int(az_meta.get("crop_count", 0) or 0)
+                    az_target_project_id = str(az_meta.get("project_id") or "").strip()
+                    annotation_dependency_blocked = not (
+                        az_target_project_id
+                        and az_target_crop_count > 0
+                    )
+
+                if annotation_dependency_blocked:
+                    pending_contract_review = False
+                    present = False
+                    fulfillment = _fulfillment_text(
+                        enabled=bool(spec_enabled),
+                        required=bool(required),
+                        present=False,
+                    )
+                    status_badge = _status_badge_text(
+                        enabled=bool(spec_enabled),
+                        required=bool(required),
+                        present=False,
+                    )
+                    fulfillment_color = tone_colors.get(_fulfillment_tone(fulfillment), muted)
+
+                if row_key == "char_run":
+                    primary_enabled = bool(
+                        spec_enabled
+                        and not annotation_dependency_blocked
+                    )
+                else:
+                    primary_enabled = bool(
+                        spec_enabled
+                        and _button_enabled(old_buttons.get(row_key))
+                        and not annotation_dependency_blocked
+                    )
                 more_enabled = spec_enabled
                 clear_enabled = spec_enabled and self._is_project_start_asset_clearable(row_key)
                 tree_actions[(row_key, "primary")] = bool(primary_enabled)
@@ -15069,7 +16198,7 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 path_match = bool(
                     edge.source == "E1"
                     and edge_spec is not None
-                    and normalize_iteration_path(getattr(edge_spec, "path_key", "")) == current_path
+                    and is_transition_path_active(edge_spec, current_path)
                 )
                 stage_status_for_gate = _get_graph_wizard_stage_status("step1") if path_match else None
                 review_pending = any(
@@ -16131,6 +17260,15 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 ),
             )
             return
+
+    # Udostępniamy bieżący opener modala Praca bramki także kartom roboczym.
+    # Dzięki temu kontrolowany powrót z PZ2 może otworzyć Praca T05 bez
+    # pokazywania po drodze samego grafu.
+    try:
+        self._campaign_open_gate_actions_modal = _open_actions
+    except Exception:
+        pass
+
     def _approve(edge_key: str) -> None:
         graph_wizard_stage_status_cache.clear()
         normalized_edge_key = str(edge_key or "").strip()
@@ -19288,13 +20426,41 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
             gate_prefix = str(gate_id or "").strip().upper()
             if gate_prefix and gate_title_body.upper().startswith(gate_prefix):
                 gate_title_body = gate_title_body[len(gate_prefix) :].lstrip(" |:-")
-            gate_title_text = f"{gate_id} {gate_title_body}".strip().upper()
-            long_gate_title = len(gate_title_text) > 34
+            gate_title_text = f"{gate_id} · {gate_title_body}".strip()
             completed = bool(_edge_completed(edge))
             local_zoom = _gate_local_zoom(edge.key)
             resource_status_value = _edge_resource_badge_status(edge)
             work_status_value = _edge_work_compact_status(edge) if _edge_fields_enabled(edge) else ""
             approve_display_label = _edge_approve_label(edge) if _edge_approve_enabled(edge) else "ZATWIERDŹ"
+            gate_work_interrupted = bool(gate_active and _is_t07_graph_edge(edge.key)
+                and _get_t07_repair_interruption_state() and not _current_t07_training_finish_state())
+            gate_step4_interrupted = bool(gate_active and _is_t07_graph_edge(edge.key)
+                and _current_step4_work_interruption_state() and not _current_t07_training_finish_state())
+            gate_training_candidate = bool(gate_active and _is_t07_graph_edge(edge.key)
+                and _current_t07_training_candidate_state() and not _current_t07_training_finish_state())
+            gate_t06_state = {}
+            if gate_active and edge.key == "e3_to_e4":
+                try:
+                    gate_t06_state = dict(_t06_interrupted_work_state() or {})
+                except Exception:
+                    gate_t06_state = {}
+            gate_t06_interrupted = bool(
+                gate_t06_state
+                and not bool(gate_t06_state.get("valid_export_exists"))
+            )
+            # Resolve dynamic copy before measuring it. Optional PZ2 draft after
+            # a valid PZ3 export stays available in the modal, but is not a
+            # graph-level interruption.
+            if gate_work_interrupted or gate_step4_interrupted or gate_t06_interrupted:
+                pending_state = (gate_t06_state if gate_t06_interrupted
+                    else _get_t07_pending_repair_approved_state() if gate_work_interrupted else {})
+                try:
+                    pending_images = int(pending_state.get("unpromoted_approved_images", 0) or 0)
+                except Exception:
+                    pending_images = 0
+                work_status_value = f"PRZERWANE +{pending_images} OK" if pending_images > 0 else "PRZERWANE"
+            elif gate_training_candidate:
+                work_status_value = "WYBIERZ WYNIK"
             rows = (
                 ("BRAMKA", status_text, None, False),
                 ("ZASOBY", resource_status_value, f"gate:{edge.key}:resources", _edge_resources_enabled(edge)),
@@ -19302,104 +20468,34 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 ("ZATWIERDŹ", "", f"gate:{edge.key}:approve", _edge_approve_enabled(edge)),
             )
 
-            title_font = _gate_font(9, local_zoom, "bold")
+            title_font = _gate_font(10, local_zoom, "bold")
             row_label_font = _gate_font(8, local_zoom)
-            row_value_font = _gate_font(8, local_zoom, "bold")
-            detail_label_font = _gate_font(8, local_zoom, "bold")
-            title_layout_font = _gate_layout_font(9, local_zoom, "bold")
+            row_value_font = _gate_font(10, local_zoom, "bold")
+            detail_label_font = _gate_font(8, local_zoom)
+            title_layout_font = _gate_layout_font(10, local_zoom, "bold")
             row_label_layout_font = _gate_layout_font(8, local_zoom)
-            row_value_layout_font = _gate_layout_font(8, local_zoom, "bold")
-            detail_label_layout_font = _gate_layout_font(8, local_zoom, "bold")
-
-            def _measure_text_width(text: object, font_spec) -> float:
-                parts = str(text or "").splitlines() or [""]
-                try:
-                    font_obj = tkfont.Font(root=canvas, font=font_spec)
-                    return float(max((font_obj.measure(part.strip()) for part in parts), default=0))
-                except Exception:
-                    scale = max(1.0, float(local_zoom or 1.0))
-                    return float(max((len(part.strip()) * 5.2 * scale for part in parts), default=0))
-
-            def _measure_text_world_width(text: object, font_spec) -> float:
-                return _measure_text_width(text, font_spec)
-
-            def _font_linespace_world(font_spec, fallback: float) -> float:
-                try:
-                    return float(tkfont.Font(root=canvas, font=font_spec).metrics("linespace"))
-                except Exception:
-                    return float(fallback)
-
-            def _inline_row_width(label: str, value: object, *, approve: bool = False) -> float:
-                clean_value = str(value or "").strip()
-                if approve:
-                    return _measure_text_world_width(approve_display_label, detail_label_layout_font) + 24 * local_zoom
-                if clean_value and clean_value.upper() not in {"OK", "WYBIERZ"}:
-                    return max(
-                        _measure_text_world_width(label, detail_label_layout_font),
-                        _measure_text_world_width(clean_value, row_value_layout_font),
-                    ) + 24 * local_zoom
-                if clean_value:
-                    return (
-                        _measure_text_world_width(label, row_label_layout_font)
-                        + _measure_text_world_width(clean_value.upper(), row_value_layout_font)
-                        + 38 * local_zoom
-                    )
-                return _measure_text_world_width(label, row_label_layout_font) + 24 * local_zoom
-
-            content_widths = [
-                _measure_text_world_width(gate_title_text, title_layout_font) + 26 * local_zoom,
-                _inline_row_width("BRAMKA", status_text),
-                _inline_row_width("ZASOBY", resource_status_value),
-                _inline_row_width("PRACA", work_status_value),
-                _inline_row_width("ZATWIERDŹ", "", approve=True),
-            ]
-            min_gate_w = 104 * local_zoom
-            # Card geometry is in world units. Resizing the viewport (including
-            # the project drawer animation) must not reflow its contents.
-            max_gate_w = 260 * local_zoom
-            gate_w = max(min_gate_w, min(max_gate_w, max(content_widths or [min_gate_w])))
-            title_line_h = _font_linespace_world(title_layout_font, 11 * local_zoom)
-            row_line_h = _font_linespace_world(row_label_layout_font, 10 * local_zoom)
-            detail_line_h = _font_linespace_world(row_value_layout_font, 9 * local_zoom)
-            row_h = max(20 * local_zoom, row_line_h + 7 * local_zoom)
-            title_text_width = max(54, (gate_w - 30 * local_zoom) * graph_zoom_scale)
-            row_text_width = max(1, (gate_w - 24 * local_zoom) * graph_zoom_scale)
-
-            def _wrapped_line_count(text: object, *, chars_per_line: int) -> int:
-                clean_lines = str(text or "").splitlines() or [""]
-                total = 0
-                for clean_line in clean_lines:
-                    length = len(clean_line.strip())
-                    total += max(1, int((length + max(1, chars_per_line) - 1) / max(1, chars_per_line)))
-                return max(1, total)
-
-            try:
-                avg_char_width = max(4.4, tkfont.Font(root=canvas, font=row_value_layout_font).measure("MMMMMMMMMM") / 10)
-            except Exception:
-                avg_char_width = 5.6 * max(1.0, float(local_zoom or 1.0))
-            row_text_width_world = max(1.0, gate_w - 24 * local_zoom)
-            inline_value_chars = max(17, int(max(1.0, row_text_width_world - 54 * local_zoom) / avg_char_width))
-            chars_per_line = max(12, int(max(1.0, row_text_width_world) / avg_char_width))
-            title_lines = _wrapped_line_count(gate_title_text, chars_per_line=chars_per_line)
-            title_h = max(28 * local_zoom, 7 * local_zoom + title_lines * title_line_h)
-
-            def _field_row_height(label: str, value: object, *, is_approve: bool = False) -> float:
-                if is_approve:
-                    approve_lines = _wrapped_line_count(approve_display_label, chars_per_line=chars_per_line)
-                    return max(28 * local_zoom, 7 * local_zoom + approve_lines * detail_line_h)
-                value_text = str(value or "").strip()
-                if value_text and value_text.upper() not in {"OK", "WYBIERZ"}:
-                    value_lines = _wrapped_line_count(value_text, chars_per_line=chars_per_line)
-                    return max(row_h, 7 * local_zoom + (1 + value_lines) * detail_line_h)
-                return row_h
-
-            row_heights = {
-                "BRAMKA": row_h,
-                "ZASOBY": _field_row_height("ZASOBY", resource_status_value),
-                "PRACA": _field_row_height("PRACA", work_status_value),
-                "ZATWIERDŹ": _field_row_height("ZATWIERDŹ", "", is_approve=True),
-            }
-            gate_h = title_h + sum(row_heights.get(str(label).strip().upper(), row_h) for label, _value, _tag, _enabled in rows)
+            row_value_layout_font = _gate_layout_font(10, local_zoom, "bold")
+            detail_label_layout_font = _gate_layout_font(8, local_zoom)
+            field_copies = {label: gate_field_copy(label, value, enabled=enabled,
+                approve_label=approve_display_label) for label, value, _tag, enabled in rows}
+            title_measure = tkfont.Font(root=canvas, font=title_layout_font)
+            primary_measure = tkfont.Font(root=canvas, font=row_value_layout_font)
+            content_widths = [title_measure.measure(gate_title_text) + 32 * local_zoom]
+            content_widths.extend(primary_measure.measure(copy.primary) + 36 * local_zoom
+                                  for copy in field_copies.values())
+            # World geometry stays independent of sidebar and viewport resizing.
+            min_gate_w = 216 * local_zoom
+            max_gate_w = 280 * local_zoom
+            gate_w = max(min_gate_w, min(max_gate_w, max(content_widths)))
+            title_text_width = max(1, (gate_w - 32 * local_zoom) * graph_zoom_scale)
+            title_h = text_height(canvas, gate_title_text, title_layout_font,
+                                  gate_w - 32 * local_zoom) + 18 * local_zoom
+            field_layouts = {label: field_layout(canvas, copy, width=gate_w, scale=local_zoom,
+                caption_font=row_label_layout_font, primary_font=row_value_layout_font,
+                detail_font=detail_label_layout_font) for label, copy in field_copies.items()}
+            row_heights = {label: item["height"] for label, item in field_layouts.items()}
+            row_h = row_heights["BRAMKA"]
+            gate_h = title_h + sum(row_heights[label] for label, _value, _tag, _enabled in rows)
             default_x_shift = 0
             post_clear_x_shift = 0.0
             forced_y_after_clear: float | None = None
@@ -19680,58 +20776,42 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 row_width = 1
                 if is_approve_row:
                     if tag and enabled:
-                        row_fill = blend_hex_colors(fill, graph_card_success, 0.16)
-                        row_outline = blend_hex_colors(graph_card_success, card_bg, 0.18)
+                        row_fill = blend_hex_colors(fill, graph_card_warning, 0.16)
+                        row_outline = blend_hex_colors(graph_card_warning, card_bg, 0.18)
                         row_width = 2
                     else:
                         row_fill = blend_hex_colors(fill, graph_card_disabled, 0.04)
-                work_interrupted = bool(
-                    _is_t07_graph_edge(edge.key)
-                    and str(tag or "").endswith(":actions")
-                    and _get_t07_repair_interruption_state()
-                    and not _current_t07_training_finish_state()
+                is_work_row = bool(tag and str(tag).endswith(":actions"))
+                work_interrupted = is_work_row and gate_work_interrupted
+                step4_work_interrupted = is_work_row and gate_step4_interrupted
+                step4_training_candidate_action = is_work_row and gate_training_candidate
+                t06_work_interrupted = is_work_row and gate_t06_interrupted
+                t06_work_done = bool(
+                    is_work_row
+                    and edge.key == "e3_to_e4"
+                    and str(work_status_value or "").strip().upper() == "WYKONANE"
                 )
-                step4_work_interrupted = bool(
-                    _is_t07_graph_edge(edge.key)
-                    and str(tag or "").endswith(":actions")
-                    and _current_step4_work_interruption_state()
-                    and not _current_t07_training_finish_state()
+                resource_review_action = (
+                    is_work_row
+                    and bool(work_status_value)
+                    and not t06_work_done
                 )
-                step4_training_candidate_action = bool(
-                    _is_t07_graph_edge(edge.key)
-                    and str(tag or "").endswith(":actions")
-                    and _current_t07_training_candidate_state()
-                    and not _current_t07_training_finish_state()
-                )
-                resource_review_action = bool(
-                    str(tag or "").endswith(":actions")
-                    and str(work_status_value or "").strip()
-                )
-                t06_work_interrupted = bool(
-                    edge.key == "e3_to_e4"
-                    and str(tag or "").endswith(":actions")
-                    and _t06_interrupted_work_state()
-                )
-                if work_interrupted or t06_work_interrupted or step4_work_interrupted:
-                    pending_state = (
-                        _t06_interrupted_work_state()
-                        if t06_work_interrupted
-                        else (_get_t07_pending_repair_approved_state() if work_interrupted else {})
-                    )
-                    try:
-                        pending_images = int(pending_state.get("unpromoted_approved_images", 0) or 0)
-                    except Exception:
-                        pending_images = 0
-                    value = f"PRZERWANE +{pending_images} OK" if pending_images > 0 else "PRZERWANE"
+                if t06_work_done:
+                    row_fill = blend_hex_colors(fill, graph_card_success, 0.10)
+                    row_outline = blend_hex_colors(graph_card_success, card_bg, 0.25)
                 elif step4_training_candidate_action:
-                    value = "WYBIERZ WYNIK"
                     row_fill = blend_hex_colors(fill, warning, 0.10)
                     row_outline = blend_hex_colors(warning, card_bg, 0.30)
-                    row_width = 1
                 elif resource_review_action:
                     row_fill = blend_hex_colors(fill, warning, 0.08)
                     row_outline = blend_hex_colors(warning, card_bg, 0.26)
-                    row_width = 1
+                copy = field_copies[label]
+                if enabled and copy.tone == "success" and not (is_work_row or is_approve_row):
+                    row_fill = blend_hex_colors(fill, graph_card_success, 0.10)
+                    row_outline = blend_hex_colors(graph_card_success, card_bg, 0.25)
+                elif is_work_row and not copy.tone:
+                    row_fill = blend_hex_colors(fill, graph_card_accent, 0.04)
+                    row_outline = outline
                 row_tags = (group_tag,)
                 if tag and enabled:
                     row_tags = (group_tag, tag, "gate_button")
@@ -19765,15 +20845,17 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                     tags=rect_tags,
                 )
                 if approve_blink:
+                    row_color = graph_card_warning
+                elif t06_work_done:
                     row_color = graph_card_success
                 elif work_interrupted or t06_work_interrupted or step4_work_interrupted:
-                    row_color = graph_card_accent if tag and enabled else (graph_card_muted if operable else graph_card_disabled)
+                    row_color = graph_card_warning if tag and enabled else (graph_card_muted if operable else graph_card_disabled)
                 elif step4_training_candidate_action:
                     row_color = graph_card_warning if tag and enabled else (graph_card_muted if operable else graph_card_disabled)
                 elif resource_review_action:
                     row_color = graph_card_warning if tag and enabled else (graph_card_muted if operable else graph_card_disabled)
                 elif is_approve_row and tag and enabled:
-                    row_color = graph_card_success
+                    row_color = graph_card_warning
                 elif tag and enabled:
                     row_color = graph_card_accent
                 else:
@@ -19781,23 +20863,6 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                 row_text_color = graph_card_text if operable else graph_card_disabled
                 if tag and not enabled:
                     row_text_color = graph_card_disabled
-                value_color = _graph_card_contrast_color(status_color)
-                if is_resource_row:
-                    value_color = graph_card_success if str(value or "").strip().upper() == "OK" else graph_card_warning
-                if work_interrupted or t06_work_interrupted or step4_work_interrupted:
-                    value_color = graph_card_error
-                if step4_training_candidate_action:
-                    value_color = graph_card_warning
-                if resource_review_action:
-                    value_color = graph_card_warning
-                if str(value or "").strip().upper().startswith("PRZERWANE"):
-                    value_color = graph_card_error
-                resource_detail_layout = bool(
-                    (is_resource_row or str(label or "").strip().upper() == "PRACA")
-                    and value
-                    and str(value).strip().upper() not in {"OK", "WYBIERZ"}
-                    and current_row_h > row_h + 1
-                )
                 if tag and enabled:
                     gate_field_geometry[str(tag)] = {
                         "x0": float(x),
@@ -19806,94 +20871,21 @@ def _render_step1_route_actions(self, frame, *, allow_pending_actions: bool = Tr
                         "y1": float(y0 + current_row_h),
                         "color": str(row_color),
                     }
-                display_label = str(label or "")
-                if is_approve_row:
-                    display_label = approve_display_label or "ZATWIERDŹ"
-                if resource_detail_layout:
-                    canvas.create_text(
-                        x + 16 * local_zoom,
-                        y0 + 4 * local_zoom,
-                        text=display_label,
-                        fill=row_text_color,
-                        anchor="nw",
-                        font=detail_label_font,
-                        width=row_text_width,
-                        justify=tk.LEFT,
-                        tags=text_tags,
-                    )
-                    canvas.create_text(
-                        x + 16 * local_zoom,
-                        y0 + 4 * local_zoom + detail_line_h,
-                        text=str(value).strip(),
-                        fill=value_color,
-                        anchor="nw",
-                        font=row_value_font,
-                        width=row_text_width,
-                        justify=tk.LEFT,
-                        tags=text_tags,
-                    )
-                elif is_approve_row and "\n" in display_label:
-                    approve_title, approve_detail = display_label.split("\n", 1)
-                    canvas.create_text(
-                        x + 16 * local_zoom,
-                        y0 + 5 * local_zoom,
-                        text=approve_title.strip(),
-                        fill=row_text_color,
-                        anchor="nw",
-                        font=detail_label_font,
-                        width=max(1, row_text_width),
-                        justify=tk.LEFT,
-                        tags=text_tags,
-                    )
-                    canvas.create_text(
-                        x + 16 * local_zoom,
-                        y0 + 5 * local_zoom + detail_line_h,
-                        text=approve_detail.strip(),
-                        fill=graph_card_muted,
-                        anchor="nw",
-                        font=row_value_font,
-                        width=max(1, row_text_width),
-                        justify=tk.LEFT,
-                        tags=text_tags,
-                    )
-                else:
-                    canvas.create_text(
-                        x + 16 * local_zoom,
-                        y0 + current_row_h / 2,
-                        text=display_label,
-                        fill=row_text_color,
-                        anchor="w",
-                        font=detail_label_font if is_approve_row else row_label_font,
-                        width=max(1, row_text_width),
-                        justify=tk.LEFT,
-                        tags=text_tags,
-                    )
-                if value and not resource_detail_layout:
-                    if idx == 0:
-                        status_value = str(value).strip().upper()
-                        if status_value == "WYBIERZ":
-                            status_value = "DO WYBORU"
-                        # The row already provides its background and border.
-                        # A second filled rectangle masks the row's outline.
-                        canvas.create_text(
-                            x + gate_w - 12 * local_zoom,
-                            y0 + current_row_h / 2,
-                            text=status_value,
-                            fill=graph_card_muted if status_value == "DO WYBORU" else value_color,
-                            anchor="e",
-                            font=_gate_font(8, local_zoom),
-                            tags=row_tags,
-                        )
-                    else:
-                        canvas.create_text(
-                            x + gate_w - 5 * local_zoom,
-                            y0 + current_row_h / 2,
-                            text=shorten(str(value).upper(), width=inline_value_chars, placeholder="..."),
-                            fill=value_color,
-                            anchor="e",
-                            font=row_value_font,
-                            tags=row_tags,
-                        )
+                primary_color = row_text_color
+                if t06_work_done and enabled:
+                    primary_color = graph_card_success
+                elif enabled and (is_work_row or is_approve_row):
+                    primary_color = graph_card_warning
+                elif copy.tone and (enabled or idx == 0):
+                    primary_color = {"success": graph_card_success, "warning": graph_card_warning,
+                                     "error": graph_card_error}.get(copy.tone, row_text_color)
+                draw_field(canvas, copy, field_layouts[label], x=x, y=y0, width=gate_w,
+                    scale=local_zoom, zoom=graph_zoom_scale,
+                    fonts={"caption": row_label_font, "primary": row_value_font, "detail": detail_label_font},
+                    colors={"caption": graph_card_muted if operable else graph_card_disabled,
+                            "primary": primary_color,
+                            "detail": graph_card_muted if operable else graph_card_disabled},
+                    tags=text_tags, enabled=bool(tag and enabled))
                 row_y += current_row_h
 
             _draw_corner_drag_handle(

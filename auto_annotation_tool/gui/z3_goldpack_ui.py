@@ -11,10 +11,14 @@ import tkinter as tk
 import uuid
 from pathlib import Path
 from .z3_metadata_cache import read_preview_metadata
+from .z3_gt_box_policy import working_characters
+from . import z3_dataset_provenance
+from . import z3_review_runtime
 
 import cv2
 
 from ..campaign_manager import CAMPAIGN
+from ..mobile_acquisition import acquisition_provenance
 from .web_slim_scrollbar import blend_hex_colors
 
 
@@ -60,7 +64,7 @@ def format_perfect_strategy_counts(counts: dict, perfect_strategy_buckets) -> st
         f"{label}: {int(safe_counts.get(key, 0))}"
         for key, label in perfect_strategy_buckets
     ]
-    return "Tablice perfect wg strategii: " + " | ".join(parts)
+    return "Sprawdzone tablice według sposobu przygotowania: " + " | ".join(parts)
 
 
 def empty_plate_layout_counts() -> dict:
@@ -138,8 +142,23 @@ def get_gold_export_split_percentages(host) -> tuple[float, float, float]:
 
 
 def build_gold_export_plate_unique_key(data: dict) -> str:
+    """Deduplicate logical crops across runs, retaining legacy source fallback."""
     if not isinstance(data, dict):
         return ""
+
+    # Registry IDs describe the logical crop; artifact IDs describe individual
+    # encodings. Missing legacy source fields must not merge distinct imports.
+    crop_id = str(data.get("crop_id") or "").strip()
+    if crop_id:
+        return "crop:" + crop_id
+
+    identity_sha = str(data.get("crop_identity_sha256") or "").strip().lower()
+    if len(identity_sha) == 64 and all(char in "0123456789abcdef" for char in identity_sha):
+        return "crop-identity:" + identity_sha
+
+    acquisition = data.get("mobile_acquisition")
+    if isinstance(acquisition, dict) and acquisition.get("archive_sha256") and acquisition.get("group_key"):
+        return "mobile:" + acquisition["archive_sha256"] + ":" + acquisition["group_key"]
 
     source_image = str(data.get("source_image", "u") or "u")
     source_bbox = data.get("source_bbox") or []
@@ -183,11 +202,16 @@ def collect_gold_export_plate_candidates(host, selected_buckets, selected_source
     for meta in meta_candidates:
         run_dir = meta.parent
         metadata = read_preview_metadata(host, meta)
+        if prepare_records:
+            from .z3_plate_gt_runtime import refresh_working_ground_truth
+            if refresh_working_ground_truth(host, metadata):
+                from .z3_metadata_cache import mark_preview_metadata_changed
+                mark_preview_metadata_changed(host)
         with os.scandir(run_dir / "images") as image_entries:
             image_names = {entry.name for entry in image_entries if entry.is_file()}
 
         for pid, source_data in metadata.items():
-            if not isinstance(source_data, dict) or source_data.get("status") != "perfect":
+            if not is_gold_export_eligible_data(source_data):
                 continue
             data = source_data
             if prepare_records:
@@ -225,6 +249,14 @@ def collect_gold_export_plate_candidates(host, selected_buckets, selected_source
             selected_strategy_counts[strategy_bucket] += 1
             if source_bucket in selected_source_counts:
                 selected_source_counts[source_bucket] += 1
+            provenance = (
+                z3_dataset_provenance.classify_plate_dataset_provenance(
+                    host,
+                    data,
+                    meta_path=meta,
+                    source_bucket=source_bucket,
+                )
+            )
             plate_entries.append(
                 {
                     "pid": str(pid),
@@ -233,6 +265,7 @@ def collect_gold_export_plate_candidates(host, selected_buckets, selected_source
                     "img_src": img_src,
                     "strategy_bucket": strategy_bucket,
                     "source_bucket": source_bucket,
+                    "provenance": provenance,
                 }
             )
 
@@ -253,9 +286,7 @@ def count_exportable_characters_in_data(host, data: dict) -> int:
 def count_exportable_perfect_plates_in_metadata(host, metadata_map) -> int:
     count = 0
     for _pid, data in (metadata_map or {}).items():
-        if not isinstance(data, dict):
-            continue
-        if str(data.get("status", "unknown") or "unknown").strip().lower() != "perfect":
+        if not is_gold_export_eligible_data(data):
             continue
         if host._count_exportable_characters_in_data(data) > 0:
             count += 1
@@ -323,9 +354,7 @@ def _compute_contextual_gold_export_counts(host, *, selected_strategies=None, se
 
     metadata_map = _get_contextual_gold_metadata(host)
     for _pid, data in (metadata_map or {}).items():
-        if not isinstance(data, dict):
-            continue
-        if str(data.get("status", "unknown") or "unknown").strip().lower() != "perfect":
+        if not is_gold_export_eligible_data(data):
             continue
 
         strategy_bucket = host._get_perfect_strategy_bucket(data)
@@ -381,6 +410,7 @@ def _compute_statuses_in_metadata_mapping(host, metadata_map):
     needs_fix = 0
     unknown = 0
     char_boxes = 0
+    approved_char_boxes = 0
     strategy_counts = host._empty_perfect_strategy_counts()
     strategy_char_counts = host._empty_perfect_strategy_counts()
     source_counts = host._empty_gold_source_counts()
@@ -394,7 +424,7 @@ def _compute_statuses_in_metadata_mapping(host, metadata_map):
             continue
 
         try:
-            char_boxes += len(list(data.get("characters", []) or []))
+            char_boxes += len(working_characters(host, data))
         except Exception:
             pass
 
@@ -405,13 +435,15 @@ def _compute_statuses_in_metadata_mapping(host, metadata_map):
         if status == "perfect":
             perfect += 1
             layout_perfect_counts[layout_label] = int(layout_perfect_counts.get(layout_label, 0) or 0) + 1
-            bucket = host._get_perfect_strategy_bucket(data)
-            source_bucket = host._get_plate_source_bucket(data)
-            strategy_counts[bucket] += 1
-            strategy_char_counts[bucket] += host._count_exportable_characters_in_data(data)
-            if source_bucket in source_counts:
-                source_counts[source_bucket] += 1
-                source_char_counts[source_bucket] += host._count_exportable_characters_in_data(data)
+            if is_gold_export_eligible_data(data):
+                approved_char_boxes += host._count_exportable_characters_in_data(data)
+                bucket = host._get_perfect_strategy_bucket(data)
+                source_bucket = host._get_plate_source_bucket(data)
+                strategy_counts[bucket] += 1
+                strategy_char_counts[bucket] += host._count_exportable_characters_in_data(data)
+                if source_bucket in source_counts:
+                    source_counts[source_bucket] += 1
+                    source_char_counts[source_bucket] += host._count_exportable_characters_in_data(data)
         elif status == "needs_fix":
             needs_fix += 1
         else:
@@ -423,6 +455,7 @@ def _compute_statuses_in_metadata_mapping(host, metadata_map):
         "unknown": unknown,
         "total": perfect + needs_fix + unknown,
         "char_boxes": int(char_boxes),
+        "approved_char_boxes": int(approved_char_boxes),
         "strategy_counts": strategy_counts,
         "strategy_char_counts": strategy_char_counts,
         "source_counts": source_counts,
@@ -459,9 +492,7 @@ def build_merged_gold_export_counts(host, *, selected_strategies=None, selected_
             continue
 
         for pid, data in metadata.items():
-            if not isinstance(data, dict):
-                continue
-            if str(data.get("status", "unknown") or "unknown").strip().lower() != "perfect":
+            if not is_gold_export_eligible_data(data):
                 continue
             data = _copy_gold_candidate_for_normalization(data)
 
@@ -605,6 +636,201 @@ def get_gold_export_meta_candidates(host) -> list[Path]:
     return meta_candidates
 
 
+
+GOLD_EXPORT_ARTIFACT_SCHEMA = "alpr.pz3.gold_export_artifact.v1"
+
+
+def validate_gold_export_artifact_contract(
+    dataset_dir: Path,
+    readiness_snapshot: dict | None,
+) -> dict:
+    """
+    Validate the finished PZ3 source dataset against:
+    1) the persisted metadata_manifest.json,
+    2) the actual files/label rows on disk,
+    3) the readiness snapshot that authorized the export.
+    """
+    result = {
+        "ok": False,
+        "message": "",
+        "plate_count": 0,
+        "character_count": 0,
+        "readiness_plate_count": 0,
+        "readiness_character_count": 0,
+        "min_exportable_plate_count": 0,
+    }
+
+    try:
+        root = Path(dataset_dir)
+    except Exception:
+        result["message"] = "Niepoprawna ścieżka datasetu."
+        return result
+
+    manifest_path = root / "metadata_manifest.json"
+    if not manifest_path.exists() or not manifest_path.is_file():
+        result["message"] = "Brak metadata_manifest.json po eksporcie PZ3."
+        return result
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        result["message"] = f"Nie można odczytać metadata_manifest.json: {exc}"
+        return result
+
+    if not isinstance(manifest, dict):
+        result["message"] = "metadata_manifest.json nie jest obiektem JSON."
+        return result
+
+    if str(manifest.get("dataset_type") or "").strip() != "char_yolo_detect":
+        result["message"] = "Manifest nie opisuje datasetu char_yolo_detect."
+        return result
+
+    items = manifest.get("items")
+    if not isinstance(items, list):
+        result["message"] = "Manifest nie zawiera poprawnej listy items."
+        return result
+
+    try:
+        manifest_plate_count = int(manifest.get("plate_count", 0) or 0)
+        manifest_char_count = int(manifest.get("character_count", 0) or 0)
+    except Exception:
+        result["message"] = "Manifest ma niepoprawne liczniki plate_count/character_count."
+        return result
+
+    result["plate_count"] = manifest_plate_count
+    result["character_count"] = manifest_char_count
+
+    if manifest_plate_count != len(items):
+        result["message"] = (
+            "Niespójny manifest: plate_count nie odpowiada liczbie items "
+            f"({manifest_plate_count} != {len(items)})."
+        )
+        return result
+
+    manifest_chars_from_items = 0
+    seen_pids = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            result["message"] = "Manifest zawiera niepoprawny wpis items."
+            return result
+
+        pid = str(item.get("pid") or "").strip()
+        if not pid:
+            result["message"] = "Manifest zawiera wpis bez pid."
+            return result
+        if pid in seen_pids:
+            result["message"] = f"Manifest zawiera zduplikowany pid: {pid}."
+            return result
+        seen_pids.add(pid)
+
+        chars = item.get("characters")
+        if not isinstance(chars, list):
+            result["message"] = f"Manifest dla {pid} nie zawiera listy characters."
+            return result
+        manifest_chars_from_items += len(chars)
+
+        image_rel = str(item.get("image_path") or "").strip()
+        label_rel = str(item.get("label_path") or "").strip()
+        if not image_rel or not label_rel:
+            result["message"] = f"Manifest dla {pid} nie zawiera ścieżki obrazu lub etykiety."
+            return result
+
+        image_path = root / image_rel
+        label_path = root / label_rel
+        if not image_path.exists() or not image_path.is_file():
+            result["message"] = f"Brak wyeksportowanego obrazu dla {pid}: {image_rel}."
+            return result
+        try:
+            if image_path.stat().st_size <= 0:
+                result["message"] = f"Wyeksportowany obraz dla {pid} jest pusty."
+                return result
+        except Exception:
+            result["message"] = f"Nie można sprawdzić obrazu dla {pid}."
+            return result
+
+        if not label_path.exists() or not label_path.is_file():
+            result["message"] = f"Brak wyeksportowanej etykiety dla {pid}: {label_rel}."
+            return result
+
+        try:
+            label_rows = [
+                line.strip()
+                for line in label_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        except Exception as exc:
+            result["message"] = f"Nie można odczytać etykiety dla {pid}: {exc}"
+            return result
+
+        if len(label_rows) != len(chars):
+            result["message"] = (
+                f"Niespójna etykieta dla {pid}: plik ma {len(label_rows)} obiektów, "
+                f"manifest opisuje {len(chars)}."
+            )
+            return result
+
+    if manifest_char_count != manifest_chars_from_items:
+        result["message"] = (
+            "Niespójny manifest: character_count nie odpowiada sumie characters "
+            f"({manifest_char_count} != {manifest_chars_from_items})."
+        )
+        return result
+
+    readiness = readiness_snapshot if isinstance(readiness_snapshot, dict) else {}
+    try:
+        readiness_plate_count = int(readiness.get("selected_plate_count", 0) or 0)
+        readiness_char_count = int(readiness.get("selected_char_count", 0) or 0)
+        min_plate_count = int(readiness.get("min_exportable_plate_count", 0) or 0)
+    except Exception:
+        result["message"] = "Snapshot readiness ma niepoprawne liczniki."
+        return result
+
+    result["readiness_plate_count"] = readiness_plate_count
+    result["readiness_character_count"] = readiness_char_count
+    result["min_exportable_plate_count"] = min_plate_count
+
+    if manifest_plate_count != readiness_plate_count:
+        result["message"] = (
+            "Eksport nie odpowiada preflightowi PZ3: liczba tablic zmieniła się "
+            f"({readiness_plate_count} -> {manifest_plate_count})."
+        )
+        return result
+
+    if manifest_char_count != readiness_char_count:
+        result["message"] = (
+            "Eksport nie odpowiada preflightowi PZ3: liczba znaków zmieniła się "
+            f"({readiness_char_count} -> {manifest_char_count})."
+        )
+        return result
+
+    manifest_source_hash = str(
+        manifest.get("gold_source_contract_sha256") or ""
+    ).strip()
+    readiness_source_hash = str(
+        readiness.get("gold_source_contract_sha256") or ""
+    ).strip()
+    if (
+        readiness_source_hash
+        and manifest_source_hash != readiness_source_hash
+    ):
+        result["message"] = (
+            "Eksport nie odpowiada preflightowi PZ3: fingerprint "
+            "źródłowego GOLD jest inny."
+        )
+        return result
+
+    if min_plate_count > 0 and manifest_plate_count < min_plate_count:
+        result["message"] = (
+            f"Gotowy artefakt ma {manifest_plate_count} tablic, "
+            f"poniżej minimum {min_plate_count}."
+        )
+        return result
+
+    result["ok"] = True
+    return result
+
+
 def run_yolo_gold_export(
     host,
     *,
@@ -616,23 +842,58 @@ def run_yolo_gold_export(
     selected_labels = host._format_selected_gold_export_strategy_labels()
     selected_sources = host._get_selected_gold_export_source_buckets()
     selected_source_labels = host._format_selected_gold_export_source_labels()
-    split_enabled = False
-    train_pct, val_pct, test_pct = host._get_gold_export_split_percentages()
-
     if not selected_buckets:
         host._set_console_text(
             host.export_console,
-            "❌ Nie wybrano żadnej strategii perfect do eksportu gold packa.\n\n"
+            "❌ Nie wybrano żadnego sposobu przygotowania danych do eksportu.\n\n"
             "Zaznacz co najmniej jedną z opcji: OCR exact, YOLO exact, OCR + YOLO rescue, YOLO boxy + OCR lub Manual / inne perfect."
         )
         return
     if not selected_sources:
         host._set_console_text(
             host.export_console,
-            "❌ Nie wybrano żadnego źródła do eksportu gold packa.\n\n"
+            "❌ Nie wybrano żadnego źródła danych do eksportu.\n\n"
             "Zaznacz Auto z runu lub Ręczne poprawki lokalne. Poprawki CVAT po imporcie są dołączane automatycznie."
         )
         return
+
+    try:
+        export_readiness = host._get_step3_yolo_export_readiness_snapshot(
+            selected_strategies=selected_buckets,
+            selected_sources=selected_sources,
+        )
+    except Exception as exc:
+        host._set_console_text(
+            host.export_console,
+            "❌ Nie można potwierdzić gotowości eksportu PZ3.\n\n"
+            f"{exc}"
+        )
+        return
+
+    if not bool(export_readiness.get("ok")):
+        readiness_message = str(
+            export_readiness.get("message", "") or ""
+        ).strip()
+        host._set_console_text(
+            host.export_console,
+            "❌ Eksport PZ3 zablokowany przez bramkę gotowości.\n\n"
+            + (
+                readiness_message
+                or "Aktualnie zatwierdzone dane nie spełniają jeszcze warunków eksportu."
+            )
+        )
+        try:
+            host.app.update_status(
+                readiness_message
+                or "Utworzenie zbioru pozostaje zablokowane do czasu sprawdzenia i zatwierdzenia wymaganej liczby tablic.",
+                "warning",
+            )
+        except Exception:
+            pass
+        return
+
+    split_enabled = False
+    train_pct, val_pct, test_pct = host._get_gold_export_split_percentages()
 
     split_line = "Wariant/split: przygotujesz w Z4"
     host._set_console_text(
@@ -653,6 +914,34 @@ def run_yolo_gold_export(
             total_source_counts,
             copied_source_counts,
         ) = host._collect_gold_export_plate_candidates(selected_buckets, selected_sources)
+
+        prepared_source_contract = (
+            z3_dataset_provenance.build_gold_source_contract_fingerprint(
+                plate_entries
+            )
+        )
+        expected_source_contract_hash = str(
+            export_readiness.get("gold_source_contract_sha256") or ""
+        ).strip()
+        prepared_source_contract_hash = str(
+            prepared_source_contract.get("sha256") or ""
+        ).strip()
+        if (
+            expected_source_contract_hash
+            and prepared_source_contract_hash != expected_source_contract_hash
+        ):
+            host._set_console_text(
+                host.export_console,
+                "❌ Eksport przerwany: zatwierdzony materiał zmienił się "
+                "pomiędzy preflightem a przygotowaniem eksportu."
+            )
+            try:
+                if host._step3_linear_mode and CAMPAIGN.get_active_project_name():
+                    CAMPAIGN.set_step3_needs_rework()
+            except Exception:
+                pass
+            return
+
         if not host._confirm_export_with_uncertain_layouts(plate_entries, export_label="YOLO Detect znaków"):
             host._set_console_text(
                 host.export_console,
@@ -660,6 +949,7 @@ def run_yolo_gold_export(
             )
             return
         export_entries = []
+        benchmark_plate_records = []
 
         for plate_entry in plate_entries:
             pid = str(plate_entry.get("pid", "") or "")
@@ -667,6 +957,9 @@ def run_yolo_gold_export(
             data = plate_entry.get("data", {})
             strategy_bucket = str(plate_entry.get("strategy_bucket", "") or "")
             source_bucket = str(plate_entry.get("source_bucket", "") or "")
+            provenance = dict(
+                plate_entry.get("provenance", {}) or {}
+            )
             layout_meta = host._build_plate_layout_export_metadata(data)
             img = cv2.imread(str(img_src))
             if img is None:
@@ -697,6 +990,10 @@ def run_yolo_gold_export(
                         "reading_col": int(c.get("reading_col", 0) or 0),
                         "reading_index": int(c.get("reading_index", 0) or 0),
                         "source_tag": str(host._get_character_source_tag(c, data=data) or ""),
+                        "provenance_category": str(
+                            provenance.get("category")
+                            or z3_dataset_provenance.LEGACY_UNTRACKED
+                        ),
                         "confidence": float(c.get("confidence", 0.0) or 0.0),
                     }
                 )
@@ -713,20 +1010,23 @@ def run_yolo_gold_export(
                     "source_bucket": source_bucket,
                     "source_pid": pid,
                     "source_image": str(data.get("source_image", "") or ""),
+                    **acquisition_provenance(data),
+                    "provenance": provenance,
                     "layout": layout_meta,
                     "characters": exported_chars_meta,
                 }
             )
+            benchmark_plate_records.append(data)
 
         copied = len(export_entries)
         if copied == 0:
             msg = (
                 "❌ NIE UDAŁO SIĘ UTWORZYĆ DATASETU YOLO.\n\n"
                 f"Powód: po filtrze strategii ({selected_labels}) i źródeł ({selected_source_labels}) "
-                "nie znaleziono ani jednej tablicy ze statusem perfect.\n\n"
-                "Tablica perfect musi mieć przynajmniej jeden poprawny box znaku z etykietą. Puste tablice nie są eksportowane.\n\n"
-                f"Dostępne tablice perfect wg strategii przed deduplikacją:\n{host._format_perfect_strategy_counts(total_strategy_counts)}\n"
-                f"Dostępne tablice perfect wg źródeł: "
+                "nie znaleziono ani jednej zatwierdzonej tablicy gotowej do eksportu.\n\n"
+                "Zatwierdzona tablica musi mieć przynajmniej jedną poprawną ramkę znaku z etykietą. Puste tablice nie są eksportowane.\n\n"
+                f"Sprawdzone tablice według sposobu przygotowania przed usunięciem duplikatów:\n{host._format_perfect_strategy_counts(total_strategy_counts)}\n"
+                f"Sprawdzone tablice według źródła: "
                 f"{' | '.join(f'{gold_source_labels[key]}: {int(total_source_counts.get(key, 0) or 0)}' for key, _ in gold_source_buckets)}\n\n"
                 "CO DALEJ:\n"
                 "1. Możesz rozszerzyć zaznaczone strategie w pz3.\n"
@@ -749,7 +1049,7 @@ def run_yolo_gold_export(
 
             try:
                 host.app.update_status(
-                    "Nie utworzono gold packa — pozostajesz w z3/pz3, aby kontynuować pracę.",
+                    "Nie utworzono zbioru znaków. Wróć do sprawdzania tablic i uzupełnij materiał.",
                     "warning"
                 )
             except Exception:
@@ -771,12 +1071,12 @@ def run_yolo_gold_export(
             if preview_train <= 0 or preview_val <= 0:
                 msg = (
                     "❌ NIE UDAŁO SIĘ PRZYGOTOWAĆ POPRAWNEGO DATASETU DO TRENINGU.\n\n"
-                    f"Do gold packa przeszło tylko {copied} tablic(y), więc przy splicie "
+                    f"Do zbioru przeszło tylko {copied} tablic(y), więc przy splicie "
                     f"{train_pct:.0f}/{val_pct:.0f}/{test_pct:.0f} dostaniesz:\n"
                     f"train={preview_train}, val={preview_val}, test={preview_test}\n\n"
                     "To nie wystarczy do treningu, bo dataset musi mieć co najmniej 1 obraz w train i 1 obraz w val.\n\n"
                     "CO DALEJ:\n"
-                    "1. Dodaj więcej tablic perfect do gold packa.\n"
+                    "1. Sprawdź i zatwierdź więcej tablic.\n"
                     "2. Zmień proporcje splitu tak, aby train i val nie były puste.\n"
                     "3. Wróć do PZ2 / CVAT i popraw więcej tablic."
                 )
@@ -786,7 +1086,7 @@ def run_yolo_gold_export(
                         gold_dataset_path="",
                         review_pack_path="",
                         retry_pack_path="",
-                        note="Gold pack znaków jest za mały, by przygotować poprawny split train / val / test."
+                        note="Zbiór zatwierdzonych znaków jest za mały, by przygotować poprawny split train / val / test."
                     )
                     failure_summary["gold_dataset_valid"] = False
                     failure_summary["gold_dataset_validation_message"] = msg
@@ -857,6 +1157,7 @@ def run_yolo_gold_export(
                     "pid": str(item.get("pid", "")),
                     "source_pid": str(item.get("source_pid", "")),
                     "source_image": str(item.get("source_image", "")),
+                    **acquisition_provenance(item),
                     "split": split_name,
                     "image_path": (
                         f"images/{split_name}/{item.get('pid')}.jpg"
@@ -870,6 +1171,7 @@ def run_yolo_gold_export(
                     ),
                     "strategy_bucket": str(item.get("strategy_bucket", "")),
                     "source_bucket": str(item.get("source_bucket", "")),
+                    "provenance": dict(item.get("provenance", {}) or {}),
                     "layout": layout_meta,
                     "characters": list(item.get("characters", []) or []),
                 }
@@ -887,20 +1189,137 @@ def run_yolo_gold_export(
             else "brak danych"
         )
 
+        provenance_counts = (
+            z3_dataset_provenance.summarize_dataset_provenance(
+                manifest_items
+            )
+        )
+        az_reuse_summary = (
+            z3_dataset_provenance.summarize_dataset_az_reuse(
+                manifest_items
+            )
+        )
+        raw_benchmark = (
+            z3_dataset_provenance.build_gt_blind_raw_benchmark(
+                benchmark_plate_records
+            )
+        )
+        dataset_revision_ids = (
+            z3_dataset_provenance.collect_dataset_revision_ids(
+                manifest_items
+            )
+        )
+
+        manifest_payload = {
+            "schema": GOLD_EXPORT_ARTIFACT_SCHEMA,
+            "dataset_type": "char_yolo_detect",
+            "created_at": timestamp,
+            "provenance_schema": z3_dataset_provenance.PROVENANCE_SCHEMA,
+            "provenance_counts": provenance_counts,
+            "az_reuse_summary": az_reuse_summary,
+            "raw_benchmark": raw_benchmark,
+            "gt_contract_fingerprint_sha256": str(
+                raw_benchmark.get(
+                    "gt_contract_fingerprint_sha256"
+                )
+                or ""
+            ),
+            "gt_revision_ids": list(
+                dataset_revision_ids.get(
+                    "gt_revision_ids",
+                    [],
+                )
+                or []
+            ),
+            "geometry_revision_ids": list(
+                dataset_revision_ids.get(
+                    "geometry_revision_ids",
+                    [],
+                )
+                or []
+            ),
+            "split_enabled": bool(split_enabled),
+            "selected_strategies": sorted(selected_buckets),
+            "selected_sources": sorted(selected_sources),
+            "gold_source_contract_schema": str(
+                prepared_source_contract.get("schema") or ""
+            ),
+            "gold_source_contract_sha256": str(
+                prepared_source_contract.get("sha256") or ""
+            ),
+            "readiness_plate_count": int(
+                export_readiness.get("selected_plate_count", 0) or 0
+            ),
+            "readiness_character_count": int(
+                export_readiness.get("selected_char_count", 0) or 0
+            ),
+            "readiness_min_exportable_plate_count": int(
+                export_readiness.get("min_exportable_plate_count", 0) or 0
+            ),
+            "plate_count": int(exported_plate_count),
+            "character_count": int(exported_char_count),
+            "layout_counts": {
+                str(key): int(value)
+                for key, value in sorted(layout_counts.items())
+            },
+            "items": manifest_items,
+        }
         host._atomic_write_json(
             yolo_out / "metadata_manifest.json",
-            {
-                "dataset_type": "char_yolo_detect",
-                "created_at": timestamp,
-                "split_enabled": bool(split_enabled),
-                "selected_strategies": sorted(selected_buckets),
-                "selected_sources": sorted(selected_sources),
-                "plate_count": int(exported_plate_count),
-                "character_count": int(exported_char_count),
-                "layout_counts": {str(key): int(value) for key, value in sorted(layout_counts.items())},
-                "items": manifest_items,
-            },
+            manifest_payload,
         )
+
+        artifact_validation = validate_gold_export_artifact_contract(
+            yolo_out,
+            export_readiness,
+        )
+        if not bool(artifact_validation.get("ok")):
+            validation_message = str(
+                artifact_validation.get("message") or
+                "Końcowy artefakt PZ3 nie przeszedł kontroli spójności."
+            ).strip()
+            host._set_console_text(
+                host.export_console,
+                "❌ EKSPORT PZ3 NIE PRZESZEDŁ KOŃCOWEJ KONTROLI SPÓJNOŚCI.\n\n"
+                + validation_message
+            )
+            try:
+                failure_summary = host._build_step3_export_summary(
+                    gold_dataset_path=str(yolo_out),
+                    review_pack_path="",
+                    retry_pack_path="",
+                    note=(
+                        "Źródłowy dataset został zapisany, ale nie przeszedł "
+                        "kontroli readiness ↔ manifest ↔ pliki."
+                    ),
+                )
+                failure_summary["exportable_plate_count"] = int(
+                    artifact_validation.get("plate_count", 0) or 0
+                )
+                failure_summary["exportable_char_count"] = int(
+                    artifact_validation.get("character_count", 0) or 0
+                )
+                failure_summary["gold_dataset_valid"] = False
+                failure_summary["gold_dataset_validation_message"] = validation_message
+                failure_summary["metadata_manifest_path"] = str(
+                    yolo_out / "metadata_manifest.json"
+                )
+                failure_summary["gold_export_artifact_schema"] = (
+                    GOLD_EXPORT_ARTIFACT_SCHEMA
+                )
+                host._write_step3_export_summary(failure_summary)
+            except Exception:
+                pass
+            try:
+                if host._step3_linear_mode and CAMPAIGN.get_active_project_name():
+                    CAMPAIGN.set_step3_needs_rework()
+            except Exception:
+                pass
+            try:
+                host._update_step3_finish_button_state()
+            except Exception:
+                pass
+            return
 
         split_info_text = (
             f"train={split_stats.get('train', 0)}, val={split_stats.get('val', 0)}, test={split_stats.get('test', 0)}"
@@ -919,8 +1338,10 @@ def run_yolo_gold_export(
                 f"Split: {split_info_text}",
                 f"Ścieżka: {yolo_out}",
                 (
-                    "Dalej: przejdź do Z4, aby przygotować wariant treningowy i split, "
-                    "albo zostań w Z3 / PZ3 i wykonaj kolejny eksport źródłowy."
+                    "Dalej: 1. Kliknij „Przekaż dataset i wróć do grafu”.\n"
+                    "2. Na grafie w bramce T05 kliknij „Zatwierdź bramkę”.\n"
+                    "3. Po zatwierdzeniu T05 projekt przejdzie do E4Z; wybierz „Otwórz Z4”, "
+                    "aby przygotować wariant treningowy i split."
                 ),
             ]
         )
@@ -944,6 +1365,24 @@ def run_yolo_gold_export(
             }
             success_summary["gold_dataset_valid"] = True
             success_summary["gold_dataset_validation_message"] = ""
+            success_summary["metadata_manifest_path"] = str(
+                yolo_out / "metadata_manifest.json"
+            )
+            success_summary["gold_export_artifact_schema"] = (
+                GOLD_EXPORT_ARTIFACT_SCHEMA
+            )
+            success_summary["gold_source_contract_schema"] = str(
+                prepared_source_contract.get("schema") or ""
+            )
+            success_summary["gold_source_contract_sha256"] = str(
+                prepared_source_contract.get("sha256") or ""
+            )
+            success_summary["readiness_plate_count"] = int(
+                export_readiness.get("selected_plate_count", 0) or 0
+            )
+            success_summary["readiness_char_count"] = int(
+                export_readiness.get("selected_char_count", 0) or 0
+            )
             host._write_step3_export_summary(success_summary)
             try:
                 from . import z3_campaign_flow
@@ -964,7 +1403,7 @@ def run_yolo_gold_export(
         )
         host._log(
             host.export_console,
-            "[INFO] Dostępne tablice perfect wg źródeł: "
+            "[INFO] Sprawdzone tablice według źródła: "
             + " | ".join(
                 f"{gold_source_labels[key]}={int(total_source_counts.get(key, 0) or 0)}"
                 for key, _ in gold_source_buckets
@@ -1192,9 +1631,9 @@ def run_char_classification_export(
             msg = (
                 "❌ NIE UDAŁO SIĘ UTWORZYĆ DATASETU ZNAKÓW.\n\n"
                 f"Powód: po filtrze strategii ({selected_labels}) i źródeł ({selected_source_labels}) "
-                "nie znaleziono ani jednej tablicy ze statusem perfect.\n\n"
-                f"Dostępne tablice perfect wg strategii przed deduplikacją:\n{host._format_perfect_strategy_counts(total_strategy_counts)}\n"
-                f"Dostępne tablice perfect wg źródeł: "
+                "nie znaleziono ani jednej zatwierdzonej tablicy gotowej do eksportu.\n\n"
+                f"Sprawdzone tablice według sposobu przygotowania przed usunięciem duplikatów:\n{host._format_perfect_strategy_counts(total_strategy_counts)}\n"
+                f"Sprawdzone tablice według źródła: "
                 f"{' | '.join(f'{gold_source_labels[key]}: {int(total_source_counts.get(key, 0) or 0)}' for key, _ in gold_source_buckets)}\n\n"
                 "CO DALEJ:\n"
                 "1. Możesz rozszerzyć zaznaczone strategie w pz3.\n"
@@ -1212,6 +1651,7 @@ def run_char_classification_export(
 
         char_entries = []
         skipped_chars = 0
+        benchmark_plate_records = []
 
         for plate_entry in plate_entries:
             data = plate_entry.get("data", {})
@@ -1219,12 +1659,16 @@ def run_char_classification_export(
             pid = str(plate_entry.get("pid", "") or "")
             strategy_bucket = str(plate_entry.get("strategy_bucket", "") or "")
             source_bucket = str(plate_entry.get("source_bucket", "") or "")
+            provenance = dict(
+                plate_entry.get("provenance", {}) or {}
+            )
             layout_meta = host._build_plate_layout_export_metadata(data)
 
             img = cv2.imread(str(img_src))
             if img is None:
                 continue
 
+            plate_char_start = len(char_entries)
             for idx, rec in enumerate(list(data.get("characters", []) or [])):
                 if not isinstance(rec, dict):
                     skipped_chars += 1
@@ -1257,11 +1701,17 @@ def run_char_classification_export(
                         "image": crop,
                         "plate_id": pid,
                         "source_image": str(data.get("source_image", "") or ""),
+                        **acquisition_provenance(data),
                         "strategy_bucket": strategy_bucket,
                         "fusion_strategy": str(data.get("fusion_strategy", "") or ""),
                         "source_tag": str(source_tag or ""),
                         "source_bucket": source_bucket,
                         "source_kind": str(host._get_character_source_kind(rec, data=data)),
+                        "provenance": dict(provenance),
+                        "provenance_category": str(
+                            provenance.get("category")
+                            or z3_dataset_provenance.LEGACY_UNTRACKED
+                        ),
                         "confidence": confidence,
                         "bbox": [float(v) for v in (rec.get("bbox", []) or [])[:4]],
                         "reading_row": int(rec.get("reading_row", 0) or 0),
@@ -1270,6 +1720,9 @@ def run_char_classification_export(
                         "layout": layout_meta,
                     }
                 )
+
+            if len(char_entries) > plate_char_start:
+                benchmark_plate_records.append(data)
 
         if not char_entries:
             msg = (
@@ -1312,11 +1765,17 @@ def run_char_classification_export(
                         "character": str(item["symbol"]),
                         "plate_id": str(item["plate_id"]),
                         "source_image": str(item["source_image"]),
+                        **acquisition_provenance(item),
                         "strategy_bucket": str(item["strategy_bucket"]),
                         "fusion_strategy": str(item["fusion_strategy"]),
                         "source_tag": str(item["source_tag"]),
                         "source_bucket": str(item["source_bucket"]),
                         "source_kind": str(item["source_kind"]),
+                        "provenance": dict(item.get("provenance", {}) or {}),
+                        "provenance_category": str(
+                            item.get("provenance_category")
+                            or z3_dataset_provenance.LEGACY_UNTRACKED
+                        ),
                         "confidence": float(item["confidence"]),
                         "bbox": list(item["bbox"]),
                         "reading_row": int(item.get("reading_row", 0) or 0),
@@ -1339,9 +1798,22 @@ def run_char_classification_export(
             layout_meta = item.get("layout", {}) if isinstance(item.get("layout", {}), dict) else {}
             layout_label = str(layout_meta.get("plate_layout_label", "?") or "?")
             layout_counts[layout_label] = int(layout_counts.get(layout_label, 0) or 0) + 1
+        provenance_counts = (
+            z3_dataset_provenance.summarize_dataset_provenance(
+                manifest_items
+            )
+        )
+        raw_benchmark = (
+            z3_dataset_provenance.build_gt_blind_raw_benchmark(
+                benchmark_plate_records
+            )
+        )
         manifest = {
             "dataset_type": "char_classification",
             "created_at": timestamp,
+            "provenance_schema": z3_dataset_provenance.PROVENANCE_SCHEMA,
+            "provenance_counts": provenance_counts,
+            "raw_benchmark": raw_benchmark,
             "selected_strategies": sorted(selected_buckets),
             "selected_sources": sorted(selected_sources),
             "split_enabled": bool(split_enabled),
@@ -1381,7 +1853,7 @@ def run_char_classification_export(
         )
         host._log(
             host.export_console,
-            "[INFO] Dostępne tablice perfect wg źródeł: "
+            "[INFO] Sprawdzone tablice według źródła: "
             + " | ".join(
                 f"{gold_source_labels[key]}={int(total_source_counts.get(key, 0) or 0)}"
                 for key, _ in gold_source_buckets
@@ -1415,10 +1887,10 @@ def refresh_gold_export_scope_label(host) -> None:
     selected_strategies = host._get_selected_gold_export_strategy_buckets()
     selected_sources = host._get_selected_gold_export_source_buckets()
     if not selected_strategies:
-        set_gold_export_scope_info(host, "Do eksportu gold packa nie wybrano żadnej strategii.", "warning")
+        set_gold_export_scope_info(host, "Nie wybrano żadnego sposobu przygotowania danych do eksportu.", "warning")
         return
     if not selected_sources:
-        set_gold_export_scope_info(host, "Do eksportu gold packa nie wybrano żadnego źródła.", "warning")
+        set_gold_export_scope_info(host, "Nie wybrano żadnego źródła danych do eksportu.", "warning")
         return
 
     selected_labels = host._format_selected_gold_export_strategy_labels()
@@ -1436,7 +1908,7 @@ def refresh_gold_export_scope_label(host) -> None:
 
     set_gold_export_scope_info(
         host,
-        f"Do gold packa: strategie={selected_labels} | źródła={selected_source_labels} | "
+        f"Do eksportu: sposoby={selected_labels} | źródła={selected_source_labels} | "
         f"perfect={selected_count} | znaki={selected_chars} | {layout_summary} | "
         f"{format_gold_export_split_summary(host)}",
         "muted",
@@ -1713,6 +2185,43 @@ def refresh_gold_export_source_labels(host) -> None:
         )
 
 
+def is_gold_export_eligible_data(data: dict | None) -> bool:
+    """
+    Single source of truth for GOLD/PZ3 eligibility.
+
+    Legacy records without review_state stay backward compatible.
+    New records with review_state require explicit human approval.
+    """
+    if not isinstance(data, dict):
+        return False
+
+    # Manual PZ2 exclusion is a hard gate. It must win even for legacy
+    # perfect records without review_state, otherwise N could leak to PZ3/Z4.
+    gold_state = data.get("gold_state")
+    if isinstance(gold_state, dict) and bool(gold_state.get("excluded", False)):
+        return False
+
+    status = str(data.get("status", "unknown") or "unknown").strip().lower()
+    if status != "perfect":
+        return False
+
+    review_state = data.get("review_state")
+    if not isinstance(review_state, dict):
+        return True
+
+    review_status = str(review_state.get("status", "") or "").strip().lower()
+    if review_status != "approved":
+        return False
+    if not z3_review_runtime.review_approval_is_current(data):
+        return False
+
+    gold_state = data.get("gold_state")
+    if not isinstance(gold_state, dict):
+        return False
+
+    return bool(gold_state.get("approved", False))
+
+
 def _copy_gold_candidate_for_normalization(data):
     # Raw detector proposals are immutable diagnostics, often 300 per plate.
     # Preserve them in the export payload without copying/reclassifying them
@@ -1815,7 +2324,7 @@ def ensure_plate_source_metadata(
         changed = True
 
     status = str(data.get("status", "unknown") or "unknown").strip().lower()
-    candidate = bool(status == "perfect")
+    candidate = bool(is_gold_export_eligible_data(data))
     if bool(gold_state.get("candidate", False)) != candidate:
         gold_state["candidate"] = candidate
         changed = True

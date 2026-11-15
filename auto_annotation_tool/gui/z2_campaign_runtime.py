@@ -46,6 +46,7 @@ from ..rectification.polygon_validator import PolygonValidator
 from ..training import DatasetCreator
 from ..utils import cleanup_gpu_memory, count_images_in_directory, format_duration, get_image_files, get_image_size
 from ..validators import format_yolo_model_identity, validate_model_file
+from ..annotators.plate_model_contract import plate_class_ids
 from .canvas_progress_overlay import CanvasProgressOverlay
 from .help_manager import HELP
 from .inertial_scroll import InertialScrollController
@@ -89,6 +90,7 @@ from .z2_shared_ui import (
     refresh_workflow_route_cards as dispatch_refresh_workflow_route_cards,
 )
 from .z2_view_models import Step2CtaViewModel, Step2ViewModel
+from .z2_gt_readiness import build_char_gt_readiness
 from .zoomable_canvas import ZoomableCanvas
 from .z2_restore_workflow import (
     _restore_preview_from_annotation_run,
@@ -198,7 +200,7 @@ def _build_campaign_char_effective_source(self) -> dict:
             contributor_approved_token = ""
 
     source_state = {
-        "builder_version": 4,
+        "builder_version": 5,
         "approved_manifest_token": self._build_path_change_token(approved_manifest_path),
         "contributor_run_dir": str(contributor_run_dir or ""),
         "contributor_manifest_token": self._build_path_change_token(contributor_manifest_path),
@@ -266,7 +268,6 @@ def _build_campaign_char_effective_source(self) -> dict:
             contributor_entries = list(
                 self._build_campaign_plate_approved_entries_from_run(
                     contributor_run_dir,
-                    extra_included_filenames=preview_source_filenames,
                 ) or []
             )
         except Exception:
@@ -290,8 +291,6 @@ def _build_campaign_char_effective_source(self) -> dict:
                 }
         except Exception:
             contributor_approved_lookup = set()
-        if preview_source_filenames:
-            contributor_approved_lookup |= set(preview_source_filenames)
         if contributor_approved_lookup:
             filtered_entries: list[dict] = []
             for entry in contributor_entries:
@@ -328,7 +327,8 @@ def _build_campaign_char_effective_source(self) -> dict:
         entry_key = self._get_campaign_plate_entry_merge_key(entry)
         if not entry_key:
             continue
-        merged_entries[entry_key] = dict(entry)
+        # A stale run XML must not replace already reviewed polygon snapshots.
+        merged_entries.setdefault(entry_key, dict(entry))
 
     merged_list = list(merged_entries.values())
     if not merged_list:
@@ -1816,6 +1816,10 @@ def _build_campaign_plate_approved_entries_from_run(
         return []
 
     manifest = self._load_annotation_run_manifest(safe_run_dir)
+    # Reopening/synchronizing an old XML must not re-admit rejected polygons
+    # merely because the containing image has an OK flag.
+    from .z2_restore_semantics import exclude_restored_vehicle_plate_conflicts
+    exclude_restored_vehicle_plate_conflicts(self, annotations, safe_run_dir, manifest)
     explicit_approval_enabled = isinstance(manifest, dict) and "approved_filenames" in manifest
     approved_filenames = (
         self._get_preview_approved_filenames()
@@ -1839,12 +1843,16 @@ def _build_campaign_plate_approved_entries_from_run(
         for name in set(extra_included_filenames or set())
         if str(name or "").strip()
     }
-    input_dir = (
-        self._resolve_existing_dir(manifest.get("source_input_dir"))
-        or self._resolve_existing_dir(manifest.get("input_dir"))
-        or self._resolve_existing_dir(self.current_input_dir)
-    )
     run_images_dir = safe_run_dir / "images"
+    # A source root can exist while its images live in subdirectories. Resolve
+    # each image against all known roots, including the prepared run scope.
+    input_dirs = []
+    for raw_dir in (manifest.get("source_input_dir"), manifest.get("input_dir"),
+                    self.current_input_dir, run_images_dir):
+        directory = self._resolve_existing_dir(raw_dir)
+        if directory is not None and directory not in input_dirs:
+            input_dirs.append(directory)
+    preview_map = getattr(self, "_preview_image_path_map", {}) or {}
     source_xml_path = safe_run_dir / "annotations.xml"
     manual_origin = bool(self._annotation_run_manifest_has_manual_value(manifest))
     approved_at = datetime.datetime.now().isoformat(timespec="seconds")
@@ -1880,7 +1888,6 @@ def _build_campaign_plate_approved_entries_from_run(
             continue
 
         source_image_path = None
-        preview_map = dict(getattr(self, "_preview_image_path_map", {}) or {})
         try:
             preview_source = preview_map.get(image_name)
             if preview_source:
@@ -1890,15 +1897,12 @@ def _build_campaign_plate_approved_entries_from_run(
         except Exception:
             source_image_path = None
 
-        if source_image_path is None and input_dir is not None:
-            candidate = Path(input_dir) / image_name
-            if candidate.exists():
-                source_image_path = candidate
-
-        if source_image_path is None and run_images_dir.exists():
-            candidate = run_images_dir / image_name
-            if candidate.exists():
-                source_image_path = candidate
+        if source_image_path is None:
+            for directory in input_dirs:
+                candidate = Path(directory) / image_name
+                if candidate.is_file():
+                    source_image_path = candidate
+                    break
 
         if source_image_path is None or not Path(source_image_path).exists():
             continue
@@ -2514,6 +2518,14 @@ def _prepare_approved_step3_source_from_z2_run(self, run_dir: Path, images_dir: 
     safe_run_dir = self._resolve_safe_annotation_run_dir(run_dir, require_xml=True)
     if safe_run_dir is None:
         return None
+
+    if not self._is_free_mode_session_context():
+        from .z3_approved_source import source_for_campaign
+        try:
+            return source_for_campaign(CAMPAIGN)["run_dir"]
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Brak zatwierdzonego źródła Z3", str(exc), parent=self.frame.winfo_toplevel())
+            return None
 
     approval_state = self._get_run_plate_strict_approved_state(safe_run_dir)
     if not approval_state.get("ok"):
@@ -3687,6 +3699,34 @@ def _build_campaign_z2_gate_overlay_state(self) -> dict:
 
     effective_images = max(0, int(project_approved_images or 0) + int(run_ok_images or 0))
     effective_plates = max(0, int(project_approved_plates or 0) + int(run_ok_plates or 0))
+
+    char_gt_state = {}
+    if iteration_target == "char":
+        try:
+            char_gt_state = dict(
+                build_char_gt_readiness(
+                    self,
+                    run_dir=approval_run_dir,
+                    force_parse_xml=False,
+                )
+                or {}
+            )
+        except Exception:
+            char_gt_state = {}
+    char_gt_count = int(char_gt_state.get("gt_plates", 0) or 0)
+    char_gt_missing = max(
+        int(char_gt_state.get("missing_gt", 0) or 0),
+        max(0, int(effective_plates or 0) - int(char_gt_count or 0)),
+    )
+    char_gt_ready = bool(
+        iteration_target != "char"
+        or (
+            int(effective_plates or 0) > 0
+            and int(char_gt_count or 0) >= int(effective_plates or 0)
+            and int(char_gt_missing or 0) == 0
+        )
+    )
+
     xml_required = bool(int(current_iteration_num or 0) <= 1)
     xml_missing = bool(xml_required and not approval_xml_exists)
     if iteration_target == "char":
@@ -3822,6 +3862,15 @@ def _build_campaign_z2_gate_overlay_state(self) -> dict:
         "required_plates": int(min_char_plates if iteration_target == "char" else min_plate_plates),
         "missing_images": int(missing_images or 0),
         "missing_plates": int(missing_plates or 0),
+        "gt_plates": int(char_gt_count or 0),
+        "gt_total_plates": int(effective_plates or 0) if iteration_target == "char" else 0,
+        "missing_gt": int(char_gt_missing or 0) if iteration_target == "char" else 0,
+        "gt_ready": bool(char_gt_ready),
+        "gt_complete": bool(char_gt_ready),
+        "geometry_ready": bool(ready),
+        "plate_geometry_count": int(effective_plates or 0),
+        "plate_gt_present_count": int(char_gt_count or 0),
+        "plate_gt_missing_count": int(char_gt_missing or 0),
         "missing_to_open": int(missing_to_open or 0),
         "missing_focus_label": missing_focus_label,
         "missing_focus_row_label": missing_focus_row_label,
@@ -3947,6 +3996,12 @@ def _apply_campaign_plate_auto_model_choice(self, model_path: Path, *, adopt_to_
         _close_campaign_plate_model_check_dialog(busy_dialog)
     if not ok:
         messagebox.showerror("Nieprawidłowy model", f"Nie udało się użyć wybranego modelu:\n{message}")
+        return False
+
+    try:
+        plate_class_ids(info.get("classes"))
+    except ValueError as exc:
+        messagebox.showerror("Nieprawidłowy model tablic", str(exc), parent=self.frame)
         return False
 
     task = str(info.get("task") or info.get("type") or "").strip().lower()

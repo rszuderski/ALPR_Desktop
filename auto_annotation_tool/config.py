@@ -10,6 +10,7 @@ import importlib.util
 from dataclasses import dataclass, field
 from typing import FrozenSet
 from pathlib import Path
+from alpr_runtime import workspace_root
 
 # ============================================================================
 # LOGOWANIE
@@ -146,7 +147,7 @@ class Config:
     """Centralna konfiguracja aplikacji."""
     
     # Wersja
-    VERSION: str = "4.5"
+    VERSION: str = "1.0.0-dyplom"
     APP_NAME: str = "ALPR Desktop"
 
     # Progi kampanii
@@ -197,7 +198,12 @@ class Config:
     # ==========================================
     # LOGICZNA STRUKTURA KATALOGÓW (WORKSPACE)
     # ==========================================
-    WORKSPACE_DIR: Path = Path("Workspace").resolve()
+    # Kanoniczna ścieżka aplikacji ma zachować logiczny alias Workspace.
+    # Na Windows Workspace może być junctionem; .resolve() zamieniał wtedy
+    # widoczne i zapisywane ścieżki na fizyczny katalog docelowy junctiona.
+    # Fizyczne .resolve() nadal stosujemy lokalnie tam, gdzie porównujemy
+    # tożsamość dwóch ścieżek, ale nie przy definiowaniu rootu aplikacji.
+    WORKSPACE_DIR: Path = workspace_root()
     
     DIR_1_RAW: Path         = WORKSPACE_DIR / "1_raw_images"
     DIR_2_AUTO_ANN: Path    = WORKSPACE_DIR / "2_auto_annotations"
@@ -526,7 +532,17 @@ class Config:
             self.DIR_4_DATASETS, 
             self.DIR_4_DATASETS_CHAR_CLASSIFICATION,
             self.DIR_5_RUNS, 
+            self.DIR_5_RUNS_PLATES,
+            self.DIR_5_RUNS_CHARS,
+            self.DIR_5_RUNS_VEHICLES,
             self.DIR_6_MODELS, 
+            self.DIR_6_MODELS_BASE,
+            self.DIR_6_MODELS_BASE_POSE,
+            self.DIR_6_MODELS_BASE_DETECT,
+            self.DIR_6_MODELS_TRAINED,
+            self.DIR_6_MODELS_TRAINED_PLATES,
+            self.DIR_6_MODELS_TRAINED_CHARS,
+            self.DIR_6_MODELS_TRAINED_VEHICLES,
             self.DIR_6_MODELS_MOBILE_PACKAGES,
             self.DIR_7_RANKINGS, 
             self.DIR_7_RANKINGS_MOBILE_PACKAGES,
@@ -557,7 +573,7 @@ class Config:
                 "4_training_datasets  : Gotowe datasety YOLO, porządkowane na plates/, chars/ i vehicles/.\n"
                 "  4_char_classification : Datasety OCR/klasyfikacji znaków (manifest.json), nie wejście Z4 YOLO.\n"
                 "5_training_runs      : Logi i artefakty treningu, także rozdzielone na plates/, chars/ i vehicles/.\n"
-                "6_models             : Modele bazowe w base/, wytrenowane w trained/, dodatkowo rozdzielone według toru.\n"
+                "6_models             : Modele bazowe w base/, wytrenowane w trained/plates/, trained/chars/ i trained/vehicles/.\n"
                 "7_rankings           : Raporty z testów i walidacji, rozdzielone według typu modelu.\n"
                 "8_presets            : Presety modułów: ocr/, detection_pipeline/, augmentation/, training/.\n"
             )

@@ -142,10 +142,8 @@ def is_transition_ready(spec: CampaignTransitionSpec | None, ctx: CampaignTransi
             if snapshot is None:
                 return False
             if resource_key == "approved_plates":
-                if not (
-                    int(snapshot.counter_value or 0) >= int(ctx.min_plates or 10)
-                    or str(snapshot.tone or "").strip().lower() == "success"
-                ):
+                geometry_count = int((snapshot.meta or {}).get("plate_geometry_count", snapshot.counter_value) or 0)
+                if geometry_count < int(ctx.min_plates or 10):
                     return False
                 continue
             if not resource_contract_ready(snapshot, required=True):

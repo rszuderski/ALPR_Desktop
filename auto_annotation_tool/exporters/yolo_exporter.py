@@ -17,32 +17,12 @@ import shutil
 
 from ..data_models import ImageAnnotation, Detection
 from ..config import logger
-
-
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
+from ..rectification.quad_geometry import validated_pose_label_points, pose_label_identity_confirmation, format_pose_label
 
 
 def _sort_corners_clockwise(corners: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    """Sortuje 4 punkty do kolejności TL, TR, BR, BL."""
-    if len(corners) != 4:
-        return corners
-
-    cx = sum(p[0] for p in corners) / 4
-    cy = sum(p[1] for p in corners) / 4
-
-    top = [p for p in corners if p[1] < cy]
-    bottom = [p for p in corners if p[1] >= cy]
-
-    if len(top) != 2 or len(bottom) != 2:
-        s = sorted(corners, key=lambda p: p[1])
-        top = sorted(s[:2], key=lambda p: p[0])
-        bottom = sorted(s[2:], key=lambda p: p[0], reverse=True)
-    else:
-        top = sorted(top, key=lambda p: p[0])
-        bottom = sorted(bottom, key=lambda p: p[0], reverse=True)
-
-    return [top[0], top[1], bottom[0], bottom[1]]
+    """Legacy entry point: validate label indices without silently sorting."""
+    return validated_pose_label_points(corners)
 
 
 class YOLOPosePlate4Exporter:
@@ -64,47 +44,30 @@ class YOLOPosePlate4Exporter:
         labels_dir = output_dir / "labels"
         images_out = output_dir / "images"
 
-        labels_dir.mkdir(parents=True, exist_ok=True)
-        if self.copy_images:
-            images_out.mkdir(parents=True, exist_ok=True)
-
+        # Validate every plate before creating/copying/writing any output.
+        prepared = []
         for ann in annotations:
             lines = []
             for det in ann.detections:
                 if det.label.lower() != "plate":
                     continue
 
-                poly = det.polygon
-                if not poly or len(poly) < 4:
-                    # fallback: z bbox
-                    x1, y1, x2, y2 = det.bbox
-                    poly = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-
-                poly = _sort_corners_clockwise(poly[:4])
-
-                xs = [p[0] for p in poly]
-                ys = [p[1] for p in poly]
-                x_min, x_max = min(xs), max(xs)
-                y_min, y_max = min(ys), max(ys)
-
-                # bbox YOLO
-                xc = ((x_min + x_max) / 2.0) / ann.width
-                yc = ((y_min + y_max) / 2.0) / ann.height
-                bw = (x_max - x_min) / ann.width
-                bh = (y_max - y_min) / ann.height
-
-                xc, yc, bw, bh = map(_clamp01, (xc, yc, bw, bh))
-
-                # keypoints (x,y) 4 szt.
-                kpts = []
-                for x, y in poly:
-                    kpts.append(f"{_clamp01(x/ann.width):.6f}")
-                    kpts.append(f"{_clamp01(y/ann.height):.6f}")
-
-                line = f"{self.class_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f} " + " ".join(kpts)
+                try:
+                    confirmed = pose_label_identity_confirmation(det.attributes, getattr(det, "geometry", None))
+                    poly = validated_pose_label_points(det.polygon, (ann.width, ann.height),
+                                                       corner_identity_confirmed=confirmed)
+                    line = format_pose_label(poly, (ann.width, ann.height), class_id=self.class_id)
+                except ValueError as exc:
+                    raise ValueError(f"{ann.filename}: {exc}") from exc
                 lines.append(line)
 
-            (labels_dir / f"{Path(ann.filename).stem}.txt").write_text("\n".join(lines), encoding="utf-8")
+            prepared.append((ann, "\n".join(lines)))
+
+        labels_dir.mkdir(parents=True, exist_ok=True)
+        if self.copy_images:
+            images_out.mkdir(parents=True, exist_ok=True)
+        for ann, content in prepared:
+            (labels_dir / f"{Path(ann.filename).stem}.txt").write_text(content, encoding="utf-8")
 
             if self.copy_images:
                 src = Path(images_dir) / ann.filename

@@ -128,7 +128,7 @@ def _write_split_source_dataset(root: Path) -> None:
         class_id = index % len(CHARACTER_BALANCE_ALPHABET)
         stem = f"plate_{index:03d}"
         (root / "labels" / f"{stem}.txt").write_text(f"{class_id} 0.5 0.5 0.1 0.1\n", encoding="utf-8")
-        (root / "images" / f"{stem}.jpg").write_bytes(b"fake")
+        (root / "images" / f"{stem}.jpg").write_bytes(f"distinct-fixture-{index}".encode())
 
 
 def _write_valid_jpeg(path: Path, color: tuple[int, int, int] = (80, 90, 100)) -> None:

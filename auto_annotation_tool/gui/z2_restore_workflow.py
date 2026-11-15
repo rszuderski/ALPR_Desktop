@@ -39,6 +39,7 @@ from ..campaign_manager import CAMPAIGN
 from ..config import AVAILABLE_DETECT_MODELS, CONFIG, SESSION, YOLO_AVAILABLE, logger
 from ..data_models import AnnotationReport, AnnotationStatus, Detection, ImageAnnotation
 from ..exporters import CVATExporter, ReportGenerator
+from .z2_restore_semantics import exclude_restored_vehicle_plate_conflicts
 from ..icons import IconManager
 from ..project_cache import PROJECT_CACHE
 from ..quality_metrics import compute_plate_polygon_fit_metrics
@@ -352,6 +353,7 @@ def _restore_preview_from_annotation_run(
             str(manifest.get("annotation_run_type") or "").strip().lower() == "auto_annotation"
         )
         annotations = self._parse_cvat_preview_annotations(xml_path)
+        exclude_restored_vehicle_plate_conflicts(self, annotations, run_dir, manifest)
         if not annotations:
             return False
         if run_is_auto_annotation:
@@ -1075,6 +1077,7 @@ def _apply_annotation_run_restore_payload(
         if str(name or "").strip()
     }
     manifest = dict(payload.get("manifest") or {})
+    exclude_restored_vehicle_plate_conflicts(self, annotations, run_dir, manifest)
     payload_is_auto_annotation = bool(
         str(manifest.get("annotation_run_type") or "").strip().lower() == "auto_annotation"
     )
@@ -1811,6 +1814,7 @@ def _restore_preview_from_session_run(self):
     manifest = self._load_annotation_run_manifest(run_dir)
     try:
         annotations = self._parse_cvat_preview_annotations(xml_path)
+        exclude_restored_vehicle_plate_conflicts(self, annotations, run_dir, manifest)
     except Exception as e:
         logger.debug(f"Nie udalo sie przywrocic ostatniego runu Z2: {e}")
         return False
@@ -2039,6 +2043,9 @@ def _apply_free_mode_session_snapshot(self, session_state: dict | None = None, r
     self._free_mode_session_restore_in_progress = True
     try:
         restored_route = self._normalize_workflow_route_value(state.get("workflow_route"))
+        restored_screen = self._normalize_free_mode_screen_value(
+            state.get("free_mode_screen")
+        )
         restored_manual_entry_mode = self._normalize_manual_entry_mode(state.get("manual_entry_mode"))
         safe_output_dir = self._coerce_annotation_output_dir(state.get("output_dir"))
         safe_run_dir = self._resolve_safe_annotation_run_dir(state.get("plate_dataset_run"), require_xml=True)
@@ -2063,9 +2070,7 @@ def _apply_free_mode_session_snapshot(self, session_state: dict | None = None, r
         self.manual_entry_mode_var.set(restored_manual_entry_mode)
         self.auto_vehicle_choice_var.set(self._normalize_auto_vehicle_choice(state.get("auto_vehicle_choice")))
         self.workflow_step_var.set(self._normalize_workflow_step_value(state.get("workflow_step")))
-        self.free_mode_screen_var.set(
-            self._normalize_free_mode_screen_value(state.get("free_mode_screen"))
-        )
+        self.free_mode_screen_var.set(restored_screen)
         self._manual_review_active = bool(state.get("manual_review_active", False))
         self._manual_review_from_auto = bool(state.get("manual_review_from_auto", False))
         self._manual_review_origin_route = self._normalize_workflow_route_value(
@@ -2265,6 +2270,10 @@ def _prepare_campaign_source_preview_payload(
             previous_xml_path = previous_bundle.get("xml_path")
             if isinstance(previous_xml_path, Path) and previous_xml_path.exists():
                 previous_annotations = self._parse_cvat_preview_annotations(previous_xml_path)
+                exclude_restored_vehicle_plate_conflicts(
+                    self, previous_annotations, previous_xml_path.parent,
+                    self._load_annotation_run_manifest(previous_xml_path.parent),
+                )
                 if callable(is_cancelled) and is_cancelled():
                     return None
                 previous_annotations_by_name = {
@@ -2499,6 +2508,7 @@ def _prepare_annotation_run_restore_payload(
     if callable(is_cancelled) and is_cancelled():
         return None
     annotations = self._parse_cvat_preview_annotations(xml_path)
+    exclude_restored_vehicle_plate_conflicts(self, annotations, safe_run_dir, manifest)
     if run_is_auto_annotation_for_origin:
         try:
             self._mark_auto_plate_origin_for_annotations(annotations)

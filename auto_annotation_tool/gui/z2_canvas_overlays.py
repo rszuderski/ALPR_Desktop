@@ -159,6 +159,14 @@ def _get_preview_legend_context(self):
     total_images = len(self.current_annotations or [])
     display_indices = list(getattr(self, "_preview_list_display_indices", []) or [])
     display_total = len(display_indices) if display_indices else total_images
+    try:
+        graph_context = dict(getattr(self, "_campaign_graph_entry_context", {}) or {})
+    except Exception:
+        graph_context = {}
+    t02_review_context = bool(
+        str(graph_context.get("z2_work_mode") or "").strip().lower() == "t02_at_review"
+        or str(graph_context.get("graph_gate_id") or "").strip().upper() == "T02"
+    )
     current_image_no = 0
     if self.current_preview_index is not None:
         current_display_index = self._get_preview_display_index(self.current_preview_index)
@@ -168,12 +176,18 @@ def _get_preview_legend_context(self):
             current_image_no = max(0, min(int(self.current_preview_index), total_images - 1)) + 1
     return {
         "filename": filename or "Brak obrazu",
-        "image_text": f"Zdjęcie: {current_image_no}/{display_total}",
+        "image_label": "Kontrola" if t02_review_context else "Zdjęcie",
+        "image_text": (
+            f"Kontrola: {current_image_no}/{display_total}"
+            if t02_review_context
+            else f"Zdjęcie: {current_image_no}/{display_total}"
+        ),
         "vehicle_text": f"Pojazd: {current_vehicle_no}/{len(vehicles)}",
         "plate_text": f"Tablica: {current_no}/{len(plates)}",
         "plate_total": int(len(plates)),
+        "pool_label": "Pula O" if t02_review_context else "Pula",
         "pool_text": (
-            f"Pula: {total_images}"
+            (f"Pula O: {total_images}" if t02_review_context else f"Pula: {total_images}")
             if total_images > 0 and display_total > 0 and display_total != total_images
             else ""
         ),

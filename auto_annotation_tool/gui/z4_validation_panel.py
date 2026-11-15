@@ -650,13 +650,14 @@ def _open_selected_run_validation_modal(self, event=None):
     return self._open_model_validation_modal(
         model_path=model_path,
         dataset_path=dataset_path,
+        split="test",
         context_label=f"Run: {run_label}. Sprawdzasz jego best.pt na wybranym torze walidacji.",
     )
 
 def _open_current_run_validation_modal(self):
-    run = None
+    run = getattr(self, "_run_details_current_run", None)
     run_id = str(getattr(self, "_run_details_current_run_id", "") or "").strip()
-    if run_id:
+    if run is None and run_id:
         try:
             run = self.history.get_run(run_id)
         except Exception:
@@ -670,7 +671,7 @@ def _open_current_run_validation_modal(self):
         return messagebox.showwarning("Brak runu", "Najpierw wybierz run z historii treningu.")
     try:
         if hasattr(self, "tree"):
-            run_id = str(getattr(run, "id", "") or "").strip()
+            run_id = z4_history_runtime._history_row_id_for_run(self, run)
             if run_id:
                 self.tree.selection_set(run_id)
                 self.tree.focus(run_id)

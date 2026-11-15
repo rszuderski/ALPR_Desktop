@@ -751,7 +751,7 @@ def _get_plate_annotation_exports_base_dir(self) -> Path:
     return Path(CONFIG.DIR_2_AUTO_ANN) / "plate_annotation_exports"
 
 
-def _get_plate_annotation_export_annotations(self, run_dir: Path) -> list[ImageAnnotation]:
+def _get_plate_annotation_export_annotations(self, run_dir: Path, *, include_empty: bool = False) -> list[ImageAnnotation]:
     current_run_dir = getattr(self, "current_annotation_run_dir", None)
     if (
         current_run_dir is not None
@@ -761,6 +761,11 @@ def _get_plate_annotation_export_annotations(self, run_dir: Path) -> list[ImageA
         source_annotations = list(self.current_annotations or [])
     else:
         source_annotations = self._parse_cvat_preview_annotations(run_dir / "annotations.xml")
+
+    if include_empty:
+        # A saved image with no polygon is still part of the XML inventory.
+        # Its presence here does not assert a reviewed NO_PLATES decision.
+        return list(source_annotations)
 
     export_annotations = []
     for ann in list(source_annotations or []):
@@ -838,7 +843,7 @@ def _get_plate_annotation_package_export_state(self, run_dir: Path | None = None
 
     result["run_dir"] = run_dir
     try:
-        annotations = self._get_plate_annotation_export_annotations(run_dir)
+        annotations = self._get_plate_annotation_export_annotations(run_dir, include_empty=True)
     except Exception as e:
         result["message"] = f"Nie można odczytać annotations.xml: {e}"
         return result
@@ -847,6 +852,7 @@ def _get_plate_annotation_package_export_state(self, run_dir: Path | None = None
     result.update(
         images_with_plates=int(images_with_plates),
         total_plates=int(total_plates),
+        xml_image_records=len(annotations),
     )
     if total_plates <= 0:
         result["message"] = "Eksport anotacji jest dostępny po zapisaniu co najmniej jednej tablicy w annotations.xml."
@@ -854,7 +860,7 @@ def _get_plate_annotation_package_export_state(self, run_dir: Path | None = None
 
     result["ok"] = True
     result["message"] = (
-        f"Gotowe do eksportu anotacji XML: {images_with_plates} obrazów / {total_plates} tablic."
+        f"Gotowe do eksportu XML: {len(annotations)} rekordów image; {images_with_plates} obrazów z ramkami / {total_plates} tablic."
     )
     return result
 
@@ -916,6 +922,9 @@ def _start_plate_annotation_package_export(self, *args, **kwargs):
 
 def _get_current_preview_plate_count_state(self) -> dict:
     annotations = list(getattr(self, "current_annotations", []) or [])
+    counter_version = int(
+        getattr(self, "_preview_counter_version", 0) or 0
+    )
     approved_set = getattr(self, "_preview_approved_filenames", None)
     campaign_approved_set = getattr(self, "_campaign_pending_approved_filenames", None)
     approval_cache_token = (
@@ -930,6 +939,7 @@ def _get_current_preview_plate_count_state(self) -> dict:
         isinstance(cache, dict)
         and int(cache.get("annotations_id", -1) or -1) == int(id(getattr(self, "current_annotations", None)))
         and int(cache.get("total_images", -1) or -1) == int(len(annotations))
+        and int(cache.get("counter_version", -1) or -1) == int(counter_version)
         and tuple(cache.get("approval_cache_token", ())) == approval_cache_token
     ):
         return cache
@@ -962,6 +972,7 @@ def _get_current_preview_plate_count_state(self) -> dict:
     cache = {
         "annotations_id": int(id(getattr(self, "current_annotations", None))),
         "total_images": int(len(annotations)),
+        "counter_version": int(counter_version),
         "approval_cache_token": approval_cache_token,
         "images_with_plates": int(images_with_plates),
         "total_plates": int(total_plates),

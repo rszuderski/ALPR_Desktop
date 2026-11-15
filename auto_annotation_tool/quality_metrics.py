@@ -10,7 +10,7 @@ from typing import Iterable, List, Tuple
 
 import numpy as np
 
-from .rectification.polygon_validator import PolygonValidator
+from .rectification.quad_geometry import analyze_quad, canonicalize_polygon
 
 
 def _clamp01(value: float) -> float:
@@ -103,6 +103,7 @@ def compute_plate_polygon_fit_metrics(
     *,
     keypoints: Iterable[tuple[float, float, float]] | None = None,
     image_size: tuple[int, int] | None = None,
+    raw_polygon: List[Tuple[float, float]] | None = None,
 ) -> dict:
     polygon = list(polygon or [])
     bbox = tuple(bbox or (0.0, 0.0, 0.0, 0.0))
@@ -122,14 +123,11 @@ def compute_plate_polygon_fit_metrics(
     else:
         keypoint_score = _clamp01(det_conf * 0.85)
 
-    ordered_polygon = list(polygon)
-    try:
-        ordered_polygon = PolygonValidator.order_points(polygon[:4]) if len(polygon) >= 4 else polygon
-        ordered_polygon = [(float(x), float(y)) for x, y in ordered_polygon[:4]]
-    except Exception:
-        ordered_polygon = [(float(x), float(y)) for x, y in polygon[:4]]
-
-    valid_quad = bool(len(ordered_polygon) == 4 and PolygonValidator.is_valid_quad(ordered_polygon))
+    # Keep input topology visible. A repaired outline is not a valid raw Pose.
+    input_analysis = analyze_quad(polygon if raw_polygon is None else raw_polygon, image_size=image_size)
+    display = canonicalize_polygon(polygon, anchor_index=0, image_size=image_size)
+    ordered_polygon = display.polygon or []
+    valid_quad = bool(display.output_analysis and display.output_analysis.is_geometrically_valid)
     polygon_bbox = _polygon_bbox(ordered_polygon) if len(ordered_polygon) == 4 else bbox
     polygon_area = _polygon_area(ordered_polygon) if len(ordered_polygon) == 4 else 0.0
     bbox_area = _bbox_area(bbox)
@@ -196,6 +194,8 @@ def compute_plate_polygon_fit_metrics(
         + 0.20 * bbox_alignment_score
         + 0.10 * size_score
     )
+    if not input_analysis.is_geometrically_valid:
+        fit_score = 0.0
     if fit_score >= 0.85:
         fit_label = "wysokie"
     elif fit_score >= 0.65:
@@ -213,6 +213,11 @@ def compute_plate_polygon_fit_metrics(
         "relative_area": max(0.0, float(relative_area)),
         "bbox_fill_ratio": _clamp01(min(1.5, float(bbox_fill_ratio))) if bbox_fill_ratio >= 0.0 else 0.0,
         "keypoint_count": int(len(keypoint_confs)),
+        "input_geometry_status": input_analysis.status,
+        "input_geometry_valid": input_analysis.is_geometrically_valid,
+        "display_geometry_status": display.output_analysis.status if display.output_analysis else "INVALID",
+        "display_geometry_valid": valid_quad,
+        "geometry_reordered": display.reordered,
     }
 
 

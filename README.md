@@ -33,11 +33,10 @@ Zależności nie narzucają wersji CUDA z poprzedniego komputera; konfiguracja G
 
 ## Dane i modele
 
-Repozytorium zawiera kod, testy, dokumentację i konfigurację edytora. Nie zawiera bibliotek,
+Repozytorium zawiera kod, testy, wymagane zasoby i konfigurację edytora. Nie zawiera bibliotek,
 modeli, zdjęć, datasetów, wyników, Workspace.
-Pusty `Workspace/` wraz ze strukturą roboczą tworzy się automatycznie przy pierwszym uruchomieniu.
-Ustawienia użytkownika aplikacja zapisuje w `~/.auto_annotation_tool/session.json`.
-Na komputerze z wcześniejszą instalacją są one współdzielone; ten plik nie jest częścią kopii.
+Domyślny Workspace i ustawienia powstają w `%LOCALAPPDATA%\ALPR_Desktop`.
+Starsze ustawienia w `~/.auto_annotation_tool` nie są automatycznie przenoszone.
 
 ## Opcjonalny eksport mobilny i testy
 

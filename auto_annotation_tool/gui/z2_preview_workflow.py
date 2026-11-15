@@ -24,6 +24,8 @@ import tkinter.font as tkfont
 import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
+from .z2_gt_readiness import missing_required_gt
+from .z2_gt_review import refresh_missing_gt_count
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
@@ -42,6 +44,7 @@ from ..exporters import CVATExporter, ReportGenerator
 from ..icons import IconManager
 from ..project_cache import PROJECT_CACHE
 from ..quality_metrics import compute_plate_polygon_fit_metrics
+from ..pose_geometry import hydrate_stored_geometry
 from ..rectification.polygon_validator import PolygonValidator
 from ..training import DatasetCreator
 from ..utils import cleanup_gpu_memory, count_images_in_directory, format_duration, get_image_files, get_image_size
@@ -1014,6 +1017,7 @@ def _apply_preview_approval_fast(
     changed = 0
     cleaned_without_plate = 0
     skipped_without_plate = 0
+    skipped_missing_gt = 0
     approved_images_delta = 0
     approved_plates_delta = 0
     changed_filenames: set[str] = set()
@@ -1047,7 +1051,10 @@ def _apply_preview_approval_fast(
             )
         )
         if approved and not can_export:
-            skipped_without_plate += 1
+            if missing_required_gt(self, ann):
+                skipped_missing_gt += 1
+            else:
+                skipped_without_plate += 1
             if was_approved or filename in approved_names:
                 approved_names.discard(filename)
                 cleaned_without_plate += 1
@@ -1140,7 +1147,14 @@ def _apply_preview_approval_fast(
         if approval_state_changed:
             _schedule_campaign_char_source_refresh_after_approval(self, graph_gate_id)
 
-    if approved and skipped_without_plate > 0:
+    if approved and skipped_missing_gt > 0:
+        status_text = (
+            f"Oznaczono jako OK: {changed} obraz(y). "
+            f"Pominięto {skipped_missing_gt} z brakującym GT"
+            + (f" i {skipped_without_plate} bez ramki" if skipped_without_plate else "")
+            + ". Uzupełnij GT dla każdej ramki. Użyj filtra „Brak GT”."
+        )
+    elif approved and skipped_without_plate > 0:
         if changed > 0:
             status_text = (
                 f"Oznaczono jako OK: {changed} obraz(y). "
@@ -1302,6 +1316,7 @@ def _set_selected_preview_images_approved(
     approved_images_delta = 0
     approved_plates_delta = 0
     skipped_without_plate = 0
+    skipped_missing_gt = 0
     cleaned_without_plate = 0
     counted_delta_filenames: set[str] = set()
     approved_changed_filenames: set[str] = set()
@@ -1319,7 +1334,10 @@ def _set_selected_preview_images_approved(
         )
         approval_before_by_filename.setdefault(filename, was_approved_for_counts)
         if approved and not self._preview_annotation_can_be_approved_for_export(ann):
-            skipped_without_plate += 1
+            if missing_required_gt(self, ann):
+                skipped_missing_gt += 1
+            else:
+                skipped_without_plate += 1
             if filename in approved_names:
                 approved_names.discard(filename)
                 cleaned_without_plate += 1
@@ -1503,7 +1521,14 @@ def _set_selected_preview_images_approved(
         _schedule_campaign_char_source_refresh_after_approval(self, graph_gate_id)
 
     if fast_shortcut_approval:
-        if approved and skipped_without_plate > 0:
+        if approved and skipped_missing_gt > 0:
+            status_text = (
+                f"Oznaczono jako OK: {changed} obraz(y). "
+                f"Pominięto {skipped_missing_gt} z brakującym GT"
+                + (f" i {skipped_without_plate} bez ramki" if skipped_without_plate else "")
+                + ". Uzupełnij GT dla każdej ramki. Użyj filtra „Brak GT”."
+            )
+        elif approved and skipped_without_plate > 0:
             if changed > 0:
                 status_text = (
                     f"Oznaczono jako OK: {changed} obraz(y). "
@@ -1631,7 +1656,14 @@ def _set_selected_preview_images_approved(
         graph_gate_has_fast_counter = bool(graph_gate_id in {"T03", "T04", "T05"})
         if not (graph_gate_has_fast_counter and _try_update_campaign_right_panel_counts_after_approval(self)):
             self._schedule_preview_approval_followup_refresh()
-    if approved and skipped_without_plate > 0:
+    if approved and skipped_missing_gt > 0:
+        status_text = (
+            f"Oznaczono jako OK: {changed} obraz(y). "
+            f"Pominięto {skipped_missing_gt} z brakującym GT"
+            + (f" i {skipped_without_plate} bez ramki" if skipped_without_plate else "")
+            + ". Uzupełnij GT dla każdej ramki. Użyj filtra „Brak GT”."
+        )
+    elif approved and skipped_without_plate > 0:
         if changed > 0:
             status_text = (
                 f"Oznaczono jako OK: {changed} obraz(y). "
@@ -1997,6 +2029,22 @@ def _refresh_preview_workspace_visibility(self, *, manual_review_active: bool | 
         padx=5,
         pady=0,
     )
+    show_history_preview = bool(
+        free_mode_context
+        and free_mode_screen == "workflow"
+        and free_mode_route == "manual"
+        and free_mode_step == "manual_history"
+        and not show_preview
+        and bool(getattr(self, "_manual_history_preview_loaded", False))
+    )
+    self._set_widget_packed(
+        getattr(self, "manual_history_preview_host", None),
+        show_history_preview,
+        fill=tk.BOTH,
+        expand=True,
+        padx=5,
+        pady=0,
+    )
     if free_mode_context and free_mode_route == "manual":
         try:
             self._sync_main_pane_right_panel_visibility()
@@ -2126,6 +2174,7 @@ def _populate_preview_list_async(
 ):
     populate_started = time.perf_counter()
     self._cancel_preview_list_population()
+    token = int(getattr(self, "_preview_list_populate_token", 0) or 0)
     if invalidate_runtime:
         self._invalidate_preview_runtime_caches()
     if show_population_state:
@@ -2208,6 +2257,10 @@ def _populate_preview_list_async(
     if refresh_summary:
         self._refresh_preview_list_summary(lightweight=bool(lightweight_summary or len(entries) >= 1200))
     signal_ready()
+    # on_ready/layout callbacks may start another population synchronously.
+    # Keep this generation's token, never adopt the replacement's token.
+    if token != int(getattr(self, "_preview_list_populate_token", 0) or 0):
+        return
 
     if not entries:
         self._set_preview_list_population_active(False)
@@ -2221,7 +2274,6 @@ def _populate_preview_list_async(
         finish_population()
         return
 
-    token = int(getattr(self, "_preview_list_populate_token", 0) or 0)
     selection_applied = False
 
     def apply_selection():
@@ -2262,13 +2314,10 @@ def _populate_preview_list_async(
                 self._suppress_preview_reload_on_list_select = False
 
     def insert_batch(start_index: int = 0):
-        if (
-            token != int(getattr(self, "_preview_list_populate_token", 0) or 0)
-            or (
-                not bool(getattr(self, "_campaign_deferred_run_restore_in_progress", False))
-                and not self._is_annotation_tab_selected()
-            )
-        ):
+        if token != int(getattr(self, "_preview_list_populate_token", 0) or 0):
+            return
+        if (not bool(getattr(self, "_campaign_deferred_run_restore_in_progress", False))
+                and not self._is_annotation_tab_selected()):
             self._preview_list_populate_after_id = None
             self._set_preview_list_population_active(False)
             return
@@ -2337,6 +2386,9 @@ def _populate_preview_list_async(
         ):
             apply_selection()
 
+        if token != int(getattr(self, "_preview_list_populate_token", 0) or 0):
+            return
+
         if start_index == 0:
             try:
                 first_batch_ms = (time.perf_counter() - populate_started) * 1000.0
@@ -2356,6 +2408,9 @@ def _populate_preview_list_async(
                 on_progress(end_index, len(entries))
             except Exception:
                 pass
+
+        if token != int(getattr(self, "_preview_list_populate_token", 0) or 0):
+            return
 
         if end_index < len(entries):
             try:
@@ -2656,9 +2711,15 @@ def _build_preview_list_summary_cache_key(self, annotations: list[ImageAnnotatio
 
 
 def _refresh_preview_list_summary(self, *, lightweight: bool = False):
+    refresh_missing_gt_count(self)
     annotations = list(self.current_annotations or [])
     visible_entries = list(getattr(self, "_preview_list_display_indices", []) or [])
     visible_count = int(len(visible_entries))
+    try:
+        t02_scope_filenames = set(self._get_t02_review_scope_filenames() or set())
+    except Exception:
+        t02_scope_filenames = set()
+    summary_total_images = len(t02_scope_filenames) if t02_scope_filenames else len(annotations)
     campaign_context = not self._is_free_mode_session_context()
     approval_context = self._get_campaign_step2_approval_context() if campaign_context else {}
     approval_current_step = int(approval_context.get("current_step") or 0) if isinstance(approval_context, dict) else 0
@@ -2711,7 +2772,9 @@ def _refresh_preview_list_summary(self, *, lightweight: bool = False):
                 reused_manual += 1
 
             origin_tag = self._preview_annotation_origin_tag(ann)
-            if origin_tag == "manual" or origin_tag == "M":
+            if missing_required_gt(self, ann):
+                problem_images += 1
+            elif origin_tag == "manual" or origin_tag == "M":
                 manual_images += 1
             elif origin_tag == "auto" or origin_tag == "A":
                 auto_images += 1
@@ -2768,7 +2831,9 @@ def _refresh_preview_list_summary(self, *, lightweight: bool = False):
                 except Exception:
                     is_approved = False
 
-            if is_manual:
+            if missing_required_gt(self, ann):
+                visible_problem += 1
+            elif is_manual:
                 visible_manual += 1
             elif is_auto:
                 visible_auto += 1
@@ -2813,7 +2878,7 @@ def _refresh_preview_list_summary(self, *, lightweight: bool = False):
             visible_problem_images = problem_images if visible_count == len(annotations) else 0
             visible_approved_images = approved_images if visible_count == len(annotations) else 0
     left_summary_parts: list[str] = []
-    left_summary_parts.append(f"Zdjęcia: {visible_count}/{len(annotations)}")
+    left_summary_parts.append(f"Zdjęcia: {visible_count}/{summary_total_images}")
     left_summary_parts.append(f"Tablice: {visible_plate_count}/{total_plate_count}")
     if filter_text:
         left_summary_parts.append(f"Filtr jakości: {filter_text}")
@@ -2960,12 +3025,20 @@ def _refresh_preview_list_summary(self, *, lightweight: bool = False):
             pass
     try:
         total_widget = getattr(self, "preview_list_legend_total_count_lbl", None)
-        if total_widget is not None:
-            total_text = f"{visible_count} / {len(annotations)}"
-            total_widget.configure(text=total_text, width=max(7, len(total_text)))
         total_label = getattr(self, "preview_list_legend_total_lbl", None)
+        if t02_scope_filenames:
+            total_text = (
+                f"{visible_count}/{summary_total_images} · "
+                f"Pula O: {len(annotations)}"
+            )
+            total_label_text = "Zakres kontroli"
+        else:
+            total_text = f"{visible_count} / {len(annotations)}"
+            total_label_text = "Zdjęcia"
+        if total_widget is not None:
+            total_widget.configure(text=total_text, width=max(7, len(total_text)))
         if total_label is not None:
-            total_label.configure(text="Zdjęcia")
+            total_label.configure(text=total_label_text)
     except Exception:
         pass
     try:
@@ -3063,10 +3136,12 @@ def _parse_cvat_preview_annotations(self, xml_path: Path) -> list[ImageAnnotatio
             except (TypeError, ValueError):
                 continue
 
-            if len(points) < 4:
+            if not points:
                 continue
 
-            polygon = PolygonValidator.fix_polygon(points[:4], quiet=True)
+            # Reading is not an annotation edit. Keep stored coordinates/order;
+            # only the temporary display cycle may be normalized.
+            polygon = list(points)
             confidence = 1.0
             attributes = {}
             for attr_el in poly_el.findall("attribute"):
@@ -3092,10 +3167,11 @@ def _parse_cvat_preview_annotations(self, xml_path: Path) -> list[ImageAnnotatio
                 label="plate",
                 confidence=confidence,
                 bbox=self._bbox_from_polygon(polygon),
-                keypoints=self._keypoints_from_polygon(polygon),
+                keypoints=None,
                 polygon=polygon,
                 attributes=attributes,
             )
+            hydrate_stored_geometry(detection, image_size=(width, height), points_text=points_text)
             try:
                 setattr(detection, "_cvat_source", polygon_source or "auto")
             except Exception:
@@ -3497,6 +3573,10 @@ def _save_preview_edits(
     refresh_workflow: bool = True,
     refresh_export_sources: bool = True,
 ):
+    from .z2_preview_autosave import wait_for_pending_save
+    from .z2_plate_gt_inline import flush_inline_plate_gt_editors
+    flush_inline_plate_gt_editors(self)
+    wait_for_pending_save(self)
     save_started_at = time.perf_counter()
     export_elapsed_ms = 0.0
     manifest_elapsed_ms = 0.0
@@ -3541,6 +3621,15 @@ def _save_preview_edits(
     if not success:
         if interactive:
             messagebox.showerror("Błąd zapisu", f"Nie udało się zapisać poprawek do:\n{xml_path}")
+        return False
+
+    from .z2_preview_autosave import flush_pending_gt_after_xml_save
+    try:
+        gt_sync = flush_pending_gt_after_xml_save(self, xml_path)
+        if gt_sync.get("queued"):
+            logger.warning("GT zapisano w XML; oczekuje synchronizacja %s wpisów GT Pack.", gt_sync["queued"])
+    except Exception as exc:
+        logger.warning("GT zapisano w XML, ale nie udało się zsynchronizować GT Pack: %s", exc)
         return False
 
     self.current_annotation_xml_path = xml_path

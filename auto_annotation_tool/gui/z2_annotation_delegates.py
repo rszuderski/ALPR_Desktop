@@ -176,6 +176,7 @@ _LAYOUT_INSTANCE_METHODS = (
     "_get_preview_metric_filter_input_thresholds",
     "_get_preview_metric_filter_thresholds",
     "_preview_annotation_passes_metric_filters",
+    "_get_t02_review_scope_filenames",
     "_filter_preview_list_entries",
     "_reset_preview_metric_filters",
     "_apply_preview_metric_filters",

@@ -1,0 +1,17 @@
+{
+  "image_identity": "source_file_sha256.v1",
+  "normalization_policy": "uppercase_alphanumeric.v1",
+  "producers": [
+    "fixture-desktop"
+  ],
+  "record_counts": {
+    "blobs": 0,
+    "conflicts": 0,
+    "geometries": 2,
+    "images": 1,
+    "plates": 2,
+    "revisions": 2
+  },
+  "schema": "alpr.gt.pack.v1",
+  "version": 1
+}

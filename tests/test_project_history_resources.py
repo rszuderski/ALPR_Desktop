@@ -207,6 +207,9 @@ class ProjectHistoryResourcesTests(unittest.TestCase):
         with patch.object(graph.CAMPAIGN, "get_active_project_name", return_value="demo"), \
              patch.object(graph.CAMPAIGN, "get_current_iteration_num", side_effect=[1, 2]), \
              patch.object(graph.CAMPAIGN, "get_current_step", side_effect=[4, 1]), \
+             patch.object(graph.CAMPAIGN, "get_iteration_path", return_value="char_from_images"), \
+             patch.object(graph.CAMPAIGN, "get_iteration_target", return_value="char"), \
+             patch.object(graph.CAMPAIGN, "get_step4_status", return_value="approved"), \
              patch.object(graph, "_execute_approve_step4", return_value=graph.CampaignGraphActionResult(True, "approve_step4", "OK")), \
              patch.object(graph.CAMPAIGN, "append_project_history_event") as append:
             graph.execute_campaign_graph_action(object(), "approve_step4")

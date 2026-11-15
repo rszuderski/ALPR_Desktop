@@ -1,0 +1,13 @@
+{
+  "normalization_policy": "uppercase_alphanumeric.v1",
+  "observed_by": [
+    "auto_annotation_tool"
+  ],
+  "operation": "set",
+  "parents": [],
+  "plate_id": "plate-ann-fixture-right",
+  "revision_id": "rev-sha256-0d3e5eb236ca0f351b0ed297c5db703abc26555cb60fc40999e976f01a1813bc",
+  "schema": "alpr.gt.revision.v1",
+  "source": "manual_z2",
+  "value": "BBB222"
+}

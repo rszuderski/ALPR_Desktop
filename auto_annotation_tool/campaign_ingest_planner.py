@@ -4,7 +4,7 @@
 Planer ingestii dla iteracji kampanii.
 
 MVP:
-- czyta ground truth z nazw plików źródłowych,
+- rozdziela jawne ground truth od pomocniczych tokenów nazw plików,
 - liczy balans znaków z zaakceptowanej wiedzy projektu,
 - proponuje kolejną porcję danych z master pool,
 - zapisuje wynik w postaci prostych, serializowalnych struktur.
@@ -13,7 +13,7 @@ MVP:
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import os
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import CONFIG, logger
+from .plate_ground_truth import normalize_plate_ground_truth_text
 
 
 CHAR_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -38,6 +39,12 @@ class IngestCandidate:
     char_histogram: dict[str, int]
     score: float = 0.0
     score_details: dict[str, float] | None = None
+    filename_text_hints: list[str] = field(default_factory=list)
+    planning_char_histogram: dict[str, int] | None = None
+
+    @property
+    def ranking_histogram(self):
+        return self.char_histogram if self.planning_char_histogram is None else self.planning_char_histogram
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +53,10 @@ class IngestCandidate:
             "source_key": self.source_key,
             "ground_truth_texts": list(self.ground_truth_texts),
             "char_histogram": dict(self.char_histogram),
+            "filename_text_hints": list(self.filename_text_hints),
+            "planning_char_histogram": dict(self.ranking_histogram),
+            "histogram_source": "explicit_gt" if self.ground_truth_texts else "filename_hint" if self.filename_text_hints else "none",
+            "ground_truth_contract": "explicit_gt.v1",
             "score": float(self.score),
             "score_details": dict(self.score_details or {}),
         }
@@ -62,7 +73,7 @@ class CampaignIngestPlanner:
       roboczy histogram i uzupełniała kolejne luki.
     """
 
-    planner_version = "balance_v1"
+    planner_version = "balance_explicit_gt_v2"
 
     def __init__(self, image_extensions: Iterable[str] | None = None):
         self.image_extensions = {
@@ -77,6 +88,34 @@ class CampaignIngestPlanner:
     def extract_true_texts_from_filename(self, filename: str) -> list[str]:
         stem = Path(str(filename or "")).stem.upper()
         return GROUND_TRUTH_PATTERN.findall(stem)
+
+    def normalize_text_metadata(self, name, metadata=None):
+        """An explicit empty value remains empty; filename tokens are only hints."""
+        metadata = metadata if isinstance(metadata, dict) else {}
+        values = metadata.get("ground_truth_texts") or []
+        if isinstance(values, str):
+            values = [values]
+        texts = list(dict.fromkeys(text for value in values
+                                   if (text := normalize_plate_ground_truth_text(value))))
+        hints = metadata.get("filename_text_hints")
+        if hints is None:
+            hints = self.extract_true_texts_from_filename(name)
+        if isinstance(hints, str):
+            hints = [hints]
+        hints = list(hints or [])
+        return {"ground_truth_texts": texts, "filename_text_hints": hints,
+                "char_histogram": self.build_char_histogram(texts),
+                "planning_char_histogram": self.build_char_histogram(texts or hints),
+                "histogram_source": "explicit_gt" if texts else "filename_hint" if hints else "none",
+                "ground_truth_contract": "explicit_gt.v1"}
+
+    @staticmethod
+    def gt_statistics(items):
+        items = list(items)
+        present = sum(bool(item.get("ground_truth_texts")) for item in items)
+        return {"explicit_gt_count": present, "missing_explicit_gt_count": len(items) - present,
+                "filename_hint_count": sum(bool(item.get("filename_text_hints")) for item in items),
+                "candidates_with_gt": present, "candidates_without_gt": len(items) - present}
 
     def build_char_histogram(self, texts: Iterable[str]) -> dict[str, int]:
         counter: Counter[str] = Counter()
@@ -283,8 +322,8 @@ class CampaignIngestPlanner:
         char_index = {ch: index for index, ch in enumerate(CHAR_ALPHABET)}
         signatures = []
         for row, candidate in enumerate(candidates):
-            signatures.append(tuple(candidate.char_histogram.items()))
-            for ch, count in candidate.char_histogram.items():
+            signatures.append(tuple(candidate.ranking_histogram.items()))
+            for ch, count in candidate.ranking_histogram.items():
                 histogram[row, char_index[ch]] = count
         balance = np.array([current_counter.get(ch, 0) for ch in CHAR_ALPHABET], dtype=np.float64)
         weights = 1.0 + balance.max() - balance + 1.0 / (balance + 1.0)
@@ -295,17 +334,24 @@ class CampaignIngestPlanner:
         scores += np.count_nonzero(histogram, axis=1) * 0.05
         selected = []
         working_counter = Counter(current_counter)
+        # Reserve a slot for unlabelled/unscored material in a mixed batch.
+        unscored = [i for i, candidate in enumerate(candidates) if not candidate.ranking_histogram]
+        unlabelled = [i for i, candidate in enumerate(candidates) if not candidate.ground_truth_texts]
+        inclusive = unscored or (unlabelled if len(unlabelled) < len(candidates) else [])
+        picked = set()
         for _ in range(min(limit, len(candidates))):
             best = float(scores.max())
             # Incremental floating-point sums can differ in their last digits.
             # Scalar rescoring preserves the original stable tie/order contract.
             near = np.flatnonzero(np.isclose(scores, best, rtol=1e-10, atol=1e-8))
+            if limit >= 2 and len(selected) == limit - 1 and inclusive and not picked.intersection(inclusive):
+                near = [next(index for index in inclusive if index not in picked)]
             exact = {}
             chosen_index, best_score, best_details = -1, -1.0, {}
             for index in near:
                 signature = signatures[index]
                 if signature not in exact:
-                    exact[signature] = self.score_candidate(candidates[index].char_histogram, working_counter)
+                    exact[signature] = self.score_candidate(candidates[index].ranking_histogram, working_counter)
                 score, details = exact[signature]
                 if score > best_score:
                     chosen_index, best_score, best_details = index, score, details
@@ -313,14 +359,15 @@ class CampaignIngestPlanner:
             chosen.score = round(best_score, 6)
             chosen.score_details = best_details
             selected.append(chosen)
-            working_counter.update(chosen.char_histogram)
+            picked.add(chosen_index)
+            working_counter.update(chosen.ranking_histogram)
             scores[chosen_index] = -np.inf
             old_max = float(balance.max())
             new_balance = balance + histogram[chosen_index]
             new_max = float(new_balance.max())
             if new_max != old_max:
                 scores += totals * (new_max - old_max)
-            for ch in chosen.char_histogram:
+            for ch in chosen.ranking_histogram:
                 column = char_index[ch]
                 delta = (balance[column] - new_balance[column]
                          + 1.0 / (new_balance[column] + 1.0) - 1.0 / (balance[column] + 1.0))
@@ -378,6 +425,7 @@ class CampaignIngestPlanner:
         used_source_keys: Iterable[str] | None = None,
         used_filenames: Iterable[str] | None = None,
         batch_size: int = 200,
+        source_metadata: dict[str, dict] | None = None,
     ) -> dict[str, Any]:
         master_pool_dir = Path(master_pool_dir)
         if not master_pool_dir.exists() or not master_pool_dir.is_dir():
@@ -404,36 +452,32 @@ class CampaignIngestPlanner:
                 skipped_used += 1
                 continue
 
-            texts = self.extract_true_texts_from_filename(image_path.name)
-            if not texts:
-                skipped_invalid_gt += 1
-                continue
-
-            char_hist = self.build_char_histogram(texts)
-            if not char_hist:
-                skipped_invalid_gt += 1
-                continue
+            fields = self.normalize_text_metadata(image_path.name, (source_metadata or {}).get(source_key))
 
             candidates.append(
                 IngestCandidate(
                     name=image_path.name,
                     source_path=str(image_path),
                     source_key=source_key,
-                    ground_truth_texts=texts,
-                    char_histogram=char_hist,
+                    ground_truth_texts=fields["ground_truth_texts"],
+                    char_histogram=fields["char_histogram"],
+                    filename_text_hints=fields["filename_text_hints"],
+                    planning_char_histogram=fields["planning_char_histogram"],
                 )
             )
 
+        candidates.sort(key=lambda candidate: candidate.source_key)
         selected, working_counter = self._select_candidates(
             candidates, current_counter, len(candidates) if select_all_remaining else requested_batch,
         )
 
         selected_hist = Counter()
         for candidate in selected:
-            selected_hist.update(candidate.char_histogram)
+            selected_hist.update(candidate.ranking_histogram)
 
         return {
             "planner_version": self.planner_version,
+            **self.gt_statistics(candidate.to_dict() for candidate in candidates),
             "generated_at": datetime.now().isoformat(),
             "master_pool_dir": str(master_pool_dir),
             "batch_size": len(selected) if select_all_remaining else requested_batch,

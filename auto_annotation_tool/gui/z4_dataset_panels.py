@@ -842,12 +842,48 @@ def _build_creator_ui(self):
         command=self._on_creator_source_mode_change,
     )
 
+    # Tryb gotowego splitu jest pełnoprawnym wejściem PZ1 także w trybie
+    # swobodnym. Sam frame jest pokazywany/ukrywany przez z4_shared_ui.
+    self.creator_source_ready_radio.pack(anchor=tk.W)
+    self.creator_source_xml_radio.pack(anchor=tk.W, pady=(2, 0))
+
+    self.creator_ready_dataset_row = ttk.Frame(f)
+    ttk.Label(self.creator_ready_dataset_row, text="Gotowy split tablic:").pack(side=tk.LEFT)
+    self.creator_ready_dataset_var = tk.StringVar()
+    self.creator_ready_dataset_entry = ttk.Entry(
+        self.creator_ready_dataset_row,
+        textvariable=self.creator_ready_dataset_var,
+        state="readonly",
+    )
+    self.creator_ready_dataset_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+    self.btn_pick_creator_ready_dataset = ttk.Button(
+        self.creator_ready_dataset_row,
+        text="Przeglądaj datasety",
+        command=lambda: z4_dataset_builder._open_ready_plate_dataset_browser(self),
+    )
+    self.btn_pick_creator_ready_dataset.pack(side=tk.LEFT)
+
     self.creator_ready_dataset_lbl = ttk.Label(
         f,
-        text="",
+        text="Wskaż gotowy dataset YOLO Pose z data.yaml oraz istniejącym train / val / test.",
         justify=tk.LEFT,
         wraplength=720
     )
+
+    def _on_ready_plate_dataset_changed(*_args):
+        try:
+            self._refresh_dataset_creator_cta_state()
+        except Exception:
+            pass
+        try:
+            self._refresh_step4_augmentation_summary("plate")
+        except Exception:
+            pass
+
+    try:
+        self.creator_ready_dataset_var.trace_add("write", _on_ready_plate_dataset_changed)
+    except Exception:
+        pass
 
     row1 = ttk.Frame(f); row1.pack(fill=tk.X, pady=2)
     self.creator_xml_row = row1
@@ -1029,6 +1065,8 @@ def _build_creator_ui(self):
     HELP.bind_help(self.creator_source_mode_frame, "tr_cvat_source_mode")
     HELP.bind_help(self.creator_source_ready_radio, "tr_cvat_source_mode")
     HELP.bind_help(self.creator_source_xml_radio, "tr_cvat_source_mode")
+    HELP.bind_help(self.creator_ready_dataset_row, "tr_cvat_source_mode")
+    HELP.bind_help(self.btn_pick_creator_ready_dataset, "tr_cvat_source_mode")
     HELP.bind_help(self.btn_pick_cvat_xml, "tr_cvat_xml")
     HELP.bind_help(self.creator_auto_match_hint_lbl, "tr_cvat_img")
     HELP.bind_help(row2, "tr_cvat_img")
@@ -1055,7 +1093,7 @@ def _build_splitter_ui(self):
     self._step4_char_split_details_visible = False
     self.btn_step4_split_toggle = ttk.Button(
         f,
-        text="Popraw split",
+        text="Dostosuj wariant",
         command=self._toggle_step4_char_split_details,
         style="WorkflowCard.TButton"
     )
@@ -1093,7 +1131,7 @@ def _build_splitter_ui(self):
         wraplength=720
     )
     summary_colors = _get_step4_table_colors(self)
-    self.split_campaign_summary_title = _make_step4_pz1_section_title(self, f, "1. Źródło i wariant treningowy")
+    self.split_campaign_summary_title = _make_step4_pz1_section_title(self, f, "1. Dane wejściowe do wariantu")
     self.split_campaign_summary_frame = tk.Frame(
         f,
         bd=0,
@@ -1109,12 +1147,12 @@ def _build_splitter_ui(self):
         bg=summary_colors["border"],
     )
     self.split_campaign_summary_grid.pack(fill=tk.X)
-    self.split_campaign_summary_grid.grid_columnconfigure(0, weight=0, minsize=132)
-    self.split_campaign_summary_grid.grid_columnconfigure(1, weight=1, minsize=180)
-    self.split_campaign_summary_grid.grid_columnconfigure(2, weight=2, minsize=260)
+    self.split_campaign_summary_grid.grid_columnconfigure(0, weight=0, minsize=190)
+    self.split_campaign_summary_grid.grid_columnconfigure(1, weight=1, minsize=220)
+    self.split_campaign_summary_grid.grid_columnconfigure(2, weight=3, minsize=460)
     self._split_campaign_summary_header_widgets = []
     self._split_campaign_summary_rows = {}
-    for column, text in enumerate(("Element", "Identyfikator", "Szczegóły")):
+    for column, text in enumerate(("Co sprawdzam", "Stan", "Wyjaśnienie")):
         header_cell = tk.Label(
             self.split_campaign_summary_grid,
             text=text,
@@ -1133,9 +1171,9 @@ def _build_splitter_ui(self):
         self._split_campaign_summary_header_widgets.append(header_cell)
     for row_index, (key, label_text) in enumerate(
         (
-            ("source", "Źródłowy dataset"),
-            ("variant", "Wariant treningowy"),
-            ("split", "Podział wariantu"),
+            ("source", "Dane wejściowe"),
+            ("identity", "Czy dane zmieniły się od poprzedniego eksportu?"),
+            ("variant", "Wariant do treningu"),
         ),
         start=1,
     ):
@@ -1188,6 +1226,272 @@ def _build_splitter_ui(self):
         )
         details_cell.grid(row=row_index, column=2, sticky="nsew")
         self._split_campaign_summary_rows[key] = (label_cell, id_cell, details_cell)
+
+    def _show_split_source_technical_details():
+        raw = str(
+            getattr(
+                self,
+                "_split_source_technical_text",
+                "Brak szczegółów technicznych dla bieżącego źródła.",
+            )
+            or "Brak szczegółów technicznych dla bieżącego źródła."
+        ).strip()
+
+        intro = ""
+        rows = []
+        for line in raw.splitlines():
+            cleaned = str(line or "").strip()
+            if not cleaned:
+                continue
+            if ":" not in cleaned:
+                if not intro:
+                    intro = cleaned
+                continue
+            key, value = cleaned.split(":", 1)
+            rows.append((key.strip(), value.strip()))
+
+        if not rows:
+            try:
+                self.app.themed_info(
+                    "Szczegóły techniczne źródła",
+                    raw,
+                    parent=f,
+                    tone="info",
+                )
+            except Exception:
+                messagebox.showinfo("Szczegóły techniczne źródła", raw, parent=f)
+            return
+
+        try:
+            palette = dict(getattr(self.app, "palette", {}) or {})
+            colors = _get_step4_table_colors(self)
+            panel = colors["panel"]
+            field = colors["row"]
+            row_alt = colors["row_alt"]
+            border = colors["border"]
+            fg = colors["fg"]
+            muted = colors["muted"]
+            success = colors["accent"]
+            warning = colors["warning"]
+            accent = palette.get("accent", success)
+            error = palette.get("error", "#b94a48")
+
+            values_by_key = {key: value for key, value in rows}
+            equivalent_text = str(values_by_key.get("Równoważne eksporty", "") or "").strip()
+            has_equivalent = bool(equivalent_text and equivalent_text.lower() != "brak")
+
+            dialog = tk.Toplevel(f)
+            dialog._campaign_graph_dialog = False
+            try:
+                self.app.style_dialog_window(
+                    dialog,
+                    title="Szczegóły techniczne źródła",
+                    geometry="930x680",
+                    parent=f,
+                )
+            except Exception:
+                dialog.title("Szczegóły techniczne źródła")
+                dialog.geometry("930x680")
+            try:
+                dialog.minsize(820, 560)
+                dialog.resizable(True, True)
+            except Exception:
+                pass
+
+            surface_builder = getattr(self.app, "_build_themed_dialog_surface", None)
+            if callable(surface_builder):
+                surface = surface_builder(dialog, tone="info")
+            else:
+                surface = tk.Frame(dialog, bg=panel, bd=0, highlightthickness=0)
+                surface.pack(fill=tk.BOTH, expand=True)
+            surface_bg = str(surface.cget("bg") or panel)
+
+            shell = tk.Frame(surface, bg=surface_bg, bd=0, highlightthickness=0)
+            shell.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+
+            header = tk.Frame(shell, bg=surface_bg, bd=0, highlightthickness=0)
+            header.pack(fill=tk.X, pady=(0, 10))
+
+            badge_bg = blend_hex_colors(surface_bg, success if has_equivalent else accent, 0.20)
+            tk.Label(
+                header,
+                text="✓" if has_equivalent else "i",
+                bg=badge_bg,
+                fg=fg,
+                font=("Segoe UI Semibold", 12),
+                width=2,
+                pady=3,
+            ).pack(side=tk.LEFT, anchor=tk.N, padx=(0, 10))
+
+            header_text = tk.Frame(header, bg=surface_bg, bd=0, highlightthickness=0)
+            header_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            tk.Label(
+                header_text,
+                text="Szczegóły techniczne źródła",
+                bg=surface_bg,
+                fg=fg,
+                font=("Segoe UI Semibold", 13),
+                anchor="w",
+            ).pack(fill=tk.X)
+
+            if has_equivalent:
+                lead = "Powtórny eksport — ten sam materiał logiczny."
+                lead_fg = success
+            else:
+                lead = "Identyfikatory i ślad techniczny źródła używanego przez PZ1."
+                lead_fg = accent
+
+            tk.Label(
+                header_text,
+                text=lead,
+                bg=surface_bg,
+                fg=lead_fg,
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=780,
+            ).pack(fill=tk.X, pady=(4, 0))
+
+            if intro:
+                tk.Label(
+                    shell,
+                    text=intro,
+                    bg=surface_bg,
+                    fg=muted,
+                    font=("Segoe UI", 9),
+                    anchor="w",
+                    justify=tk.LEFT,
+                    wraplength=860,
+                ).pack(fill=tk.X, pady=(0, 10))
+
+            table = tk.Frame(
+                shell,
+                bg=border,
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=border,
+                highlightcolor=border,
+            )
+            table.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+            table.grid_columnconfigure(0, weight=0, minsize=225)
+            table.grid_columnconfigure(1, weight=1)
+
+            header_bg = blend_hex_colors(field, border, 0.18)
+            for col, text_value in enumerate(("Pole", "Wartość")):
+                tk.Label(
+                    table,
+                    text=text_value,
+                    bg=header_bg,
+                    fg=muted,
+                    font=("Segoe UI Semibold", 9),
+                    anchor="w",
+                    padx=10,
+                    pady=7,
+                    relief="solid",
+                    bd=1,
+                ).grid(row=0, column=col, sticky="nsew")
+
+            def _row_tone(key: str, value: str):
+                normalized = key.casefold()
+                if "pełna ścieżka" in normalized:
+                    return muted
+                if "równoważne eksporty" in normalized:
+                    return success if value and value.casefold() != "brak" else muted
+                if "materiału logicznego" in normalized or "liczba source_pid" in normalized:
+                    return success
+                if "kontrakt" in normalized or "fingerprint" in normalized:
+                    return accent
+                if "folder eksportu" in normalized:
+                    return success
+                if "projekt" in normalized or "iteracja" in normalized:
+                    return accent
+                if "artefaktu" in normalized:
+                    return warning
+                return fg
+
+            for row_index, (key, value) in enumerate(rows, start=1):
+                tone = _row_tone(key, value)
+                base_bg = field if row_index % 2 else row_alt
+                row_bg = (
+                    blend_hex_colors(base_bg, tone, 0.08)
+                    if tone not in {fg, muted}
+                    else base_bg
+                )
+                key_fg = tone if tone != fg else muted
+
+                tk.Label(
+                    table,
+                    text=key,
+                    bg=row_bg,
+                    fg=key_fg,
+                    font=("Segoe UI Semibold", 9),
+                    anchor="nw",
+                    justify=tk.LEFT,
+                    padx=10,
+                    pady=7,
+                    relief="solid",
+                    bd=1,
+                ).grid(row=row_index, column=0, sticky="nsew")
+
+                tk.Label(
+                    table,
+                    text=value or "-",
+                    bg=row_bg,
+                    fg=fg if tone != muted else muted,
+                    font=("Segoe UI", 9),
+                    anchor="nw",
+                    justify=tk.LEFT,
+                    wraplength=625,
+                    padx=10,
+                    pady=7,
+                    relief="solid",
+                    bd=1,
+                ).grid(row=row_index, column=1, sticky="nsew")
+
+            actions = tk.Frame(shell, bg=surface_bg, bd=0, highlightthickness=0)
+            actions.pack(fill=tk.X)
+            tk.Button(
+                actions,
+                text="OK",
+                command=dialog.destroy,
+                bg=blend_hex_colors(field, success if has_equivalent else accent, 0.18),
+                fg=fg,
+                activebackground=blend_hex_colors(field, success if has_equivalent else accent, 0.28),
+                activeforeground=fg,
+                relief=tk.FLAT,
+                font=("Segoe UI", 10),
+                padx=18,
+                pady=7,
+                cursor="hand2",
+            ).pack(side=tk.RIGHT)
+
+            try:
+                dialog.transient(f.winfo_toplevel())
+                dialog.grab_set()
+                dialog.focus_set()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self.app.themed_info(
+                    "Szczegóły techniczne źródła",
+                    raw,
+                    parent=f,
+                    tone="info",
+                )
+            except Exception:
+                messagebox.showinfo("Szczegóły techniczne źródła", raw, parent=f)
+
+    self.split_source_technical_row = ttk.Frame(f)
+    self.split_source_technical_row.pack(fill=tk.X, pady=(5, 3))
+    self.btn_split_source_technical_details = ttk.Button(
+        self.split_source_technical_row,
+        text="Szczegóły techniczne",
+        command=_show_split_source_technical_details,
+        style="WorkflowCard.TButton",
+    )
+    self.btn_split_source_technical_details.pack(side=tk.RIGHT)
 
     row2 = ttk.Frame(f); row2.pack(fill=tk.X, pady=2)
     self.split_output_row = row2

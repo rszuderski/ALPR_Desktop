@@ -1,0 +1,13 @@
+{
+  "normalization_policy": "uppercase_alphanumeric.v1",
+  "observed_by": [
+    "fixture-desktop"
+  ],
+  "operation": "set",
+  "parents": [],
+  "plate_id": "plate-ann-fixture-single",
+  "revision_id": "rev-sha256-0b72dd1387eb2596ad00625a43575fb4435d302da0294a23756eb3e4eb6fa2eb",
+  "schema": "alpr.gt.revision.v1",
+  "source": "manual_z2",
+  "value": "ABC123"
+}

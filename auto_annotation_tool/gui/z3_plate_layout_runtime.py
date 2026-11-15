@@ -35,6 +35,7 @@ from .z3_preview_records import (
     normalize_plate_source_origin,
 )
 from .z3_preview_ui import serialize_character_records
+from .z3_review_runtime import prepare_layout_review
 
 _VALID_PREVIEW_LAYOUT_OVERRIDES = {"single_row", "two_row"}
 
@@ -460,8 +461,14 @@ def _constrain_preview_char_bbox_to_layout_separator(self, bbox, data=None, *, r
     if y2 < y1:
         y1, y2 = y2, y1
     center_x = (x1 + x2) / 2.0
-    sep_y = self._preview_separator_y_at_x(data, center_x)
-    if sep_y is None:
+    # Dla separatora skośnego sama wartość w środku boxa nie wystarcza.
+    # Box nie może przeciąć linii ani przy lewej, ani przy prawej krawędzi.
+    separator_samples = []
+    for probe_x in (x1, center_x, x2):
+        probe_y = self._preview_separator_y_at_x(data, float(probe_x))
+        if probe_y is not None:
+            separator_samples.append(float(probe_y))
+    if not separator_samples:
         return [x1, y1, x2, y2]
     try:
         max_h = max(1.0, float((data or {}).get("plate_image_height", 0.0) or 0.0))
@@ -473,11 +480,13 @@ def _constrain_preview_char_bbox_to_layout_separator(self, bbox, data=None, *, r
         resolved_row = 0
     min_h = max(1.0, float(min_size))
     if resolved_row == 1:
-        y2 = min(y2, sep_y - 1.0)
+        boundary_y = min(separator_samples) - 1.0
+        y2 = min(y2, boundary_y)
         if y2 - y1 < min_h:
             y1 = max(0.0, y2 - min_h)
     elif resolved_row == 2:
-        y1 = max(y1, sep_y + 1.0)
+        boundary_y = max(separator_samples) + 1.0
+        y1 = max(y1, boundary_y)
         if y2 - y1 < min_h:
             y2 = min(max_h, y1 + min_h)
     return [float(x1), float(y1), float(x2), float(y2)]
@@ -698,7 +707,9 @@ def _build_preview_layout_separator_drag_preview(self, drag_state, canvas_x: flo
         prepared["y1"] = current_img_y
 
     prepared["source"] = "manual"
-    return prepared
+    # Separator nie może być przeciągnięty przez istniejące boxy znaków.
+    # Przy poprawnej geometrii 2R pozostaje w wolnym pasie między rzędami.
+    return self._clamp_preview_layout_separator_to_existing_rows(data, prepared)
 
 def _clamp_preview_layout_separator_to_existing_rows(self, data, separator):
     if not isinstance(data, dict) or not isinstance(separator, dict):
@@ -759,8 +770,31 @@ def _apply_preview_layout_separator_constraints_to_chars(self, data, chars=None)
     source_chars = chars if isinstance(chars, list) else (data.get("characters", []) if isinstance(data, dict) else [])
     if not isinstance(source_chars, list):
         return []
-    # Separator rzędów jest narzędziem semantycznym: zmienia kolejność
-    # czytania (1.x/2.x), ale nie może przesuwać ani przycinać wykrytych boxów.
+    if not isinstance(data, dict) or not self._should_preview_use_two_row_layers(data):
+        return list(source_chars)
+
+    # RAW pozostaje nietknięty. W edytowalnym REVIEW separator 2R jest
+    # twardą granicą geometrii roboczych boxów.
+    for rec in source_chars:
+        if not isinstance(rec, dict):
+            continue
+        bbox = rec.get("bbox")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) >= 4):
+            continue
+        try:
+            row = int(rec.get("reading_row", 0) or 0)
+        except Exception:
+            row = 0
+        if row not in (1, 2):
+            row = self._get_preview_row_for_bbox(bbox, data) or 0
+        constrained = self._constrain_preview_char_bbox_to_layout_separator(
+            bbox,
+            data=data,
+            row=(row if row in (1, 2) else None),
+            min_size=4.0,
+        )
+        if isinstance(constrained, (list, tuple)) and len(constrained) >= 4:
+            rec["bbox"] = [float(value) for value in constrained[:4]]
     return list(source_chars)
 
 def _preview_layout_separator_conflicts_with_chars(self, data, chars=None) -> bool:
@@ -917,6 +951,14 @@ def _apply_preview_plate_layout_override(self, override: str | None, *, source: 
     except Exception:
         pass
 
+    if not prepare_layout_review(self, data):
+        return "break"
+
+    try:
+        self._mark_review_edit_started(data)
+    except Exception:
+        pass
+
     chars = list(data.get("characters", []) or []) if isinstance(data.get("characters", []), list) else []
     selected_records = {}
     for attr in ("_preview_char_selected_index", "_preview_char_label_active_index", "_preview_char_hover_label_index"):
@@ -931,6 +973,13 @@ def _apply_preview_plate_layout_override(self, override: str | None, *, source: 
             data.pop("layout_separator", None)
         elif next_override == "two_row":
             try:
+                # Zmiana 1R -> 2R jest zmianą semantyki czytania, nie geometrii.
+                # Po pracy w 1R rekordy mogą mieć zapisane reading_row=1 dla
+                # wszystkich znaków. Użycie tych starych rzędów do constraintów
+                # ścinałoby dolne boxy do górnej połowy tablicy. Zachowujemy
+                # boxy tam, gdzie są, budujemy separator z ich geometrii, a
+                # dalsza anotacja przeliczy reading_row/reading_col względem
+                # separatora.
                 self._ensure_preview_layout_separator(data, chars)
             except Exception:
                 pass
@@ -950,6 +999,9 @@ def _apply_preview_plate_layout_override(self, override: str | None, *, source: 
         setattr(self, attr, next((index for index, item in enumerate(ordered_chars) if item is record), None))
     ordered_chars = self._annotate_preview_character_reading_positions(ordered_chars, data=data)
     data["characters"] = ordered_chars
+    assist = getattr(self, "_apply_live_gt_assist", None)
+    if callable(assist):
+        assist(data)
     data["status"] = self._derive_preview_status_from_data(data, ordered_chars)
 
     try:
@@ -976,6 +1028,7 @@ def _apply_preview_plate_layout_override(self, override: str | None, *, source: 
         message=message,
         tone=tone if tone in {"success", "warning", "error", "info", "muted"} else "info",
     )
+    self._refresh_detection_review_controls()
     return "break"
 
 
@@ -1260,16 +1313,15 @@ def _count_character_sources(self, chars, data=None):
         "manual_sign": 0,
         "generated_box": 0,
         "ocr_symbol": 0,
+        "gt_assisted": 0,
     }
     for idx, rec in enumerate(list(chars or [])):
         box_source = self._get_character_box_source_tag(rec, data=data, fallback_index=idx)
         sign_source = self._get_character_sign_source_tag(rec, data=data, fallback_index=idx)
-        if box_source in counts:
-            counts[box_source] += 1
-        if sign_source in counts:
-            counts[sign_source] += 1
         tag = self._get_character_source_tag(rec, data=data, fallback_index=idx)
-        if tag not in counts:
-            continue
-        counts[tag] += 1
+        # The combined tag can equal a component (YB with no model symbol,
+        # including a symbol assigned by GT). Count that role once per box.
+        for source in {box_source, sign_source, tag}:
+            if source in counts:
+                counts[source] += 1
     return counts

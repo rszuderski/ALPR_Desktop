@@ -1575,17 +1575,51 @@ def _collect_project_start_image_names(
 ) -> list[str]:
     image_names: list[str] = []
 
-    for item in list((self.current_ingest_plan or {}).get("selected", []) or []):
-        name = str(item.get("name") or "").strip()
-        if not name:
-            try:
-                name = str(Path(str(item.get("source_path") or "").strip()).name or "").strip()
-            except Exception:
-                name = ""
-        if name:
-            image_names.append(name)
+    def _same_source_path(left, right) -> bool:
+        if left is None or right is None:
+            return False
+        try:
+            return Path(left).resolve() == Path(right).resolve()
+        except Exception:
+            return str(left or "").strip().lower() == str(right or "").strip().lower()
 
-    if not image_names and isinstance(manifest, dict):
+    current_plan = getattr(self, "current_ingest_plan", None)
+    plan_source_matches_images_dir = False
+    if isinstance(current_plan, dict):
+        plan_source = str(
+            current_plan.get("master_pool_dir")
+            or current_plan.get("source_dir")
+            or ""
+        ).strip()
+        if images_dir is None:
+            plan_source_matches_images_dir = True
+        elif plan_source:
+            plan_source_matches_images_dir = _same_source_path(plan_source, images_dir)
+
+    # Plan roboczy należy do konkretnego źródła O. Nie wolno używać listy
+    # selected z poprzedniego katalogu/projektu podczas budowy nowego kontraktu.
+    if plan_source_matches_images_dir:
+        for item in list((current_plan or {}).get("selected", []) or []):
+            name = str(item.get("name") or "").strip()
+            if not name:
+                try:
+                    name = str(Path(str(item.get("source_path") or "").strip()).name or "").strip()
+                except Exception:
+                    name = ""
+            if name:
+                image_names.append(name)
+
+    manifest_matches_images_dir = isinstance(manifest, dict)
+    if manifest_matches_images_dir and images_dir is not None:
+        manifest_source = str(
+            manifest.get("master_pool_dir")
+            or manifest.get("source_dir")
+            or ""
+        ).strip()
+        if manifest_source:
+            manifest_matches_images_dir = _same_source_path(manifest_source, images_dir)
+
+    if not image_names and manifest_matches_images_dir:
         for item in list(manifest.get("selected_images", []) or []):
             name = str((item or {}).get("name") or "").strip()
             if name:
@@ -1637,35 +1671,155 @@ def _build_project_start_image_set_token(
     )
     return token, int(unique_count or 0)
 
+def _scan_project_start_plate_xml_summary(self, run_dir: Path | None) -> dict:
+    result = {
+        "xml_path": "",
+        "image_names": [],
+        "normalized_names": set(),
+        "name_by_normalized": {},
+        "plate_count_by_normalized": {},
+        "plate_images": 0,
+        "plate_count": 0,
+    }
+    if run_dir is None:
+        return result
+
+    try:
+        candidate = Path(run_dir)
+    except Exception:
+        return result
+
+    xml_path = candidate if candidate.is_file() else candidate / "annotations.xml"
+    try:
+        if not xml_path.exists() or not xml_path.is_file():
+            return result
+    except Exception:
+        return result
+
+    try:
+        resolved_xml = str(xml_path.resolve())
+    except Exception:
+        resolved_xml = str(xml_path)
+
+    try:
+        stat = xml_path.stat()
+        stamp = (
+            resolved_xml.lower(),
+            int(getattr(stat, "st_mtime_ns", 0) or 0),
+            int(getattr(stat, "st_size", 0) or 0),
+        )
+    except Exception:
+        stamp = (resolved_xml.lower(), 0, 0)
+
+    cache = getattr(self, "_project_start_plate_xml_summary_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            self._project_start_plate_xml_summary_cache = cache
+        except Exception:
+            pass
+
+    cached = cache.get(stamp)
+    if isinstance(cached, dict):
+        prepared = dict(cached)
+        prepared["image_names"] = list(cached.get("image_names") or [])
+        prepared["normalized_names"] = set(cached.get("normalized_names") or set())
+        prepared["name_by_normalized"] = dict(cached.get("name_by_normalized") or {})
+        prepared["plate_count_by_normalized"] = dict(cached.get("plate_count_by_normalized") or {})
+        return prepared
+
+    plate_labels = {
+        str(label or "").strip().lower()
+        for label in getattr(CONFIG, "PLATE_LABELS", [])
+        if str(label or "").strip()
+    }
+    if not plate_labels:
+        plate_labels = {"plate"}
+
+    image_names = []
+    normalized_names = set()
+    name_by_normalized = {}
+    plate_count_by_normalized = {}
+    total_plates = 0
+
+    def _local_tag(tag) -> str:
+        value = str(tag or "")
+        return value.rsplit("}", 1)[-1].lower()
+
+    try:
+        for _event, image_el in ET.iterparse(str(xml_path), events=("end",)):
+            if _local_tag(getattr(image_el, "tag", "")) != "image":
+                continue
+
+            filename = str(image_el.get("name", "") or "").strip()
+            if not filename:
+                image_el.clear()
+                continue
+
+            plate_count = 0
+            for det_el in list(image_el):
+                if _local_tag(getattr(det_el, "tag", "")) not in {"polygon", "box"}:
+                    continue
+                label = str(det_el.get("label", "") or "").strip().lower()
+                if label in plate_labels:
+                    plate_count += 1
+
+            if plate_count > 0:
+                normalized = CAMPAIGN._normalize_image_set_name(filename)
+                if normalized:
+                    image_names.append(filename)
+                    normalized_names.add(normalized)
+                    name_by_normalized.setdefault(normalized, Path(filename).name)
+                    plate_count_by_normalized[normalized] = (
+                        int(plate_count_by_normalized.get(normalized, 0) or 0)
+                        + int(plate_count)
+                    )
+                    total_plates += int(plate_count)
+
+            image_el.clear()
+    except Exception:
+        return result
+
+    prepared = {
+        "xml_path": resolved_xml,
+        "image_names": list(image_names),
+        "normalized_names": set(normalized_names),
+        "name_by_normalized": dict(name_by_normalized),
+        "plate_count_by_normalized": dict(plate_count_by_normalized),
+        "plate_images": int(len(normalized_names)),
+        "plate_count": int(total_plates),
+    }
+
+    if len(cache) > 24:
+        cache.clear()
+    cache[stamp] = {
+        "xml_path": resolved_xml,
+        "image_names": list(image_names),
+        "normalized_names": set(normalized_names),
+        "name_by_normalized": dict(name_by_normalized),
+        "plate_count_by_normalized": dict(plate_count_by_normalized),
+        "plate_images": int(len(normalized_names)),
+        "plate_count": int(total_plates),
+    }
+    return prepared
+
+
 def _build_project_start_plate_xml_image_set_token(self, run_dir: Path | None) -> tuple[str, int]:
     if run_dir is None:
         return "", 0
 
-    annotation_tab = getattr(self.app, "tabs", {}).get("annotation")
-    if annotation_tab is None:
+    summary = _scan_project_start_plate_xml_summary(self, run_dir)
+    image_names = [
+        str(name or "").strip()
+        for name in list(summary.get("image_names") or [])
+        if str(name or "").strip()
+    ]
+    if not image_names:
         return "", 0
 
-    try:
-        safe_run_dir = annotation_tab._resolve_safe_annotation_run_dir(run_dir, require_xml=True)
-    except Exception:
-        safe_run_dir = None
-    if safe_run_dir is None:
-        return "", 0
-
-    try:
-        annotations = annotation_tab._parse_cvat_preview_annotations(safe_run_dir / "annotations.xml")
-    except Exception:
-        annotations = []
-    image_names = [str(getattr(ann, "filename", "") or "").strip() for ann in annotations if str(getattr(ann, "filename", "") or "").strip()]
     token = CAMPAIGN.build_image_name_set_token(image_names)
-    unique_count = len(
-        {
-            CAMPAIGN._normalize_image_set_name(name)
-            for name in image_names
-            if CAMPAIGN._normalize_image_set_name(name)
-        }
-    )
-    return token, int(unique_count or 0)
+    return token, int(summary.get("plate_images", 0) or 0)
+
 
 def _show_project_start_asset_source_context_menu(self, event, row_key: str) -> None:
     rows = getattr(self, "ingest_start_asset_row_widgets", {}) or {}
@@ -1805,13 +1959,17 @@ def _clear_project_start_asset(self, row_key: str) -> None:
     try:
         if row_key == "images":
             try:
-                CAMPAIGN.clear_master_pool_dir()
-            except Exception:
-                pass
-            try:
-                CAMPAIGN.clear_latest_ingest_plan()
-            except Exception:
-                pass
+                clear_result = CAMPAIGN.clear_step1_image_source_state()
+                if isinstance(clear_result, dict) and not bool(clear_result.get("ok", True)):
+                    logger.warning(
+                        "Nie udało się w pełni wyczyścić źródła obrazów E1: %s",
+                        clear_result,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Nie udało się wyczyścić źródła obrazów E1: %s",
+                    exc,
+                )
             self.current_ingest_plan = {}
             self.ingest_plan_items = []
             try:
@@ -1837,23 +1995,28 @@ def _clear_project_start_asset(self, row_key: str) -> None:
                 pass
             self._set_project_start_asset_scope("char_model", "", persist=True)
 
-        if self._get_iteration_target() == "char" and self._get_step1_char_route_block_reason():
-            try:
-                CAMPAIGN.clear_iteration_target()
-            except Exception:
-                pass
-
+        # Usunięcie albo podmiana zasobu E1 nie może kasować jawnego wyboru
+        # bramki/toru. Wybrana bramka pozostaje aktywna i po prostu wraca do
+        # stanu „warunki niespełnione”, dopóki operator nie uzupełni braków.
+        # Zmiana toru jest osobną, świadomą akcją („Zmień tor” / wybór innej
+        # bramki), więc tylko ona może wyczyścić iteration_target/path.
         try:
             self._clear_dashboard_perf_cache()
         except Exception:
             pass
-        try:
-            self._sync_iteration_artifact_registry_from_project_start()
-        except Exception:
-            pass
+
+        if row_key != "images":
+            try:
+                self._sync_iteration_artifact_registry_from_project_start()
+            except Exception:
+                pass
+
         self._refresh_dashboard()
         try:
-            self.app.update_status(f"Wyczyszczono wybór {label} w E1.", "info")
+            self.app.update_status(
+                f"Wyczyszczono wybór {label} w E1. Wybrana bramka pozostaje aktywna; uzupełnij brakujący zasób.",
+                "info",
+            )
         except Exception:
             pass
     except Exception as e:
@@ -3302,6 +3465,69 @@ def _get_project_start_adoptable_normalized_image_names(self, images_dir: Path |
     approved_names = self._get_project_start_approved_normalized_image_names()
     return set(all_names) - set(approved_names)
 
+def _get_project_start_az_resource_state(self) -> dict:
+    '''Read-only AZ resource state for the active campaign project.'''
+    active_project = str(CAMPAIGN.get_active_project_name() or "").strip()
+    if not active_project:
+        return {
+            "project_id": "",
+            "project_exists": False,
+            "crop_count": 0,
+            "az_count": 0,
+            "usable_count": 0,
+            "ready_count": 0,
+            "pending_review_count": 0,
+            "excluded_count": 0,
+            "other_count": 0,
+            "missing_count": 0,
+            "contract_ready": False,
+            "coverage_status": "no_project",
+            "latest_updated_at": "",
+        }
+
+    try:
+        project_data = dict(
+            (CAMPAIGN.state.get("projects", {}) or {}).get(
+                active_project,
+                {},
+            )
+            or {}
+        )
+        folder_name = str(project_data.get("folder_name") or "").strip()
+        if not folder_name:
+            raise RuntimeError("Aktywny projekt nie ma folder_name.")
+
+        from ..registry.az_campaign_resource import summarize_project_az_resource
+        from ..registry.az_registry import AZRegistry, project_id_from_folder_name
+
+        project_id = project_id_from_folder_name(folder_name)
+        if not project_id:
+            raise RuntimeError("Nie udało się wyliczyć project_id.")
+
+        registry = AZRegistry.for_workspace(CONFIG.WORKSPACE_DIR)
+        return summarize_project_az_resource(
+            registry,
+            project_id=project_id,
+        ).to_dict()
+    except Exception as exc:
+        logger.debug("Nie udało się odczytać stanu AZ projektu: %s", exc)
+        return {
+            "project_id": "",
+            "project_exists": False,
+            "crop_count": 0,
+            "az_count": 0,
+            "usable_count": 0,
+            "ready_count": 0,
+            "pending_review_count": 0,
+            "excluded_count": 0,
+            "other_count": 0,
+            "missing_count": 0,
+            "contract_ready": False,
+            "coverage_status": "error",
+            "latest_updated_at": "",
+            "error": str(exc),
+        }
+
 def _show_project_start_asset_details(self, row_key: str, parent=None) -> None:
     row_key = str(row_key or "").strip()
     if not row_key:
@@ -3387,16 +3613,36 @@ def _show_project_start_asset_details(self, row_key: str, parent=None) -> None:
         )
     elif row_key == "char_run":
         title = "AZ - anotacje znaków"
-        body_lines.append("Źródło: Nie wskazano")
-        body_lines.append("")
+        az_state = _get_project_start_az_resource_state(self)
+        crop_count = int(az_state.get("crop_count", 0) or 0)
+        az_count = int(az_state.get("az_count", 0) or 0)
+        usable_count = int(az_state.get("usable_count", 0) or 0)
+        ready_count = int(az_state.get("ready_count", 0) or 0)
+        pending_count = int(az_state.get("pending_review_count", 0) or 0)
+        excluded_count = int(az_state.get("excluded_count", 0) or 0)
         body_lines.append(
-            "AZ oznacza gotowe anotacje znaków. To piąty możliwy zasób wejściowy iteracji, "
-            "obok obrazów, modeli i anotacji tablic."
+            "Źródło: Registry projektu"
+            if az_count > 0
+            else "Źródło: Brak AZ przypisanej do projektu"
         )
         body_lines.append("")
         body_lines.append(
-            "Import anotacji znaków nie jest jeszcze podłączony jako operacja E1. "
-            "Na tym etapie zasób jest widoczny w grafie jako element przyszłego modelu warunków wejściowych."
+            f"Logiczne cropy projektu: {crop_count}. "
+            f"AZ przypisane: {az_count}. Używalne: {usable_count}."
+        )
+        body_lines.append(
+            f"Gotowe: {ready_count} | do kontroli: {pending_count} | "
+            f"wykluczone: {excluded_count}."
+        )
+        body_lines.append("")
+        body_lines.append(
+            "AZ jest odczytywane bezpośrednio z registry projektu. "
+            "Boxy i etykiety są powiązane z logical crop_id, nie z nazwą pliku."
+        )
+        body_lines.append("")
+        body_lines.append(
+            "Import AZ z innego projektu zostanie obsłużony przez tę samą pozycję zasobów; "
+            "nie powstaje osobna ścieżka PZ2 ani nowa bramka."
         )
     elif row_key in {"plate_model", "char_model"}:
         is_plate = row_key == "plate_model"
@@ -3489,9 +3735,13 @@ def _get_project_start_filename_plate_signature(filename: str) -> tuple[str, ...
 def _project_start_annotation_covers_filename_plates(self, filename: str, plate_count: int) -> tuple[bool, int]:
     expected_texts = self._get_project_start_filename_plate_texts(filename)
     expected_count = int(len(expected_texts) or 0)
-    if expected_count <= 0:
-        return True, 0
-    return bool(int(plate_count or 0) >= expected_count), expected_count
+
+    # Nazwa pliku jest wyłącznie historyczną podpowiedzią GT. Nie może być
+    # bramką importu AT: prosty parser [A-Z0-9]{4,} potrafi potraktować np.
+    # licznik pliku "0017" albo drugi numer z nazwy jako dodatkową tablicę.
+    # W aktualnym kontrakcie właściwy tekst jest przypisywany do konkretnej
+    # anotacji tablicy podczas kontroli w Z2.
+    return True, expected_count
 
 def _format_project_start_annotation_adoption_summary(compatibility: dict | None) -> str:
     payload = dict(compatibility or {})
@@ -4194,25 +4444,21 @@ def _check_project_start_run_compatibility(
     result["package_image_set_token"] = str(package_image_set_token or "").strip()
     result["package_image_count"] = int(package_image_count or 0)
 
-    try:
-        annotations = annotation_tab._parse_cvat_preview_annotations(safe_run_dir / "annotations.xml")
-    except Exception:
-        return result
+    xml_summary = _scan_project_start_plate_xml_summary(self, safe_run_dir)
+    xml_image_names = [
+        str(name or "").strip()
+        for name in list(xml_summary.get("image_names") or [])
+        if str(name or "").strip()
+    ]
+    xml_name_by_normalized = dict(xml_summary.get("name_by_normalized") or {})
+    xml_normalized_names = set(xml_summary.get("normalized_names") or set())
+    plate_count_by_normalized = dict(xml_summary.get("plate_count_by_normalized") or {})
+    plate_count = int(xml_summary.get("plate_count", 0) or 0)
 
-    plate_annotations = []
-    plate_count = 0
-    plate_count_by_normalized: dict[str, int] = {}
-    incomplete_name_by_normalized: dict[str, str] = {}
-    for ann in annotations:
-        ann_plate_count = self._count_project_start_plate_detections(annotation_tab, ann)
-        if ann_plate_count <= 0:
-            continue
-        filename = str(getattr(ann, "filename", "") or "").strip()
-        if not filename:
-            continue
-        normalized_name = CAMPAIGN._normalize_image_set_name(filename)
-        if not normalized_name:
-            continue
+    incomplete_name_by_normalized = {}
+    for normalized_name in sorted(xml_normalized_names):
+        filename = str(xml_name_by_normalized.get(normalized_name, normalized_name) or "").strip()
+        ann_plate_count = int(plate_count_by_normalized.get(normalized_name, 0) or 0)
         covers_filename, expected_plate_count = self._project_start_annotation_covers_filename_plates(
             filename,
             ann_plate_count,
@@ -4223,28 +4469,8 @@ def _check_project_start_run_compatibility(
                     f"{Path(filename).name} ({int(ann_plate_count)} z {int(expected_plate_count)} tablic z nazwy)"
                 )
             except Exception:
-                incomplete_name_by_normalized[normalized_name] = str(filename)
-        plate_annotations.append(ann)
-        plate_count += int(ann_plate_count)
-        plate_count_by_normalized[normalized_name] = (
-            int(plate_count_by_normalized.get(normalized_name, 0) or 0)
-            + int(ann_plate_count)
-        )
+                incomplete_name_by_normalized[normalized_name] = filename
 
-    xml_image_names = [
-        str(getattr(ann, "filename", "") or "").strip()
-        for ann in plate_annotations
-        if str(getattr(ann, "filename", "") or "").strip()
-    ]
-    xml_name_by_normalized: dict[str, str] = {}
-    for name in xml_image_names:
-        normalized_name = CAMPAIGN._normalize_image_set_name(name)
-        if normalized_name and normalized_name not in xml_name_by_normalized:
-            try:
-                xml_name_by_normalized[normalized_name] = Path(name).name
-            except Exception:
-                xml_name_by_normalized[normalized_name] = name
-    xml_normalized_names = set(xml_name_by_normalized.keys())
     complete_xml_normalized_names = xml_normalized_names - set(incomplete_name_by_normalized.keys())
 
     xml_image_set_token = CAMPAIGN.build_image_name_set_token(xml_image_names)
@@ -4259,7 +4485,7 @@ def _check_project_start_run_compatibility(
         and package_image_set_token == xml_image_set_token
     )
 
-    if not plate_annotations:
+    if not xml_normalized_names:
         result["checked"] = True
         result["images_dir"] = images_dir
         return result
@@ -5658,24 +5884,102 @@ def _refresh_project_start_panel(self) -> None:
         requirement=char_model_requirement,
     )
 
-    char_run_validation_text = "Planowane | import AZ nie jest jeszcze dostępny w zasobach bramki."
-    char_run_validation_tone = "muted"
+    az_state = _get_project_start_az_resource_state(self)
+    az_project_id = str(az_state.get("project_id") or "").strip()
+    az_crop_count = int(az_state.get("crop_count", 0) or 0)
+    az_count = int(az_state.get("az_count", 0) or 0)
+    az_usable_count = int(az_state.get("usable_count", 0) or 0)
+    az_ready_count = int(az_state.get("ready_count", 0) or 0)
+    az_pending_count = int(az_state.get("pending_review_count", 0) or 0)
+    az_excluded_count = int(az_state.get("excluded_count", 0) or 0)
+    az_other_count = int(az_state.get("other_count", 0) or 0)
+    az_missing_count = int(az_state.get("missing_count", 0) or 0)
+    coverage_status = str(az_state.get("coverage_status") or "")
+    az_reviewed_count = int(az_state.get("reviewed_count", 0) or 0)
+    az_review_required = bool(az_state.get("review_required"))
+    az_review_complete = bool(az_state.get("review_complete"))
+    az_contract_ready = bool(az_state.get("contract_ready"))
+
+    if coverage_status == "error":
+        char_run_validation_text = "Registry AZ niedostępne | nie udało się odczytać stanu zasobu."
+        char_run_validation_tone = "warning"
+    elif az_crop_count <= 0:
+        char_run_validation_text = (
+            "Brak cropów PZ1 w projekcie | AZ może zostać użyte po wyodrębnieniu tablic."
+        )
+        char_run_validation_tone = "muted"
+    elif az_count <= 0:
+        char_run_validation_text = (
+            f"Brak AZ | 0/{az_crop_count} logicznych cropów projektu ma anotacje znaków."
+        )
+        char_run_validation_tone = "muted"
+    elif az_pending_count > 0 or az_other_count > 0:
+        char_run_validation_text = (
+            f"Do kontroli | {az_count}/{az_crop_count} cropów ma AZ; "
+            f"gotowe {az_ready_count}, do kontroli {az_pending_count}, "
+            f"inne {az_other_count}, wykluczone {az_excluded_count}, "
+            f"brakujące {az_missing_count}."
+        )
+        char_run_validation_tone = "warning"
+    elif az_ready_count <= 0:
+        char_run_validation_text = (
+            f"AZ istnieje | {az_count}/{az_crop_count} cropów, "
+            "ale brak gotowych anotacji do ponownego użycia."
+        )
+        char_run_validation_tone = "warning"
+    elif coverage_status == "partial":
+        char_run_validation_text = (
+            f"Częściowe | {az_count}/{az_crop_count} cropów ma AZ; "
+            f"gotowe {az_ready_count}, wykluczone {az_excluded_count}, "
+            f"brakujące {az_missing_count}."
+        )
+        char_run_validation_tone = "info"
+    else:
+        char_run_validation_text = (
+            f"Jest | {az_count}/{az_crop_count} cropów ma AZ; "
+            f"gotowe {az_ready_count}, wykluczone {az_excluded_count}."
+        )
+        char_run_validation_tone = (
+            "success"
+            if az_contract_ready
+            else "info"
+        )
+
     char_run_requirement = ""
     char_run_meta = build_resource_contract_meta(
         "O/AT->AZ",
-        contract_ready=False,
+        contract_ready=az_contract_ready,
         requires_rematch=False,
-        source_mode="",
+        source_mode=("project_registry" if az_count > 0 else ""),
         iteration_path=current_iteration_path,
+        project_id=az_project_id,
+        crop_count=az_crop_count,
+        az_count=az_count,
+        usable_count=az_usable_count,
+        ready_count=az_ready_count,
+        pending_review_count=az_pending_count,
+        excluded_count=az_excluded_count,
+        other_count=az_other_count,
+        missing_count=az_missing_count,
+        reviewed_count=az_reviewed_count,
+        coverage_status=coverage_status,
+        review_required=az_review_required,
+        review_complete=bool(az_state.get("review_complete")),
+        latest_updated_at=str(az_state.get("latest_updated_at") or ""),
+        contract_message=char_run_validation_text,
     )
     self._set_project_start_asset_row_state(
         "char_run",
-        source_text="Nie wskazano",
+        source_text=("Registry projektu" if az_count > 0 else "Nie wskazano"),
         source_path="",
         validation_text=char_run_validation_text,
         tone=char_run_validation_tone,
         requirement=char_run_requirement,
-        counter_text="0",
+        counter_text=(
+            f"{az_usable_count}/{az_crop_count}"
+            if az_crop_count > 0
+            else str(az_usable_count)
+        ),
         meta=char_run_meta,
     )
 

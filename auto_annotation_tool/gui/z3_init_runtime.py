@@ -19,6 +19,8 @@ from .inertial_scroll import InertialScrollController
 
 PREVIEW_BOX_MODE_OPTIONS = [
     ("AUTO", "Auto (wg etapu)"),
+    ("GT_RESULT", "Wynik do korekty (limit GT)"),
+    ("RAW_RESULT", "RAW wynik eksperymentu"),
     ("FINAL", "Końcowe ramki treningowe"),
     ("YOLO_FILTERED", "YOLO po filtrze sekwencji"),
     ("YOLO_NMS", "YOLO po usunięciu dubli (NMS)"),
@@ -31,6 +33,9 @@ PREVIEW_BOX_MODE_BY_LABEL = {label: key for key, label in PREVIEW_BOX_MODE_OPTIO
 
 PREVIEW_BOX_MODE_BY_LABEL.update({
     "Auto (wg metody)": "AUTO",
+    "RAW": "RAW_RESULT",
+    "Wynik RAW": "RAW_RESULT",
+    "RAW wynik": "RAW_RESULT",
     "Wynik końcowy": "FINAL",
     "YOLO po NMS": "YOLO_NMS",
     "YOLO surowe": "YOLO_RAW",
@@ -74,7 +79,24 @@ def __init__(self, parent, app):
 
     # core state
     self.is_processing = False
-    self._step3_linear_mode = False
+
+    # Invariant kontekstu Z3:
+    # aktywny projekt zawsze ma pierwszeństwo nad lokalnym/starym stanem
+    # trybu swobodnego. To chroni restore/restart przed przeciekiem (F)->(C).
+    try:
+        _active_campaign_project = bool(
+            str(CAMPAIGN.get_active_project_name() or "").strip()
+        )
+    except Exception:
+        _active_campaign_project = False
+
+    self._step3_linear_mode = bool(_active_campaign_project)
+
+    if _active_campaign_project:
+        try:
+            self.app.campaign_free_mode = False
+        except Exception:
+            pass
 
     # preview/cache state
     self.preview_metadata = {}
@@ -180,7 +202,7 @@ def __init__(self, parent, app):
     self._preview_controls_legend_drag_state = None
     self._preview_controls_legend_click_state = None
     self._preview_fullscreen_toggle_rect = None
-    self._preview_controls_legend_visible = True
+    self._preview_controls_legend_visible = False
     self._preview_operation_assistant_visible = True
     self._preview_overlay_dock_expanded = True
     self._preview_overlay_dock_render_key = None
@@ -238,7 +260,8 @@ def __init__(self, parent, app):
     self.presets_search_dirs = CONFIG.get_preset_search_dirs("ocr")
 
     # local session
-    self.session_file = Path.home() / ".auto_annotation_tool" / "char_tab_session.json"
+    from alpr_runtime import user_data_root
+    self.session_file = user_data_root() / "char_tab_session.json"
     self.session_file.parent.mkdir(parents=True, exist_ok=True)
     self.local_session = self._load_local_session()
 

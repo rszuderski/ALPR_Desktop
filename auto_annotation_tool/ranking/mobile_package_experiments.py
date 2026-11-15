@@ -16,11 +16,12 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import zipfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..config import CONFIG, logger
 
@@ -242,6 +243,105 @@ class ReportBundleValidation:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+def _declared_capability(
+    capabilities: dict[str, Any],
+    name: str,
+) -> bool | None:
+    value = capabilities.get(name)
+
+    if isinstance(value, bool):
+        return value
+
+    return None
+
+
+def _derive_mobile_report_capabilities(
+    sample_schema: dict[str, Any],
+    collection_session: dict[str, Any],
+    model_refs: dict[str, Any],
+    manifest: dict[str, Any],
+    checked_hashes: int,
+    skipped_hashes: int,
+) -> dict[str, Any]:
+    declared = sample_schema.get("capabilities", {})
+
+    if not isinstance(declared, dict):
+        declared = {}
+
+    collection_complete = collection_session.get(
+        "collection_complete"
+    )
+
+    if not isinstance(collection_complete, bool):
+        collection_complete = None
+
+    raw_hashes = (
+        manifest.get("entry_sha256")
+        or manifest.get("sha256")
+        or {}
+    )
+
+    if not isinstance(raw_hashes, dict):
+        raw_hashes = {}
+
+    declared_hashes = sum(
+        1
+        for name, digest in raw_hashes.items()
+        if name != "manifest.json"
+        and str(digest or "").strip()
+    )
+
+    return {
+        "attempt_registry": _declared_capability(
+            declared,
+            "attempt_registry",
+        ),
+        "mt_invocation_identity": _declared_capability(
+            declared,
+            "mt_invocation_identity",
+        ),
+        "mt_input_evidence_references": _declared_capability(
+            declared,
+            "mt_input_evidence_references",
+        ),
+        "raw_prediction": _declared_capability(
+            declared,
+            "raw_prediction",
+        ),
+        "registration_key": _declared_capability(
+            declared,
+            "registration_key",
+        ),
+        "source_timestamp_domain": _declared_capability(
+            declared,
+            "source_timestamp_domain",
+        ),
+        "actual_backend_fields": _declared_capability(
+            declared,
+            "actual_backend_fields",
+        ),
+
+        # Nie zgadujemy brakujących możliwości.
+        "fresh_mz_result": _declared_capability(
+            declared,
+            "fresh_mz_result",
+        ),
+
+        "model_refs": True if model_refs else None,
+        "collection_complete": collection_complete,
+
+        "hash_coverage": {
+            "manifest_present": bool(manifest),
+            "declared_entries": declared_hashes,
+            "checked_entries": checked_hashes,
+            "skipped_entries": skipped_hashes,
+            "complete": (
+                declared_hashes > 0
+                and checked_hashes == declared_hashes
+                and skipped_hashes == 0
+            ),
+        },
+    }
 
 @dataclass(frozen=True)
 class MobileReportBundle:
@@ -275,12 +375,21 @@ class MobileReportBundle:
     crop_count: int = 0
     annotation_count: int = 0
     sample_schema: dict[str, Any] = field(default_factory=dict)
+    scene_evidence: dict[str, Any] = field(default_factory=dict)
+    mz_input_evidence: dict[str, Any] = field(default_factory=dict)
+    tv_bbox_evidence: dict[str, Any] = field(default_factory=dict)
+    f6_evidence: dict[str, Any] = field(default_factory=dict)
     collection_session: dict[str, Any] = field(default_factory=dict)
     attempt_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
     attempt_total: int = 0
     attempts_available: bool = False
     log_preview: str = ""
     entries: tuple[ReportBundleEntry, ...] = field(default_factory=tuple)
+
+    capabilities: dict[str, Any] = field(
+        default_factory=dict
+    )
+
     validation: ReportBundleValidation = field(
         default_factory=lambda: ReportBundleValidation(ok=True)
     )
@@ -315,12 +424,16 @@ class MobileReportBundle:
             "crop_count": self.crop_count,
             "annotation_count": self.annotation_count,
             "sample_schema": dict(self.sample_schema),
+            "mz_input_evidence": dict(self.mz_input_evidence),
+            "tv_bbox_evidence": dict(self.tv_bbox_evidence),
+            "f6_evidence": dict(self.f6_evidence),
             "collection_session": dict(self.collection_session),
             "attempt_rows": list(self.attempt_rows),
             "attempt_total": self.attempt_total,
             "attempts_available": self.attempts_available,
             "log_preview": self.log_preview,
             "entries": [entry.to_dict() for entry in self.entries],
+            "capabilities": dict(self.capabilities),
             "validation": self.validation.to_dict(),
             "imported_at": self.imported_at,
         }
@@ -496,7 +609,7 @@ class ReportBundleReader:
         safe_path = Path(path)
         if not safe_path.exists() or not safe_path.is_file():
             raise FileNotFoundError(f"Nie znaleziono raportu mobilnego: {safe_path}")
-        if zipfile.is_zipfile(safe_path):
+        if self._is_zip_bundle(safe_path):
             return self._read_zip_bundle(safe_path)
         return self._read_json_report(safe_path)
 
@@ -504,9 +617,33 @@ class ReportBundleReader:
         safe_path = Path(path)
         if not safe_path.exists() or not safe_path.is_file():
             raise FileNotFoundError(f"Nie znaleziono raportu mobilnego: {safe_path}")
-        if zipfile.is_zipfile(safe_path):
+        if self._is_zip_bundle(safe_path):
             return (self._read_zip_bundle(safe_path),)
         return self._read_json_bundles(safe_path)
+
+    @staticmethod
+    def _is_zip_bundle(path: Path) -> bool:
+        if zipfile.is_zipfile(path):
+            return True
+        # A truncated ZIP lacks its central directory. Do not mistake the
+        # entire archive size for a JSON size, or read binary data as text.
+        # The bounded header probe also preserves legacy UTF-8 JSON reports
+        # named .alprsession. Actual PK archives never fall through to JSON.
+        with path.open("rb") as stream:
+            prefix = stream.read(4096)
+        signature = prefix[:4]
+        json_prefix = prefix.removeprefix(b'\xef\xbb\xbf').lstrip(b' \t\r\n')
+        legacy_json_header = json_prefix.startswith((b'{', b'[')) or (bool(prefix) and not json_prefix)
+        if signature in (
+            b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08",
+        ) or (path.suffix.lower() in (".alprsession", ".zip") and not legacy_json_header):
+            raise ValueError(
+                "Import integralności: archiwum ZIP jest niekompletne lub uszkodzone. "
+                "Nie można odczytać katalogu ZIP. "
+                "Wskaż kompletną kopię lub ponowny eksport tej samej zapisanej sesji. "
+                f"Plik: {path.name} ({path.stat().st_size} B)."
+            )
+        return False
 
     def _read_json_report(self, path: Path) -> MobileReportBundle:
         bundles = self._read_json_bundles(path)
@@ -674,11 +811,6 @@ class ReportBundleReader:
                 for name in normalized_names
                 if name.lower().endswith((".pt", ".tflite", ".onnx", ".param", ".bin", ".alprmodel"))
             ]
-            if embedded_model_entries:
-                warnings.append(
-                    "Raport zawiera binarne artefakty modeli. Nowy lekki standard .alprsession "
-                    "powinien przechowywać tylko manifesty pipeline i referencje SHA-256."
-                )
 
             def read_text(name: str, *, optional: bool = False, limit: int | None = None) -> str:
                 info = normalized_names.get(name)
@@ -708,8 +840,27 @@ class ReportBundleReader:
 
             manifest = read_json("manifest.json", optional=True)
             bundle_schema = str(manifest.get("schema") or "")
+
+            supported_bundle_schemas = {
+                MOBILE_RESEARCH_BUNDLE_SCHEMA,
+                MOBILE_THESIS_BUNDLE_SCHEMA,
+                MOBILE_BENCHMARK_REPORT_SCHEMA,
+            }
+
+            if manifest and bundle_schema not in supported_bundle_schemas:
+                errors.append(
+                    f"Nieobsługiwany schemat manifestu raportu: "
+                    f"{bundle_schema or 'brak'}."
+                )
+
             metadata = read_json("metadata.json", optional=True)
             collection_session = read_json("session.json", optional=True)
+            if collection_session.get("schema") == "alpr_crop_session_v1":
+                errors.append(
+                    "To paczka Akwizycji Androida, a nie sesja badawcza. "
+                    "Otwórz ją przez Z3 > Akwizycja Androida. "
+                    "Selekcja niepustych MZ nie pozwala ocenić jakości całego pipeline'u."
+                )
             report_payload = read_json("report.json", optional=True)
             if not report_payload and metadata:
                 report_payload = _report_payload_from_thesis_metadata(metadata)
@@ -844,9 +995,68 @@ class ReportBundleReader:
                 bundle_kind = "alprsession"
             elif bundle_schema == MOBILE_THESIS_BUNDLE_SCHEMA:
                 bundle_kind = "thesis"
-            else:
+            elif bundle_schema == MOBILE_BENCHMARK_REPORT_SCHEMA:
                 bundle_kind = "legacy_zip"
+            else:
+                bundle_kind = "unknown"
 
+            from .mobile_f6_execution_evidence import read_extension as read_f6_extension
+            f6_evidence = dict(available=False, status='ABSENT')
+            try:
+                f6_evidence = read_f6_extension(archive, sample_schema, collection_session, manifest, report_payload)
+                if errors and f6_evidence.get('available'):
+                    raise ValueError('ARCHIVE_INTEGRITY_FAILURE')
+                if f6_evidence.get('status') == 'PARTIAL':warnings.append('F6: niekompletny dziennik wykonania; brak dowodu pozostaje N/A.')
+            except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as exc:
+                errors.append('F6 execution evidence contract: ' + str(exc))
+                f6_evidence = dict(available=False, status='INVALID', reason=str(exc))
+            scene_evidence = dict(available=False, status='ABSENT', scenes=(), roles=())
+            if errors and any((sample_schema.get('capabilities') or {}).get(k) for k in ('scene_evidence_v1','mt_detection_roles_v1')):
+                scene_evidence = dict(available=False, status='INVALID', scenes=(), roles=(), reason='ARCHIVE_INTEGRITY_FAILURE')
+            if not errors:
+                from .mobile_scene_evidence import read_extension
+                try:
+                    scene_evidence = read_extension(archive, sample_schema, collection_session, manifest, report_payload, f6=f6_evidence)
+                    if scene_evidence['status'] == 'PARTIAL':
+                        warnings.append('F5A: niekompletne dowody scen/ról; brakujące jednostki pozostają N/A.')
+                except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as exc:
+                    errors.append('F5A evidence contract: ' + str(exc))
+                    scene_evidence = dict(available=False, status='INVALID', scenes=(), roles=(), reason=str(exc))
+            from .mobile_mz_input_evidence import read_extension as read_mz_extension, absent as mz_absent
+            mz_input_evidence = mz_absent(collection_session.get('measurement_purpose'))
+            try:
+                mz_input_evidence = read_mz_extension(archive, sample_schema, collection_session, manifest, report_payload)
+                if errors and mz_input_evidence.get('available'):
+                    raise ValueError('ARCHIVE_INTEGRITY_FAILURE')
+                if mz_input_evidence['status'] == 'PARTIAL':
+                    warnings.append('MZ: niekompletny dowód wejścia; brak dowodu pozostaje N/A.')
+            except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as exc:
+                errors.append('MZ input evidence contract: ' + str(exc))
+                mz_input_evidence = dict(available=False, status='INVALID', rows=[], dependencies={}, reason=str(exc))
+            from .mobile_tv_bbox_evidence import read_extension as read_tv_extension, absent as tv_absent
+            tv_bbox_evidence = tv_absent()
+            try:
+                tv_bbox_evidence = read_tv_extension(archive, sample_schema, collection_session, manifest, report_payload, f6=f6_evidence)
+                if errors and tv_bbox_evidence.get('available'):
+                    raise ValueError('ARCHIVE_INTEGRITY_FAILURE')
+                if tv_bbox_evidence['status'] == 'PARTIAL':
+                    warnings.append('TV_BBOX_CROP: niekompletne dowody wejścia; brak pozostaje N/A.')
+            except (ValueError, KeyError, TypeError, AttributeError, IndexError, ArithmeticError, OSError, zipfile.BadZipFile) as exc:
+                errors.append('TV BBOX evidence contract: ' + str(exc))
+                tv_bbox_evidence = dict(available=False, status='INVALID', rows=[], dependencies={}, reason=str(exc))
+            if f6_evidence.get('available') and not errors:
+                from .mobile_f6_execution_evidence import validate_bindings
+                try:
+                    validate_bindings(archive, manifest, collection_session, f6_evidence, tv_bbox_evidence, scene_evidence)
+                except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as exc:
+                    errors.append('F6 binding contract: ' + str(exc))
+                    f6_evidence = dict(available=False, status='INVALID', reason=str(exc))
+            tensor_entries = set(mz_input_evidence.get('tensor_payloads', ()))
+            if any(name not in tensor_entries for name in embedded_model_entries):
+                warnings.append(
+                    "Raport zawiera binarne artefakty modeli. Nowy lekki standard .alprsession "
+                    "powinien przechowywać tylko manifesty pipeline i referencje SHA-256."
+                )
             validation = ReportBundleValidation(
                 ok=not errors,
                 errors=tuple(errors),
@@ -854,6 +1064,24 @@ class ReportBundleReader:
                 checked_hashes=checked_hashes,
                 skipped_hashes=skipped_hashes,
             )
+
+            capabilities = _derive_mobile_report_capabilities(
+                sample_schema=sample_schema,
+                collection_session=collection_session,
+                model_refs=model_refs,
+                manifest=manifest,
+                checked_hashes=checked_hashes,
+                skipped_hashes=skipped_hashes,
+            )
+            if scene_evidence.get('available'):
+                capabilities.update(scene_evidence_v1=True, mt_detection_roles_v1=True,
+                                    scene_evidence_status=scene_evidence['status'])
+            capabilities.update(mz_input_evidence_v1=mz_input_evidence.get('available', False),
+                                mz_input_evidence_status=mz_input_evidence['status'])
+            if tv_bbox_evidence.get('available'):
+                capabilities.update(tv_bbox_crop_v1=True, tv_bbox_status=tv_bbox_evidence['status'])
+            if f6_evidence.get('available'):
+                capabilities.update(f6_final180_v1=True, f6_status=f6_evidence['status'])
             artifact_flags = {
                 "has_traces": bool(trace_total),
                 "has_thermal": bool(thermal_total),
@@ -874,6 +1102,11 @@ class ReportBundleReader:
                 "attempts": attempt_total,
             }
             report = MobileBenchmarkReport.from_dict(report_payload or {})
+            if not report_payload.get('measured_at'):
+                # Some archives do not declare this report date.
+                # Keep it unavailable instead of generating a different identity
+                # on each native source re-open.
+                report = replace(report, measured_at='')
             report, experiment_session = _attach_report_ingest_metadata(
                 report,
                 path=path,
@@ -917,11 +1150,16 @@ class ReportBundleReader:
                 sample_schema=sample_schema,
                 collection_session=collection_session,
                 attempt_rows=tuple(attempt_rows),
+                scene_evidence=scene_evidence,
+                mz_input_evidence=mz_input_evidence,
+                tv_bbox_evidence=tv_bbox_evidence,
+                f6_evidence=f6_evidence,
                 attempt_total=attempt_total,
                 attempts_available=attempts_available,
                 log_preview=log_preview,
                 entries=tuple(entries),
-                validation=validation,
+                capabilities=capabilities,
+                validation=validation
             )
 
     def _verify_manifest_hashes(
@@ -1815,7 +2053,7 @@ class MobileBenchmarkReport:
             report_id=_safe_id(str(payload.get("report_id") or report_seed), fallback="report"),
             package_id=package_id,
             variant_id=variant_id,
-            measured_at=str(payload.get("measured_at") or _utc_now_iso()),
+            measured_at=str(payload.get("measured_at") or "") if "measured_at" in payload else _utc_now_iso(),
             source_archive_sha256=str(
                 payload.get("source_archive_sha256")
                 or _nested_value(raw_payload, "desktop_ingest.source_archive_sha256")
@@ -1848,6 +2086,12 @@ def _mobile_report_device_name(report: MobileBenchmarkReport) -> str:
 
 
 def _mobile_report_dedupe_key(report: MobileBenchmarkReport) -> tuple[str, ...]:
+    # A session archive contains one report. Its bytes remain the same even
+    # when a legacy report omits measured_at (which otherwise defaults to now).
+    kind = _nested_value(report.raw, "desktop_ingest.bundle_kind")
+    if (report.source_archive_sha256 and (kind == "alprsession" or
+            (Path(report.source_path).suffix.lower() == ".alprsession" and kind != "json"))):
+        return ("archive", report.source_archive_sha256)
     return (
         "report",
         str(report.report_id or "").strip(),
@@ -2296,6 +2540,495 @@ def score_mobile_report(
     )
 
 
+F5A_IMPORT_SERIES = "F5A-ROI-A12-01"
+F5A_IMPORT_SCENARIO = "PAIRED_ROI_01"
+F5A_IMPORT_GROUP = (F5A_IMPORT_SERIES, F5A_IMPORT_SCENARIO)
+F5A_IMPORT_COMBINATIONS = tuple(
+    (variant, f"r{repeat:02d}", block)
+    for variant in ("R0", "R1", "R2")
+    for repeat in (1, 2, 3)
+    for block in ("A", "B", "C", "D")
+)
+
+
+@dataclass
+class MobileSessionImportItem:
+    path: Path
+    status: str = "NEW"
+    session_id: str = ""
+    sha256: str = ""
+    combination: tuple[str, str, str] | None = None
+    report: MobileBenchmarkReport | None = None
+    reason: str = ""
+    roles_incomplete: bool = False
+    archive_ok: bool | None = None
+    profile_ok: bool | None = None
+    observations: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    codes: tuple[str, ...] = ()
+    details: tuple[str, ...] = ()
+    mt_interruptions: dict[str, int] = field(default_factory=dict)
+    group: tuple[str, str] | None = None
+
+    @property
+    def is_f5a(self) -> bool:
+        return self.group == F5A_IMPORT_GROUP
+
+    def observed(self, key: str) -> str:
+        return " / ".join(self.observations.get(key, ())) or "brak w odczytanych metadanych"
+
+
+@dataclass
+class MobileSessionImportPlan:
+    root: Path
+    f5a: bool = False
+    items: list[MobileSessionImportItem] = field(default_factory=list)
+    scan_errors: list[str] = field(default_factory=list)
+    cancelled: bool = False
+    finished: bool = False
+    selected_group: tuple[str, str] | None = None
+    found_count: int = 0
+
+    @property
+    def groups(self) -> dict[tuple[str, str], list[MobileSessionImportItem]]:
+        result = {}
+        for item in self.items:
+            if item.group is not None:
+                result.setdefault(item.group, []).append(item)
+        return result
+
+    def select_group(self, group: tuple[str, str]) -> None:
+        if group not in self.groups:
+            raise ValueError("Nie znaleziono wybranej grupy w tym skanie.")
+        self.selected_group = group
+
+    @property
+    def eligible_items(self) -> list[MobileSessionImportItem]:
+        if self.cancelled or self.selected_group is None:
+            return []
+        return [i for i in self.items if i.group == self.selected_group and i.status == "NEW"
+                and (not i.is_f5a or i.profile_ok is True)]
+
+    @property
+    def import_caption(self) -> str:
+        n = len(self.eligible_items)
+        ending = "zgodną sesję" if n == 1 else "zgodne sesje" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "zgodnych sesji"
+        return f"Importuj {n} {ending}"
+
+    @staticmethod
+    def group_caption(group) -> str:
+        return " / ".join(v or "brak deklaracji" for v in group) if group is not None else "wybierz grupę w podsumowaniu"
+
+    @staticmethod
+    def mt_counts(items) -> tuple[int, dict[str, int]]:
+        items = list(items)
+        reasons, seen = {}, set()
+        for item in items:
+            if not item.archive_ok or item.sha256 in seen:
+                continue
+            seen.add(item.sha256)
+            for reason, number in item.mt_interruptions.items():
+                reasons[reason] = reasons.get(reason, 0) + number
+        return sum(i.roles_incomplete for i in items), reasons
+
+    def headline(self) -> list[str]:
+        primary = [i for i in self.items if i.is_f5a]
+        others = [i for i in self.items if not i.is_f5a and i.group is not None]
+        return [f"Wszystkie znalezione archiwa: {self.found_count or len(self.items)}",
+                f"Sprawdzone archiwa: {len(self.items)}",
+                f"Integralne: {sum(i.archive_ok is True for i in self.items)}",
+                f"Seria główna / wybrana: {self.group_caption(self.selected_group)}",
+                f"Właściwa seria F5A: {len(primary)}",
+                f"Zgodne z protokołem F5A: {sum(i.profile_ok is True for i in primary)}",
+                f"Niezgodne z protokołem F5A: {sum(i.status == 'CONFLICT' for i in primary)}",
+                f"Pilotaże / inne serie: {len(others)}" if primary else "Inne eksperymenty: kwalifikacja ogólna, bez przypisania do F5A",
+                f"Już istniejące: {self.count('EXISTING')}",
+                f"Uszkodzone lub nieczytelne: {self.count('INVALID')}",
+                f"Konflikty tożsamości: {self.count('IDENTITY_CONFLICT')}",
+                f"Duplikaty: {self.count('DUPLICATE')}",
+                f"Gotowe do importu: {len(self.eligible_items)}"]
+
+    def overview(self) -> list[str]:
+        """The compact GUI and copied diagnostics share these exact counters."""
+        selected = self.groups.get(self.selected_group, [])
+        others = [i for i in self.items if i.group is not None and i.group != self.selected_group]
+        return [f"Wszystkie archiwa: {self.found_count or len(self.items)}",
+                f"Integralne: {sum(i.archive_ok is True for i in self.items)}",
+                f"Poprawne w wybranej serii: {sum(i.status in {'NEW', 'EXISTING', 'IMPORTED'} for i in selected)}",
+                f"Niezgodne: {sum(i.status == 'CONFLICT' for i in selected)}",
+                f"Pilotaże / inne serie poza wyborem: {len(others)}",
+                f"Już istniejące: {self.count('EXISTING')}",
+                f"Uszkodzone: {self.count('INVALID')}",
+                f"Gotowe do importu: {len(self.eligible_items)}"]
+
+    def item_summary(self, item: MobileSessionImportItem) -> str:
+        labels = {"NEW": "nowa", "EXISTING": "już zaimportowana", "IMPORTED": "zaimportowano",
+                  "DUPLICATE": "duplikat", "INVALID": "uszkodzona lub nieczytelna",
+                  "CONFLICT": "niezgodna z protokołem", "IDENTITY_CONFLICT": "konflikt tożsamości", "ERROR": "błąd zapisu lub zmiana źródła"}
+        lines = [f"[{labels.get(item.status, item.status)}] {item.path}",
+                 f"Seria / scenariusz: {self.group_caption(item.group)}",
+                 f"session_id: {item.observed('session_id')}",
+                 f"Wariant zapisany: {item.observed('variant')}",
+                 f"Powtórzenie: {item.observed('replicate_index')} | Blok: {item.observed('block')}",
+                 f"Integralność: {'potwierdzona' if item.archive_ok else 'niepotwierdzona'}",
+                 f"Protokół: {'zgodny F5A' if item.profile_ok else 'niezgodny F5A' if item.profile_ok is False and item.is_f5a else 'brak znanego protokołu — ogólna kontrola archiwum'}",
+                 f"SHA-256: {item.sha256 or 'nie udało się odczytać'}"]
+        if item.reason:
+            lines.append(item.reason)
+        lines.extend(item.details)
+        if item.codes:
+            lines.append("Kod: " + ", ".join(item.codes))
+        if item.roles_incomplete:
+            lines.extend(["Nie wszystkie wywołania MT zakończyły postprocessing — szczegóły w raporcie.",
+                          "mt_detection_roles_complete=False (ostrzeżenie, nie błąd ZIP/SHA)"])
+            lines.extend(f"{reason}: {number}" for reason, number in sorted(item.mt_interruptions.items()))
+        return "\n".join(lines)
+
+    def count(self, status: str) -> int:
+        return sum(item.status == status for item in self.items)
+
+    @property
+    def missing(self) -> tuple[tuple[str, str, str], ...]:
+        accepted = {"EXISTING", "IMPORTED"} if self.finished else {"NEW", "EXISTING", "IMPORTED"}
+        present = {item.combination for item in self.items if item.is_f5a and item.status in accepted}
+        return tuple(c for c in F5A_IMPORT_COMBINATIONS if c not in present) if self.f5a else ()
+
+    @property
+    def missing_files(self) -> tuple[tuple[str, str, str], ...]:
+        # Presence is independent of qualification: a policy conflict still
+        # proves that this recorded session exists, without proving valid R1.
+        present = {i.combination for i in self.items if i.archive_ok
+                   and i.observations.get("series_id") == (F5A_IMPORT_SERIES,)
+                   and i.observations.get("scenario_id") == (F5A_IMPORT_SCENARIO,)}
+        return tuple(c for c in F5A_IMPORT_COMBINATIONS if c not in present) if self.f5a else ()
+
+    def summary(self, *, completed: bool = False) -> str:
+        lines = ["Podsumowanie kwalifikacji", f"Folder: {self.root}", *self.headline(), "", "Liczniki widoczne w oknie:", *self.overview()]
+        if self.cancelled:
+            lines.append("Operacja anulowana. Skan lub zapis mogą być częściowe; zapisane sesje pozostają w magazynie.")
+        if not self.items and not self.scan_errors:
+            lines.append("Nie znaleziono plików .alprsession w tym folderze ani jego podfolderach.")
+        if self.selected_group is None and self.groups:
+            lines.append("Wybierz świadomie jedną z grup. Żadnej nie wybrano arbitralnie.")
+        if completed or self.finished:
+            lines.extend(["", "Wynik zapisu dla całego skanu:",
+                          f"Zaimportowano: {self.count('IMPORTED')}",
+                          f"Już istniały: {self.count('EXISTING')}",
+                          f"Nie zaimportowano: {len(self.items) - self.count('IMPORTED') - self.count('EXISTING')}",
+                          f"Błędy: {self.count('ERROR') + self.count('INVALID') + self.count('IDENTITY_CONFLICT')}"])
+        lines.extend(["", "Grupy rozpoznane z metadanych:"])
+        for group, items in self.groups.items():
+            lines.append(f"{self.group_caption(group)}: {len(items)} archiwów; "
+                         f"nowe: {sum(i.status == 'NEW' for i in items)}; "
+                         f"już zaimportowane: {sum(i.status == 'EXISTING' for i in items)}; "
+                         f"niezgodne: {sum(i.status == 'CONFLICT' for i in items)}")
+        excluded = [i for i in self.items if i.group is not None and i.group != self.selected_group]
+        if excluded and self.selected_group is not None:
+            pilots = all(re.search(r"(?:^|[-_])PILOT(?:$|[-_])", i.group[0], re.I) for i in excluded)
+            lines.append(f"Pominięto {len(excluded)} sesje pilotażowe należące do innej serii." if pilots
+                         else f"Pominięto {len(excluded)} archiwów innych serii. Można jawnie wybrać ich grupę.")
+        if self.f5a:
+            unknown = self.cancelled or self.scan_errors or any(not i.archive_ok or (i.is_f5a and not i.combination) for i in self.items)
+            lines.append("Brakujących plików oryginalnych F5A: nie można ustalić — niepełny odczyt" if unknown
+                         else f"Brakujących plików oryginalnych F5A: {len(self.missing_files)}")
+            lines.append(f"Brakujących poprawnych pomiarów F5A: {len(self.missing)}")
+            lines.append("Do uzupełnienia: " + (", ".join("/".join(c) for c in self.missing) or "brak"))
+        for label, items in (("Cały skan", self.items),
+                             ("Właściwa seria F5A", [i for i in self.items if i.is_f5a]),
+                             ("Inne serie", [i for i in self.items if not i.is_f5a])):
+            incomplete, reasons = self.mt_counts(items)
+            lines.extend(["", f"Dowody MT — {label}:", f"Archiwa z niekompletnymi dowodami: {incomplete}",
+                          f"Wywołania z niedokończonym postprocessingiem: {sum(reasons.values())}"])
+            lines.extend(f"{reason}: {number}" for reason, number in sorted(reasons.items()))
+            if incomplete:
+                lines.append("Nie wszystkie wywołania MT zakończyły postprocessing — szczegóły w raporcie.")
+        lines.extend(["", "Szczegóły archiwów:"])
+        for item in sorted(self.items, key=lambda i: i.status in {"NEW", "EXISTING", "IMPORTED", "DUPLICATE"}):
+            lines.extend(["", self.item_summary(item)])
+        lines.extend(self.scan_errors)
+        if not completed:
+            lines.extend(["", "Samo sprawdzanie i podsumowanie nie zapisują raportów.", self.import_caption])
+        return "\n".join(lines)
+
+
+class _SessionImportIssue(ValueError):
+    def __init__(self, reason, *, status="CONFLICT", codes=(), details=()):
+        super().__init__(reason)
+        self.status, self.codes, self.details = status, tuple(codes), tuple(details)
+
+
+def mobile_import_path_error(error: Exception, path: Path | str) -> str:
+    """Operator-facing Windows/filesystem errors, retaining raw details separately."""
+    winerror = getattr(error, "winerror", None)
+    if isinstance(error, PermissionError) or winerror == 5:
+        reason = "Brak dostępu. Sprawdź uprawnienia do folderu lub pliku"
+    elif isinstance(error, FileNotFoundError) or winerror in {3, 15, 21, 53}:
+        reason = "Ścieżka nie istnieje lub dysk jest niedostępny"
+    elif winerror == 206 or getattr(error, "errno", None) == 36:
+        reason = "Ścieżka przekracza limit obsługiwany przez system Windows"
+    elif isinstance(error, NotADirectoryError):
+        reason = "Wskazana ścieżka nie jest folderem"
+    else:
+        reason = "Nie można odczytać wskazanej lokalizacji"
+    return f"{reason}: {path}"
+
+
+def _observe_session_import(bundle: MobileReportBundle, item: MobileSessionImportItem) -> None:
+    """Retain declared facts even when subsequent qualification fails."""
+    raw, session = bundle.report.raw, bundle.collection_session
+    experiment = _optional_dict(raw.get("experiment"))
+    recorded = _optional_dict(experiment.get("session"))
+    collection = _optional_dict(raw.get("research_collection"))
+    sources = [session, experiment, recorded, collection, bundle.manifest, raw, bundle.report_payload]
+    def values(key):
+        return tuple(dict.fromkeys((str(s[key]) if key in {"series_id", "scenario_id"} else str(s[key]).strip())
+                                   for s in sources if s.get(key) not in (None, "")))
+    item.observations = {k: values(k) for k in ("series_id", "scenario_id", "variant", "replicate_index", "completion_reason", "state")}
+    series, scenario = item.observations["series_id"], item.observations["scenario_id"]
+    if len(series) <= 1 and len(scenario) <= 1:
+        item.group = (series[0] if series else "", scenario[0] if scenario else "")
+    item.observations["session_id"] = tuple(dict.fromkeys(str(v).strip() for v in (
+        session.get("session_id"), recorded.get("id"), recorded.get("session_id"),
+        raw.get("session_id"), experiment.get("session_id"), collection.get("session_id"),
+        bundle.manifest.get("session_id")) if v not in (None, "")))
+    item.session_id = item.observations["session_id"][0] if item.observations["session_id"] else ""
+    blocks = []
+    for source in sources:
+        blocks.extend(str(source[k]).removeprefix("BLOK_") for k in ("block", "block_id") if source.get(k))
+        blocks.extend(re.findall(r"\bBLOK_([A-D])\b", str(source.get("notes") or "")))
+    item.observations["block"] = tuple(dict.fromkeys(blocks))
+    configs = [session.get("execution"), raw.get("research_execution_config"),
+               experiment.get("effective_execution_config"), collection.get("execution")]
+    item.observations["roi_budget_policy"] = tuple(dict.fromkeys(
+        str(s[k]) for s in [*sources, *configs] if isinstance(s, dict)
+        for k in ("roi_budget_policy", "effective_roi_budget_policy") if s.get(k)))
+    v, r, b = (item.observations[k] for k in ("variant", "replicate_index", "block"))
+    if len(v) == len(r) == len(b) == 1 and r[0] in {"1", "2", "3"}:
+        candidate = (v[0], f"r{int(r[0]):02d}", b[0])
+        if candidate in F5A_IMPORT_COMBINATIONS:
+            item.combination = candidate
+    item.roles_incomplete = any(s.get("mt_detection_roles_complete") is False for s in sources)
+    for role in bundle.scene_evidence.get("roles", ()):
+        if role.get("postprocess_status") == "NOT_REACHED":
+            reason = role.get("cancel_reason") or role.get("processing_error") or role.get("execution_error") or "brak zapisanej przyczyny"
+            item.mt_interruptions[reason] = item.mt_interruptions.get(reason, 0) + 1
+
+
+def _session_import_metadata(bundle: MobileReportBundle, item: MobileSessionImportItem, *, f5a: bool) -> tuple[str, tuple | None, dict]:
+    """Inspect the native reader's validated objects; never infer from a path."""
+    session, manifest, raw = bundle.collection_session, bundle.manifest, bundle.report_payload
+    if not bundle.validation.ok:
+        raise ValueError("; ".join(bundle.validation.errors))
+    if session.get("schema") != "alpr.mobile_research_session.v1" or not session.get("session_id"):
+        raise ValueError("Brak poprawnego session.json lub session_id.")
+    hashes = manifest.get("entry_sha256") or manifest.get("sha256") or {}
+    if not isinstance(hashes, dict) or any(not re.fullmatch(r"[a-fA-F0-9]{64}", str(hashes.get(n, "")))
+                                           for n in ("session.json", "report.json")):
+        raise ValueError("Manifest musi zawierać SHA-256 session.json i report.json.")
+    item.archive_ok = True
+    if item.group is None:
+        raise _SessionImportIssue("Sprzeczne deklaracje serii lub scenariusza w archiwum.",
+                                  status="IDENTITY_CONFLICT", codes=("EXPERIMENT_IDENTITY_CONFLICT",))
+    experiment = _optional_dict(raw.get("experiment"))
+    recorded = _optional_dict(experiment.get("session"))
+    collection = _optional_dict(raw.get("research_collection"))
+    sid = str(session["session_id"]).strip()
+    if not sid or any(str(v).strip() != sid for v in (
+        raw.get("session_id"), experiment.get("session_id"), recorded.get("id"),
+        recorded.get("session_id"), collection.get("session_id"), manifest.get("session_id")
+    ) if v is not None):
+        raise _SessionImportIssue("Niezgodny identyfikator sesji w metadanych archiwum.", status="IDENTITY_CONFLICT", codes=("SESSION_ID_CONFLICT",))
+    if bundle.experiment_session.get("experiment_session_id") != sid:
+        raise _SessionImportIssue("Identyfikator sesji raportu nie odpowiada session.json.", status="IDENTITY_CONFLICT", codes=("SESSION_ID_CONFLICT",))
+    if manifest.get("report_id") and manifest["report_id"] != raw.get("report_id"):
+        raise _SessionImportIssue("Niezgodny report_id w manifeście i report.json.", status="IDENTITY_CONFLICT", codes=("REPORT_ID_CONFLICT",))
+    sources = [session, experiment, recorded, collection, manifest, raw]
+    roles = {name: value["mt_detection_roles_complete"] for name, value in
+             (("session.json", session), ("manifest.json", manifest), ("research_collection", collection))
+             if "mt_detection_roles_complete" in value}
+    combination = None
+    if f5a:
+        # All repeated declarations must agree. Runtime variant_id (fp32 etc.)
+        # is deliberately not an alias for the experimental ROI variant.
+        def agreed(key):
+            values = {str(s[key]).strip() for s in sources if key in s and s[key] is not None}
+            if len(values) != 1 or not next(iter(values), ""):
+                raise _SessionImportIssue(f"Brak lub konflikt pola {key} w metadanych.", codes=(key.upper() + "_CONFLICT",))
+            return values.pop()
+        series, scenario = agreed("series_id"), agreed("scenario_id")
+        if series != F5A_IMPORT_SERIES or scenario != F5A_IMPORT_SCENARIO:
+            raise _SessionImportIssue(f"Sesja należy do innej serii lub scenariusza: {series} / {scenario}.", status="FOREIGN", codes=("PROFILE_SCOPE_MISMATCH",))
+        from .mobile_experiment_identity import from_bundle
+        identity = from_bundle(bundle)
+        if identity.get("status") != "VERIFIED" or identity.get("is_pilot"):
+            codes = identity.get("issues", [])
+            if "VARIANT_POLICY_CONFLICT" in codes:
+                captions = {"r0_full_frame": "R0 — pełna klatka", "full_frame": "R0 — pełna klatka",
+                            "r1_one_roi": "R1 — maksymalnie 1 ROI", "r2_two_roi": "R2 — maksymalnie 2 ROI"}
+                expected = {"R0": "r0_full_frame", "R1": "r1_one_roi", "R2": "r2_two_roi"}.get(identity.get("variant"), "")
+                policy = identity.get("roi_budget_policy") or item.observed("roi_budget_policy")
+                raise _SessionImportIssue("Niezgodna strategia ROI", codes=codes, details=(
+                    f"Wariant zapisany: {item.observed('variant')}",
+                    f"Strategia wykonania: {captions.get(policy, policy)} ({policy})",
+                    f"Oczekiwano: {captions.get(expected, 'brak jednoznacznego wariantu')} ({expected})",
+                    "Archiwum pozostaje integralne, ale nie jest poprawnym pomiarem zaplanowanego wariantu."))
+            raise _SessionImportIssue("Nie można potwierdzić konfiguracji wymaganej przez profil F5A.", codes=codes,
+                                      details=(f"Zapisana strategia ROI: {item.observed('roi_budget_policy')}",))
+        variant, repeat = agreed("variant"), agreed("replicate_index")
+        blocks = set()
+        for source in sources:
+            for key in ("block", "block_id"):
+                if source.get(key):
+                    blocks.add(str(source[key]).removeprefix("BLOK_"))
+            blocks.update(re.findall(r"\bBLOK_([A-D])\b", str(source.get("notes") or "")))
+        if len(blocks) != 1:
+            raise _SessionImportIssue("Brak jednoznacznego bloku A–D w metadanych (np. notatka BLOK_A).", codes=("BLOCK_UNPROVEN",))
+        if repeat not in {"1", "2", "3"}:
+            raise _SessionImportIssue("Powtórzenie poza zakresem r01–r03.", codes=("REPEAT_OUT_OF_RANGE",))
+        combination = (variant, f"r{int(repeat):02d}", blocks.pop())
+        if combination not in F5A_IMPORT_COMBINATIONS:
+            raise _SessionImportIssue("Wariant lub blok poza zakresem F5A.", codes=("COMBINATION_OUT_OF_RANGE",))
+        item.profile_ok = True
+    return sid, combination, roles
+
+
+def _stored_session_id(report: MobileBenchmarkReport) -> str:
+    return str(_nested_value(report.raw, "desktop_ingest.session_id", "research_collection.session_id",
+                             "experiment.session.id", "experiment.session_id", "session_id") or "")
+
+
+def validate_known_mobile_experiment(bundle: MobileReportBundle) -> None:
+    """File import cannot bypass the protocol of an exactly identified F5A source."""
+    item = MobileSessionImportItem(Path(bundle.path))
+    _observe_session_import(bundle, item)
+    if item.is_f5a:
+        _session_import_metadata(bundle, item, f5a=True)
+    elif item.group is None:
+        raise _SessionImportIssue("Sprzeczne deklaracje serii lub scenariusza w archiwum.",
+                                  status="IDENTITY_CONFLICT", codes=("EXPERIMENT_IDENTITY_CONFLICT",))
+
+
+def _classify_session_import(plan: MobileSessionImportPlan, existing_reports) -> None:
+    """Fail closed on ambiguous session bytes or multiple sessions in one slot."""
+    valid = [i for i in plan.items if i.status in {"NEW", "EXISTING", "DUPLICATE"}]
+    for attribute in ("session_id", "combination"):
+        groups = {}
+        for item in valid:
+            key = getattr(item, attribute)
+            if key:
+                groups.setdefault(key, []).append(item)
+        for group in groups.values():
+            if len({i.sha256 for i in group}) > 1:
+                for item in group:
+                    item.status, item.reason = "IDENTITY_CONFLICT", "Różne archiwa deklarują tę samą sesję lub kombinację. Wymaga wyjaśnienia."
+                    item.codes = (attribute.upper() + "_CONFLICT",)
+    existing_hashes = {r.source_archive_sha256 for r in existing_reports if r.source_archive_sha256}
+    existing_ids, existing_combinations = {}, {}
+    for report in existing_reports:
+        if _stored_session_id(report):
+            existing_ids.setdefault(_stored_session_id(report), set()).add(report.source_archive_sha256)
+        ingest = _optional_dict(report.raw.get("desktop_ingest"))
+        if (ingest.get("series_id") == F5A_IMPORT_SERIES
+                and ingest.get("scenario_id") == F5A_IMPORT_SCENARIO
+                and isinstance(ingest.get("f5a_combination"), list)):
+            key = tuple(ingest["f5a_combination"])
+            existing_combinations.setdefault(key, set()).add(report.source_archive_sha256)
+    seen = set()
+    for item in valid:
+        if item.status == "IDENTITY_CONFLICT":
+            continue
+        if item.session_id in existing_ids and existing_ids[item.session_id] != {item.sha256}:
+            item.status, item.reason = "IDENTITY_CONFLICT", "Magazyn zawiera ten session_id z innym lub nieznanym SHA-256."
+            item.codes = ("STORED_SESSION_CONFLICT",)
+        elif item.combination in existing_combinations and existing_combinations[item.combination] != {item.sha256}:
+            item.status, item.reason = "IDENTITY_CONFLICT", "Magazyn zawiera inną sesję dla tej kombinacji F5A."
+            item.codes = ("STORED_COMBINATION_CONFLICT",)
+        elif item.sha256 in seen:
+            item.status, item.reason = "DUPLICATE", "Identyczne archiwum występuje wcześniej w tym folderze."
+        else:
+            item.status = "EXISTING" if item.sha256 in existing_hashes else "NEW"
+            seen.add(item.sha256)
+    for item in valid:
+        if item.status == "IDENTITY_CONFLICT":
+            logger.warning("Import sesji %s: %s", item.path, item.reason)
+
+
+def plan_mobile_session_import(root: Path, existing_reports=(), *, f5a: bool | None = None,
+                               progress: Callable | None = None, cancelled: Callable | None = None,
+                               prepare_report: Callable | None = None) -> MobileSessionImportPlan:
+    """Read-only preflight. The legacy f5a argument cannot override source identity."""
+    try:
+        root = Path(root).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(str(root))
+        with os.scandir(root):
+            pass
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValueError(mobile_import_path_error(exc, root)) from exc
+    plan = MobileSessionImportPlan(root)
+    paths = []
+    for directory, dirs, files in os.walk(root, onerror=lambda e: plan.scan_errors.append(
+            mobile_import_path_error(e, e.filename or root) + f"\nSzczegóły: {e}"), followlinks=False):
+        if cancelled and cancelled():
+            plan.cancelled = True
+            return plan
+        # Avoid cycles and escaping through Windows junctions as well as symlinks.
+        dirs[:] = sorted(d for d in dirs if not Path(directory, d).is_symlink()
+                         and not getattr(os.path, "isjunction", lambda p: False)(Path(directory, d)))
+        paths.extend(Path(directory, name) for name in files if Path(name).suffix.lower() == ".alprsession")
+        plan.found_count = len(paths)
+        if progress:
+            progress(0, 0, Path(directory))
+    plan.found_count = len(paths)
+    for index, path in enumerate(sorted(paths, key=lambda p: (str(p).casefold(), str(p))), 1):
+        if cancelled and cancelled():
+            plan.cancelled = True
+            break
+        if progress:
+            progress(index - 1, len(paths), path)
+        item = MobileSessionImportItem(path)
+        plan.items.append(item)
+        try:
+            if path.is_symlink():
+                raise ValueError("Dowiązanie do pliku nie jest archiwum źródłowym.")
+            bundles = read_mobile_report_bundles(path)
+            if len(bundles) != 1:
+                raise ValueError("Archiwum musi zawierać jedną sesję.")
+            bundle = bundles[0]
+            item.sha256 = bundle.source_archive_sha256
+            _observe_session_import(bundle, item)
+            if _file_sha256(path) != item.sha256:
+                raise _SessionImportIssue("SHA-256 źródła zmieniło się podczas odczytu.", status="ERROR", codes=("SOURCE_CHANGED",))
+            item.session_id, item.combination, roles = _session_import_metadata(bundle, item, f5a=item.is_f5a)
+            raw = dict(bundle.report.raw)
+            raw["desktop_ingest"] = dict(raw.get("desktop_ingest") or {}, session_id=item.session_id,
+                                          mt_detection_roles_complete_sources=roles)
+            if item.is_f5a:
+                raw["desktop_ingest"].update(series_id=F5A_IMPORT_SERIES,
+                                             scenario_id=F5A_IMPORT_SCENARIO,
+                                             f5a_combination=list(item.combination))
+            report = replace(bundle.report, raw=raw)
+            item.report = prepare_report(report, bundle=bundle) if prepare_report else report
+        except _SessionImportIssue as exc:
+            item.status, item.reason, item.codes, item.details = exc.status, str(exc), exc.codes, exc.details
+            if item.is_f5a:
+                item.profile_ok = False
+        except Exception as exc:
+            item.status, item.archive_ok = "INVALID", False
+            item.reason = mobile_import_path_error(exc, path) if isinstance(exc, OSError) else "Archiwum nie przeszło kontroli formatu lub integralności."
+            item.codes, item.details = ("ARCHIVE_INVALID",), (str(exc),)
+        if item.status not in {"NEW", "EXISTING", "DUPLICATE"}:
+            logger.warning("Import sesji %s: %s", path, item.reason)
+        if progress:
+            progress(index, len(paths), path)
+    plan.items.sort(key=lambda i: (i.combination or ("~", "~", "~"), str(i.path).casefold(), str(i.path)))
+    _classify_session_import(plan, existing_reports)
+    plan.f5a = F5A_IMPORT_GROUP in plan.groups
+    plan.selected_group = F5A_IMPORT_GROUP if plan.f5a else next(iter(plan.groups)) if len(plan.groups) == 1 else None
+    if cancelled and cancelled():
+        plan.cancelled = True
+    return plan
+
+
 class MobilePackageExperimentStore:
     """Persistent storage for package candidates and Android reports."""
 
@@ -2371,14 +3104,56 @@ class MobilePackageExperimentStore:
 
     def import_mobile_report_file(self, report_path: Path, *, save: bool = True) -> list[MobileBenchmarkReport]:
         safe_path = Path(report_path)
-        imported = [
-            self.add_report(bundle.report, save=False)
-            for bundle in read_mobile_report_bundles(safe_path)
-            if bundle.validation.ok
-        ]
-        if save:
+        imported, changed = [], False
+        for bundle in read_mobile_report_bundles(safe_path):
+            if not bundle.validation.ok:
+                continue
+            validate_known_mobile_experiment(bundle)
+            existing = self.existing_import(bundle.report)
+            imported.append(existing or self.add_report(bundle.report, save=False))
+            changed |= existing is None
+        if save and changed:
             self.save()
         return imported
+
+    def existing_import(self, report: MobileBenchmarkReport) -> MobileBenchmarkReport | None:
+        """Do not replace operator reviews or locators when importing the same bytes."""
+        return next((r for r in self.reports if report.source_archive_sha256
+                     and r.source_archive_sha256 == report.source_archive_sha256
+                     and r.identity == report.identity), None)
+
+    def import_mobile_session_plan(self, plan: MobileSessionImportPlan, *,
+                                   progress: Callable | None = None,
+                                   cancelled: Callable | None = None) -> MobileSessionImportPlan:
+        """Commit a reviewed plan through add_report/save; retain existing reviews."""
+        if plan.cancelled:
+            return plan
+        if plan.selected_group is None and plan.groups:
+            raise ValueError("Wybierz jawnie grupę sesji przed importem.")
+        _classify_session_import(plan, self.reports)
+        pending = list(plan.eligible_items)
+        for index, item in enumerate(pending, 1):
+            if cancelled and cancelled():
+                plan.cancelled = True
+                break
+            previous = list(self.reports)
+            try:
+                if _file_sha256(item.path) != item.sha256:
+                    raise ValueError("SHA-256 źródła zmieniło się od podsumowania. Wykonaj ponowny skan.")
+                if cancelled and cancelled():
+                    plan.cancelled = True
+                    break
+                self.add_report(item.report, save=True)
+                item.status = "IMPORTED"
+            except Exception as exc:
+                self.reports = previous
+                item.status, item.reason = "ERROR", "Nie udało się zapisać sesji lub jej źródło uległo zmianie."
+                item.codes, item.details = ("IMPORT_WRITE_OR_SOURCE_ERROR",), (str(exc),)
+                logger.exception("Nie udało się zaimportować sesji: %s", item.path)
+            if progress:
+                progress(index, len(pending), item.path)
+        plan.finished = True
+        return plan
 
     def score_reports(
         self,

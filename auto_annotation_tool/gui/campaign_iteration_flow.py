@@ -564,6 +564,7 @@ def _set_iteration_advance_busy(self, busy: bool) -> None:
 
 def _run_iteration_advance_worker(self, mode: str) -> None:
     started = perf_counter()
+    CAMPAIGN._ingest_identity_progress = None
     try:
         result = CAMPAIGN.advance_to_next_iteration(start_mode=mode)
     except Exception as exc:
@@ -591,6 +592,14 @@ def _poll_iteration_advance_worker(self) -> None:
     self._iteration_advance_poll_after_id = None
     worker = getattr(self, "_iteration_advance_thread", None)
     if worker is not None and worker.is_alive():
+        progress = getattr(CAMPAIGN, "_ingest_identity_progress", None)
+        if isinstance(progress, dict) and progress != getattr(self, "_last_identity_progress", None):
+            self._last_identity_progress = dict(progress)
+            self._show_project_loading_overlay(
+                title="Przygotowuję obrazy kolejnej iteracji",
+                body=str(progress.get("message", "")) + " " + str(progress.get("detail", "")),
+                progress=progress.get("value"),
+            )
         self._schedule_iteration_advance_poll()
         return
 

@@ -1,3 +1,4 @@
+# Z4MOBREV001_SIMPLE_REVIEW_20261016
 import copy
 import json
 
@@ -7,6 +8,9 @@ from test_mobile_human_review import make_bundle, attempt, load
 from auto_annotation_tool.ranking.mobile_human_review import MobileReviewSession
 from auto_annotation_tool.ranking.mobile_package_experiments import MobilePackageExperimentStore, _file_sha256
 from auto_annotation_tool.ranking.mobile_mt_invocations import group_mt_invocations
+
+
+from auto_annotation_tool.ranking.mobile_verification_policy import visual_decision
 
 
 def children(count=1, *, invocation="mt-x", statuses=None):
@@ -195,7 +199,7 @@ def test_b5_b7_export_quality_mode_and_immutable_source(tmp_path):
         session.set_subject(key, ground_truth="WI1234A")
     session.annotate_invocation("mt-x", visible_plate_count="one")
     for row in rows:
-        session.annotate("attempt", row["attempt_id"], is_plate=True)
+        session.annotate("attempt", row["attempt_id"], **visual_decision("accurate"))
     session.complete()
     store = MobilePackageExperimentStore(tmp_path / "ranking")
     store.add_report(session.bundle.report)
@@ -212,7 +216,9 @@ def test_b5_b7_export_quality_mode_and_immutable_source(tmp_path):
     assert _file_sha256(session.path) == source_hash
 
 
-def test_invocation_decisions_do_not_change_mz_or_alpr_metrics(tmp_path):
+def test_single_plate_invocation_decisions_do_not_change_mz_or_alpr_metrics(tmp_path):
+    # "multiple" intentionally activates the per-plate GT scientific guard.
+    # That case (including return to "one") has its own regression test.
     rows = children(2)
     rows[0].update(prediction="", consensus_prediction="WI1234A", capture_source="auto_zoom", camera_zoom_ratio=2)
     rows[1]["prediction"] = "WI12B4A"
@@ -220,7 +226,7 @@ def test_invocation_decisions_do_not_change_mz_or_alpr_metrics(tmp_path):
     session = load(make_bundle(tmp_path / "source.alprsession", samples=samples, attempts=rows), tmp_path)
     session.set_subject(next(iter(session.subjects)), ground_truth="WI1234A")
     before = session.statistics()
-    for visible in ("one", "none", "multiple", "uncertain"):
+    for visible in ("one", "none", "uncertain"):
         session.annotate_invocation("mt-x", visible_plate_count=visible)
         after = session.statistics()
         for key in ("exact_reads", "incorrect_reads", "no_reads", "cer", "gt_characters", "correct_characters",
@@ -231,3 +237,23 @@ def test_invocation_decisions_do_not_change_mz_or_alpr_metrics(tmp_path):
                     "first_exact_camera_zoom_ratio", "baseline_exact_before_az", "exact_only_after_az", "consensus_repaired_result"):
             assert after["subjects"][0][key] == before["subjects"][0][key]
         assert after["reads"] == before["reads"] and after["character_confusion"] == before["character_confusion"]
+
+
+def test_explicit_one_way_assisted_reveal_preserves_decisions_and_archive(tmp_path):
+    path = make_bundle(tmp_path / "source.alprsession")
+    session = load(path, tmp_path)
+    key = next(iter(session.subjects))
+    original_archive = path.read_bytes()
+    session.set_subject(key, ground_truth="WI1234A")
+    previous = session.review.subjects[key].copy()
+    assert session.review.review_mode == "blinded_gt_v1" and session.review.review_mode_locked
+    session.reveal_predictions_for_review()
+    assert session.review.review_mode == "assisted"
+    assert session.review.review_mode_origin == "blinded_gt_v1"
+    assert session.review.subjects[key] == previous
+    assert session.predictions_visible(key)
+    assert path.read_bytes() == original_archive
+    reopened = load(path, tmp_path)
+    assert reopened.review.review_mode == "assisted"
+    with pytest.raises(ValueError, match="stały"):
+        reopened.set_review_mode("blinded_gt_v1")

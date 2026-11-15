@@ -13,6 +13,7 @@ import tkinter.font as tkfont
 import xml.etree.ElementTree as ET
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
+from .z2_gt_readiness import annotation_gt_readiness, gt_required_for_current_route, missing_required_gt
 import datetime
 import threading
 import logging
@@ -117,6 +118,7 @@ from ..annotators.runtime_factory import validate_pt_model_path_for_runtime
 from ..icons import IconManager
 from ..exporters import CVATExporter, ReportGenerator
 from ..quality_metrics import compute_plate_polygon_fit_metrics
+from ..pose_geometry import geometry_display_polygon, finalize_manual_geometry
 from ..project_cache import PROJECT_CACHE
 from ..training import DatasetCreator
 from ..utils import cleanup_gpu_memory, count_images_in_directory, format_duration, get_image_files, get_image_size
@@ -129,6 +131,8 @@ from .canvas_progress_overlay import CanvasProgressOverlay
 NAV_BUTTON_WIDTH = 18
 
 def _arm_preview_super_perf_probe(self, reason: str, *, step: int | None = None) -> str:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return ""
     trace_id = int(getattr(self, "_preview_super_perf_trace_id", 0) or 0) + 1
     now = time.perf_counter()
     label = f"super-qe-{trace_id}"
@@ -164,7 +168,7 @@ def _preview_super_perf_active(self) -> bool:
 
 
 def _log_preview_super_perf(self, operation: str, elapsed_ms: float, *, threshold_ms: float = 80.0, **details) -> None:
-    if not _preview_super_perf_active(self) and float(elapsed_ms) < float(threshold_ms):
+    if not _preview_super_perf_active(self) and float(elapsed_ms) < max(80.0, float(threshold_ms)):
         return
     try:
         suffix = " ".join(f"{key}={value}" for key, value in details.items())
@@ -186,7 +190,7 @@ def _resolve_preview_image_path(self, ann) -> Path | None:
     if not filename:
         return None
 
-    image_map = dict(getattr(self, "_preview_image_path_map", {}) or {})
+    image_map = getattr(self, "_preview_image_path_map", {}) or {}
     mapped_path = image_map.get(filename)
     if mapped_path is not None:
         try:
@@ -328,6 +332,7 @@ def _build_preview_list_render_state_cache(
     except Exception:
         reused_names = set()
 
+    gt_required = gt_required_for_current_route(self)
     cache: dict[int, dict] = {}
     for _actual_idx, ann in source_entries:
         filename = str(getattr(ann, "filename", "") or "").strip()
@@ -366,8 +371,11 @@ def _build_preview_list_render_state_cache(
 
         if filename_key and filename_key in manual_touched_names:
             manual = True
+        gt_state = annotation_gt_readiness(ann) if gt_required else {}
+        gt_missing = int(gt_state.get("missing", 0))
         approved = bool(
             has_plate
+            and not gt_missing
             and filename_key not in hidden_project_approved
             and (
                 bool(getattr(ann, "_approved_for_training", False))
@@ -375,7 +383,10 @@ def _build_preview_list_render_state_cache(
             )
         )
         origin_tag = "M" if manual else "A" if auto else "--"
-        if approved:
+        if gt_missing:
+            status_text = f"{origin_tag}|BRAK GT: {gt_missing}"
+            bucket = "problem"
+        elif approved:
             status_text = f"{origin_tag}|OK" if origin_tag in {"M", "A"} else "OK"
             bucket = "approved"
         elif manual:
@@ -396,6 +407,7 @@ def _build_preview_list_render_state_cache(
             "origin_tag": origin_tag,
             "reused": filename in reused_names,
             "status_text": status_text,
+            "gt_missing": gt_missing,
         }
 
     self._preview_list_render_state_cache = cache
@@ -484,6 +496,9 @@ def _preview_annotation_status_tag(self, ann) -> str:
         return str(cached_state.get("status_text", "") or "--")
 
     origin_tag = self._preview_annotation_origin_tag(ann)
+    gt_missing = missing_required_gt(self, ann)
+    if gt_missing:
+        return f"{origin_tag}|BRAK GT: {gt_missing}"
     if self._preview_annotation_is_explicitly_approved(ann):
         if origin_tag in {"M", "A"}:
             return f"{origin_tag}|OK"
@@ -622,7 +637,7 @@ def _build_manual_override_annotation(self, ann):
         attributes = dict(getattr(det, "attributes", {}) or {})
         manually_edited = str(attributes.get("manually_edited", "") or "").strip().lower() == "true"
         manual_source = str(attributes.get("manual_source", "") or "").strip().lower()
-        if manually_edited or manual_source:
+        if manually_edited or manual_source or str(attributes.get("ground_truth_text", "") or "").strip():
             kept_detections.append(det)
             continue
         fallback_plate_detections.append(copy.deepcopy(det))
@@ -1311,11 +1326,15 @@ def _preview_list_color_for_bucket(self, bucket: str) -> str:
 def _preview_list_effective_color_bucket(self, ann) -> str:
     cached_state = self._get_preview_list_render_state(ann)
     if isinstance(cached_state, dict):
+        if cached_state.get("gt_missing"):
+            return "problem"
         if bool(cached_state.get("reused")):
             return "reused"
         bucket = str(cached_state.get("bucket", "") or "").strip().lower()
         return bucket if bucket in {"approved", "manual", "auto", "problem"} else "problem"
 
+    if missing_required_gt(self, ann):
+        return "problem"
     if self._preview_annotation_is_reused_from_previous_manual(ann):
         return "reused"
     bucket = self._preview_annotation_sort_bucket(ann)
@@ -1339,6 +1358,8 @@ def _preview_annotation_sort_bucket(self, ann) -> str:
     if cached_state is not None:
         return str(cached_state.get("bucket", "") or "problem")
 
+    if missing_required_gt(self, ann):
+        return "problem"
     if self._preview_annotation_is_explicitly_approved(ann):
         return "approved"
     if self._preview_annotation_is_manually_corrected(ann):
@@ -1764,6 +1785,8 @@ def _get_plate_detections(self, ann) -> list[Detection]:
 
 
 def _detection_polygon(det: Detection) -> list[tuple[float, float]]:
+    if isinstance(getattr(det, "geometry", None), dict):
+        return geometry_display_polygon(det)
     if det.polygon and len(det.polygon) >= 4:
         return [(float(x), float(y)) for x, y in det.polygon[:4]]
 
@@ -1889,6 +1912,11 @@ def _mark_preview_image_dirty(
         return
     if invalidate_runtime:
         self._invalidate_preview_runtime_caches()
+    versions = getattr(self, "_preview_image_edit_versions", None)
+    if not isinstance(versions, dict):
+        versions = {}
+        self._preview_image_edit_versions = versions
+    versions[ann.filename] = int(versions.get(ann.filename, 0)) + 1
     was_dirty = ann.filename in self._preview_dirty_images
     self._preview_dirty_images.add(ann.filename)
     if refresh_list and not was_dirty:
@@ -1937,6 +1965,7 @@ def _clone_preview_history_detection(det: Detection) -> Detection:
         text=getattr(det, "text", None),
         text_confidence=float(getattr(det, "text_confidence", 0.0) or 0.0),
         attributes=dict(getattr(det, "attributes", {}) or {}),
+        geometry=copy.deepcopy(getattr(det, "geometry", None)),
     )
 
 
@@ -2042,6 +2071,21 @@ def _restore_preview_annotation_history_snapshot(self, snapshot, *, action_label
             return False
 
         self.current_annotations[safe_index] = restored_ann
+        # Undo/Redo clones detections, so object IDs from a held-W sequence
+        # must be rebound to the restored objects, never to unrelated plates.
+        touched = getattr(self, "_preview_geometry_touched", None)
+        if not isinstance(touched, dict):
+            touched = {}
+            self._preview_geometry_touched = touched
+        pending = [det for det in restored_ann.detections
+                   if (getattr(det, "geometry", None) or {}).get("manual_pending")
+                   and (getattr(det, "geometry", None) or {}).get("manual_edit")]
+        if pending and bool(getattr(self, "_preview_corner_drag_modifier_down", False)):
+            touched[restored_ann.filename] = {id(det) for det in pending}
+        else:
+            touched.pop(restored_ann.filename, None)
+            for det in pending:
+                finalize_manual_geometry(det, image_size=(restored_ann.width, restored_ann.height))
         selected_plate_idx = snapshot.get("selected_plate_idx") if isinstance(snapshot, dict) else None
         selected_vehicle_idx = snapshot.get("selected_vehicle_idx") if isinstance(snapshot, dict) else None
         self._set_selected_plate_index_for_ann(restored_ann, selected_plate_idx)
@@ -2859,11 +2903,15 @@ def _populate_preview_list(self, *, on_complete=None, on_progress=None, batch_si
 
 
 def _clear_preview_metric_filters_for_new_run(self) -> bool:
+    from .z2_gt_review import missing_gt_filter_active
+    had_gt_filter = missing_gt_filter_active(self)
+    if had_gt_filter:
+        self.preview_missing_gt_only_var.set(False)
     try:
         conf_threshold, fit_threshold = self._get_preview_metric_filter_thresholds()
     except Exception:
         conf_threshold, fit_threshold = 0.0, 0.0
-    if conf_threshold <= 0.0 and fit_threshold <= 0.0:
+    if conf_threshold <= 0.0 and fit_threshold <= 0.0 and not had_gt_filter:
         return False
 
     try:
@@ -3003,9 +3051,12 @@ def _select_preview_index(self, idx: int, *, reset_view: bool = True):
     self._defer_preview_autosave_for_navigation(delay_ms=4500)
     safe_idx = max(0, min(int(idx), len(self.current_annotations) - 1))
     previous_idx = self.current_preview_index
-    if bool(getattr(self, "_preview_fullscreen_active", False)):
+    drawers = getattr(self, "_preview_workspace_drawers", None)
+    list_drawer_open = drawers is not None and drawers.visible.get("left", 0) > 0
+    if bool(getattr(self, "_preview_fullscreen_active", False)) and not list_drawer_open:
         self._preview_list_selection_sync_pending = True
     else:
+        self._preview_list_selection_sync_pending = False
         display_idx = self._get_preview_display_index(safe_idx)
         if display_idx is None:
             display_idx = max(0, min(safe_idx, max(0, self.preview_listbox.size() - 1)))
@@ -3063,40 +3114,8 @@ def _get_preview_image_cache_key(img_path: Path):
 
 
 def _load_preview_image_cached(self, img_path: Path, ann=None, *, update_annotation: bool = True):
-    cache_key = _get_preview_image_cache_key(img_path)
-    image_cache = getattr(self, "_preview_render_image_cache", None)
-    if not isinstance(image_cache, dict):
-        image_cache = {}
-        self._preview_render_image_cache = image_cache
-
-    lock = _get_preview_image_cache_lock(self)
-    with lock:
-        preview_image = image_cache.get(cache_key)
-    if preview_image is None:
-        load_started_at = time.perf_counter()
-        img = cv2.imread(str(img_path))
-        if img is None:
-            raise ValueError("Nie można załadować obrazu do podglądu.")
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        preview_image = Image.fromarray(img_rgb)
-        with lock:
-            image_cache[cache_key] = preview_image
-            load_elapsed_ms = max(0.0, (time.perf_counter() - load_started_at) * 1000.0)
-            if load_elapsed_ms >= 120.0:
-                try:
-                    logger.info(
-                        "[Z2 PERF] preview_image_load_cached total=%.0fms cache=%s file=%s",
-                        load_elapsed_ms,
-                        len(image_cache),
-                        Path(img_path).name,
-                    )
-                except Exception:
-                    pass
-            while len(image_cache) > z2_preview_editor.PREVIEW_IMAGE_CACHE_LIMIT:
-                try:
-                    image_cache.pop(next(iter(image_cache)))
-                except Exception:
-                    break
+    from .z2_preview_images import preview_images
+    preview_image = preview_images(self).load(img_path)
     if update_annotation and ann is not None:
         try:
             image_width = max(1, int(getattr(preview_image, "width", 1) or 1))
@@ -3129,10 +3148,10 @@ def _schedule_preview_neighbor_prefetch(
 
     candidates = []
     step = -1 if int(direction) < 0 else 1
-    for offset in range(1, 4):
-        pos = current_pos + (step * offset)
+    for offset in (step, step * 2, step * 3, -step):
+        pos = current_pos + offset
         if pos < 0 or pos >= len(nav_indices):
-            break
+            continue
         actual_idx = int(nav_indices[pos])
         if actual_idx < 0 or actual_idx >= len(self.current_annotations):
             continue
@@ -3142,27 +3161,10 @@ def _schedule_preview_neighbor_prefetch(
         img_path = self._resolve_preview_image_path(ann)
         if img_path is not None and img_path.exists():
             candidates.append(Path(img_path))
-        if len(candidates) >= 2:
-            break
     if not candidates:
         return
-
-    token = int(getattr(self, "_preview_prefetch_token", 0) or 0) + 1
-    self._preview_prefetch_token = token
-
-    def worker(paths: list[Path], expected_token: int) -> None:
-        for path in paths:
-            if expected_token != int(getattr(self, "_preview_prefetch_token", 0) or 0):
-                return
-            try:
-                _load_preview_image_cached(self, path, update_annotation=False)
-            except Exception:
-                continue
-
-    try:
-        threading.Thread(target=worker, args=(candidates, token), daemon=True).start()
-    except Exception:
-        pass
+    from .z2_preview_images import preview_images
+    preview_images(self).prefetch(candidates)
 
 
 def _select_preview_index_for_super_correction(self, idx: int):
@@ -3237,10 +3239,10 @@ def _select_preview_index_for_super_correction(self, idx: int):
         self._clear_preview_legend_image_cache()
         self.preview_canvas.set_image_preserve_view(preview_image, redraw=False)
         mark_phase("set_image")
-        try:
-            self._update_preview_canvas_metrics_overlay(force_render=True)
-        except Exception:
-            pass
+        _schedule_preview_neighbor_prefetch(
+            self, safe_idx, int(getattr(self, "_preview_navigation_direction", 1)),
+            self._get_preview_navigation_actual_indices(),
+        )
     except Exception as e:
         logger.error(f"Błąd rysowania podglądu YOLO: {e}")
         self.preview_canvas.clear_image()
@@ -3274,6 +3276,7 @@ def _select_preview_index_for_super_correction(self, idx: int):
 def _select_preview_relative(self, step: int):
     if not self.current_annotations:
         return "break"
+    self._preview_navigation_direction = -1 if int(step) < 0 else 1
     display_indices = list(getattr(self, "_preview_list_display_indices", []) or [])
     if not display_indices:
         current = 0 if self.current_preview_index is None else int(self.current_preview_index)
@@ -3336,6 +3339,7 @@ def _get_preview_navigation_actual_indices(self) -> list[int]:
 def _select_preview_global_plate_relative(self, step: int):
     if not self.current_annotations:
         return "break"
+    self._mark_preview_user_interaction(quiet_ms=1400)
 
     switch_started = time.perf_counter()
     _arm_preview_super_perf_probe(self, "global_plate_relative", step=int(step))
@@ -3344,6 +3348,7 @@ def _select_preview_global_plate_relative(self, step: int):
     except Exception:
         pass
     direction = -1 if int(step) < 0 else 1
+    self._preview_navigation_direction = direction
     nav_indices = self._get_preview_navigation_actual_indices()
     if not nav_indices:
         self._update_preview_edit_status(

@@ -52,7 +52,7 @@ FREE_MODE_ASSISTANT_GLOSSARY: dict[str, str] = {
     "epoka": "jedno pełne przejście treningu po danych treningowych.",
     "eksport": "zapisanie gotowych danych do formatu używanego dalej, np. XML, YOLO albo zestawu CVAT.",
     "fit": "dopasowanie ramek do obrazu lub obszaru pracy, aby wynik był spójny z podglądem.",
-    "gold pack": "wybrany, zaufany zestaw przykładów, z którego buduje się lepszy dataset znaków.",
+    "zakres zatwierdzonych danych": "wybrane przykłady sprawdzone przez użytkownika, z których tworzony jest zbiór znaków.",
     "GPU": "karta graficzna używana do szybszej inferencji lub treningu modeli.",
     "inferencja": "uruchomienie gotowego modelu na danych, aby uzyskać predykcje, np. boxy albo odczyt znaków.",
     "INT8": "wariant kwantyzowany do 8-bitowych liczb całkowitych; może być mniejszy i szybszy na telefonie, ale wymaga kalibracji i kontroli jakości względem FP32.",
@@ -78,7 +78,7 @@ FREE_MODE_ASSISTANT_GLOSSARY: dict[str, str] = {
     "model mobilny": "jeden MP, MT albo MZ w formacie alpr.model.v1; pozwala podmienić jedną rolę na telefonie lub wykonać test izolowany.",
     "pakiet ALPR": "kompletny zestaw MT+MZ albo MP+MT+MZ w formacie alpr.package.v1, przeznaczony do pełnego rozpoznawania tablic.",
     "pakiet MT+MZ": "kompletny pakiet ALPR zawierający model tablic MT, model znaków MZ i opis pipeline; to właściwy kandydat do testu end-to-end na telefonie.",
-    "perfect": "status oznaczający, że przykład jest sprawdzony i nadaje się do datasetu.",
+    "sprawdzona tablica": "tablica, której ramki i znaki spełniają warunki techniczne; do zbioru trafia dopiero po zatwierdzeniu przez użytkownika.",
     "poligon": "wielopunktowy obrys obiektu; dokładniejszy niż zwykły prostokątny box.",
     "preview run": "roboczy zestaw podglądowy, zwykle używany do sprawdzenia cropów przed dalszym etapem.",
     "PT": "plik wag modelu PyTorch/YOLO, zwykle z rozszerzeniem .pt.",
@@ -256,7 +256,7 @@ FREE_MODE_ASSISTANT_GLOSSARY_ALIASES: dict[str, str] = {
     "runy": "run",
     "splity": "split",
     "splitu": "split",
-    "tablica perfect": "perfect",
+    "tablica gotowa": "sprawdzona tablica",
     "tablice": "tablica",
     "tablic": "tablica",
     "treningu": "trening",
@@ -381,20 +381,20 @@ def get_step3_free_mode_assistant_context(host) -> dict:
             "location": "[Z3] Autoanotacja znaków tablic / [PZ2] Wykrywanie znaków i analiza",
             "goal": (
                 "PZ2 jest pierwszym krokiem pracy T05: tutaj przygotowujesz anotacje znaków na wyodrębnionych tablicach. "
-                "Poprawiasz ramki, wpisujesz znaki i doprowadzasz tablice do statusu perfect. "
+                "Poprawiasz ramki, wpisujesz znaki i zatwierdzasz gotowe tablice. "
                 "Sam zbiór przygotowany w PZ2 nie otwiera jeszcze T05; po zbudowaniu sensownego materiału trzeba przejść do PZ3 i wyeksportować źródłowy dataset znaków."
             ),
             "current": (
                 "Pipeline PZ2 składa się z bloków YB, YS i OCR. Manualne ramki oraz ręcznie wpisane znaki mają pierwszeństwo przed wynikiem automatu."
             ),
             "workflow": (
-                "W PZ2 popraw ramki znaków i doprowadź możliwie dużo tablic do statusu perfect.",
+                "Popraw ramki znaków i zatwierdź możliwie dużo poprawnych tablic.",
                 "Szuflada PZ2 pokazuje lokalny stan pracy: ile jest tablic i znaków, poziom jakości zbioru oraz braki do kolejnego poziomu.",
                 "Gdy zbiór jest sensowny, użyj przycisku „Krok 2: dataset PZ3”.",
                 "W PZ3 utwórz źródłowy dataset znaków AZ. Dopiero ten eksport domyka warunek bramki T05.",
             ),
             "glossary": (
-                "perfect = tablica gotowa do datasetu",
+                "zatwierdzona tablica = próbka sprawdzona przez użytkownika i gotowa do użycia w zbiorze danych",
                 "YOLO znaków = boxy znaków",
                 "OCR = odczyt znaków z boxów",
                 "1R = tablica jednorzędowa",
@@ -414,14 +414,14 @@ def get_step3_free_mode_assistant_context(host) -> dict:
             "goal": "Ta podzakładka domyka pracę nad znakami: zbiera sprawdzone tablice perfect, opcjonalne poprawki CVAT i eksportuje źródłowy dataset znaków do dalszej pracy w Z4.",
             "current": "Eksport PZ3 tworzy artefakt AZ. Ten artefakt jest później wybierany w Z4/PZ1 jako źródło wariantu treningowego MZ.",
             "workflow": (
-                "Sprawdź, że pracujesz na perfectach z aktywnego runu PZ2.",
-                "Jeśli poprawki zewnętrzne nie są potrzebne, wybierz strategie i źródła gold packa.",
+                "Sprawdź, że pracujesz na właściwym zestawie tablic i że poprawne próbki są zatwierdzone.",
+                "Jeśli poprawki zewnętrzne nie są potrzebne, wybierz zakres danych, który ma trafić do zbioru.",
                 "Jeśli potrzebujesz CVAT, wyeksportuj review pack, popraw boxy znaków w CVAT i zaimportuj XML z powrotem do PZ3.",
                 "Wyeksportuj źródłowy dataset YOLO znaków i przeczytaj modal z wynikiem operacji.",
                 "Przejdź do Z4/PZ1, aby utworzyć wariant treningowy i split; trening uruchamiasz dopiero w Z4/PZ2.",
             ),
             "glossary": (
-                "gold pack = wybrane tablice perfect używane jako zaufane źródło datasetu znaków",
+                "zakres danych = wybrane, sprawdzone i zatwierdzone tablice używane do utworzenia zbioru znaków",
                 "review pack = zestaw cropów tablic wysyłany do ręcznego sprawdzenia w CVAT",
                 "Poprawki CVAT = ręczne korekty boxów znaków wracające z CVAT do PZ3 i włączane do datasetu",
             ),
@@ -435,7 +435,7 @@ def get_step3_free_mode_assistant_context(host) -> dict:
         "workflow": (
             "PZ1 wyodrębnia tablice z obrazów i XML z Z2.",
             "PZ2 rozpoznaje i poprawia znaki na cropach tablic.",
-            "PZ3 zbiera perfecty, opcjonalne poprawki CVAT i eksportuje źródłowy dataset znaków.",
+            "Po sprawdzeniu i zatwierdzeniu tablic możesz utworzyć źródłowy zbiór znaków; opcjonalne poprawki możesz wykonać w CVAT.",
             "Z4 przejmuje dopiero wariant treningowy, split i trening modelu.",
         ),
         "glossary": (

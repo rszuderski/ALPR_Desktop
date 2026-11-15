@@ -280,6 +280,8 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
         except Exception:
             pass
     dialog.configure(bg=panel_bg)
+    # The shared styler fixes dialog size; this metadata table needs resizing.
+    dialog.resizable(True, True)
 
     body_builder = getattr(host.app, "_build_themed_dialog_surface", None)
     if callable(body_builder):
@@ -287,17 +289,19 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
     else:
         body = tk.Frame(dialog, bg=panel_bg, padx=18, pady=16)
         body.pack(fill=tk.BOTH, expand=True)
+    body.configure(padx=14, pady=12)
 
     body.grid_columnconfigure(0, weight=1)
     body.grid_rowconfigure(1, weight=1)
-    tk.Label(
+    title_label = tk.Label(
         body,
         text=dialog_title,
         bg=panel_bg,
         fg=fg,
         font=("Segoe UI", 13, "bold"),
         anchor="w",
-    ).grid(row=0, column=0, sticky="ew", pady=(0, 10))
+    )
+    title_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
     table_shell = tk.Frame(body, bg=panel_bg, bd=0, highlightthickness=0)
     table_shell.grid(row=1, column=0, sticky="nsew")
@@ -321,6 +325,8 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
     table_window = table_canvas.create_window((0, 0), window=table, anchor="nw")
     table.grid_columnconfigure(0, weight=0)
     table.grid_columnconfigure(1, weight=1)
+    value_labels = []
+    key_labels = []
 
     def _sync_table_scrollregion(_event=None):
         try:
@@ -330,7 +336,11 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
 
     def _sync_table_width(event=None):
         try:
-            table_canvas.itemconfigure(table_window, width=max(1, int(event.width)))
+            width = max(1, int(event.width))
+            key_width = max((label.winfo_reqwidth() for label in key_labels), default=160)
+            table_canvas.itemconfigure(table_window, width=width)
+            for label in value_labels:
+                label.configure(wraplength=max(40, width - key_width - 24))
         except Exception:
             pass
 
@@ -349,7 +359,7 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
 
     for idx, (label, value) in enumerate(rows):
         bg = panel_alt if idx % 2 == 0 else blend_hex_colors(panel_alt, panel_bg, 0.35)
-        tk.Label(
+        key_label = tk.Label(
             table,
             text=label,
             bg=bg,
@@ -358,8 +368,10 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
             anchor="w",
             padx=10,
             pady=6,
-        ).grid(row=idx, column=0, sticky="nsew")
-        tk.Label(
+        )
+        key_label.grid(row=idx, column=0, sticky="nsew")
+        key_labels.append(key_label)
+        value_label = tk.Label(
             table,
             text=value,
             bg=bg,
@@ -370,12 +382,16 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
             wraplength=520,
             padx=10,
             pady=6,
-        ).grid(row=idx, column=1, sticky="nsew")
+        )
+        value_label.grid(row=idx, column=1, sticky="nsew")
+        value_labels.append(value_label)
+        key_label.bind("<MouseWheel>", _on_table_mousewheel, add="+")
+        value_label.bind("<MouseWheel>", _on_table_mousewheel, add="+")
 
     footer_row = tk.Frame(body, bg=panel_bg)
     footer_row.grid(row=2, column=0, sticky="ew", pady=(12, 0))
     footer_row.grid_columnconfigure(0, weight=1)
-    tk.Label(
+    footer_label = tk.Label(
         footer_row,
         text=footer,
         bg=panel_bg,
@@ -384,5 +400,25 @@ def show_yolo_model_metadata_dialog(host, model_path: str | None = None, *, titl
         anchor="w",
         justify=tk.LEFT,
         wraplength=560,
-    ).grid(row=0, column=0, sticky="ew", padx=(0, 10))
-    ttk.Button(footer_row, text="Zamknij", command=dialog.destroy).grid(row=0, column=1, sticky="e")
+    )
+    footer_label.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+    close_button = ttk.Button(footer_row, text="Zamknij", command=dialog.destroy)
+    close_button.grid(row=0, column=1, sticky="e")
+
+    def _sync_footer_width(event):
+        footer_label.configure(wraplength=max(80, event.width - close_button.winfo_reqwidth() - 16))
+        title_label.configure(wraplength=max(80, event.width))
+
+    footer_row.bind("<Configure>", _sync_footer_width, add="+")
+    dialog.bind("<Escape>", lambda _event: dialog.destroy(), add="+")
+    dialog.update_idletasks()
+    screen_width = dialog.winfo_screenwidth()
+    screen_height = dialog.winfo_screenheight()
+    width = min(1040, max(320, screen_width - 80))
+    height = min(760, max(240, screen_height - 100))
+    dialog.minsize(min(640, width), min(360, height))
+    x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+    x = max(20, min(x, screen_width - width - 20))
+    y = max(20, min(y, screen_height - height - 60))
+    dialog.geometry(f"{width}x{height}+{x}+{y}")

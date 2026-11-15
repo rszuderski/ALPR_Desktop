@@ -197,7 +197,9 @@ def _target_label(target: str) -> str:
 
 
 def _dataset_timestamp(root: Path | None, name: str) -> tuple[str, str]:
-    match = _TIMESTAMP_RE.search(str(name or ""))
+    # Z4DATASETUI001: newest timestamp wins
+    matches = list(_TIMESTAMP_RE.finditer(str(name or "")))
+    match = matches[-1] if matches else None
     if match:
         try:
             stamp = _dt.datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S")

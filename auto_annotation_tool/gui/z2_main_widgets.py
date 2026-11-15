@@ -16,6 +16,9 @@ from .web_slim_scrollbar import WebSlimScrollbar, blend_hex_colors
 from .zoomable_canvas import ZoomableCanvas
 from .z2_main_widget_bindings import bind_annotation_widget_help_and_events
 from .z2_right_panel_widgets import build_annotation_right_panel
+from . import z2_gt_completion
+from . import z2_gt_review
+from .z2_image_listbox import ImageListbox
 
 
 def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
@@ -57,7 +60,9 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
 
     left_frame = ttk.Frame(pane, style="Panel.TFrame")
     center_frame = ttk.Frame(pane, style="Panel.TFrame")
-    right_frame = ttk.Frame(pane, style="Panel.TFrame")
+    right_frame = ttk.Frame(pane, style="Panel.TFrame", width=280)
+    # Status copy must wrap inside the sidebar instead of requesting canvas space.
+    right_frame.pack_propagate(False)
     self.main_left_frame = left_frame
     self.main_center_frame = center_frame
     self.main_right_frame = right_frame
@@ -65,7 +70,7 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
 
     pane.add(left_frame, weight=2)
     pane.add(center_frame, weight=6)
-    pane.add(right_frame, weight=1)
+    pane.add(right_frame, weight=0)
     pane.bind("<Configure>", self._on_main_pane_configure, add="+")
     pane.bind("<ButtonPress-1>", self._on_main_pane_button_press, add="+")
     pane.bind("<B1-Motion>", self._on_main_pane_drag_motion, add="+")
@@ -173,120 +178,120 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
     self.manual_route_card_title = None
     self.manual_route_card_desc = None
 
-    if not initial_campaign_context:
-        self.workflow_entry_title_lbl = SectionHeaderLabel(
-            self.workflow_entry_section,
-            self.app,
-            text="Co chcesz zrobic?",
-        )
-        self.workflow_entry_title_lbl.pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
-
-        self.workflow_intro_lbl = tk.Label(
-            self.workflow_entry_section,
-            textvariable=self.workflow_intro_var,
-            anchor="w",
-            justify=tk.LEFT,
-            wraplength=360,
-            bd=0,
-            highlightthickness=0
-        )
-        self.workflow_intro_lbl.pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
-        self._set_inline_label_state(self.workflow_intro_lbl, tone="muted", emphasis=False)
-
-        self.workflow_cards_frame = ttk.Frame(self.workflow_entry_section, style="Panel.TFrame")
-        self.workflow_cards_frame.pack(fill=tk.X)
-
-        palette = getattr(self.app, "palette", {})
-        workflow_card_bg = palette.get("panel_alt", palette.get("panel", "#252526"))
-        workflow_card_border = blend_hex_colors(
-            palette.get("success", "#4ec9b0"),
-            palette.get("panel_border", palette.get("border", "#3c3c3c")),
-            0.18,
-        )
-        workflow_card_fg = palette.get("fg", "#f3f3f3")
-        workflow_card_muted = palette.get("muted", "#c7c7c7")
-
-        self.auto_route_card = tk.Frame(
-        self.workflow_cards_frame,
-        bd=0,
-        highlightthickness=1,
-        highlightbackground=workflow_card_border,
-        highlightcolor=workflow_card_border,
-        bg=workflow_card_bg,
-        padx=14,
-        pady=12,
-        cursor="hand2",
+    # Build route cards in both contexts; the renderer controls visibility.
+    self.workflow_entry_title_lbl = SectionHeaderLabel(
+        self.workflow_entry_section,
+        self.app,
+        text="Co chcesz zrobic?",
     )
-        self.auto_route_card.pack(fill=tk.X, pady=(0, 8))
-        self.auto_route_card_title = tk.Label(
-        self.auto_route_card,
-        text="Autoanotacja tablic",
+    self.workflow_entry_title_lbl.pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
+
+    self.workflow_intro_lbl = tk.Label(
+        self.workflow_entry_section,
+        textvariable=self.workflow_intro_var,
         anchor="w",
         justify=tk.LEFT,
-        font=("Segoe UI Semibold", 11),
-        cursor="hand2",
+        wraplength=360,
         bd=0,
-        highlightthickness=0,
-        bg=workflow_card_bg,
-        fg=workflow_card_fg,
+        highlightthickness=0
     )
-        self.auto_route_card_title.pack(anchor=tk.W, fill=tk.X)
-        self.auto_route_card_desc = tk.Label(
-        self.auto_route_card,
-        text="Uruchom YOLO, zapisz run anotacji Z2 w workspace i przejdź potem do korekty oraz splitu.",
-        anchor="w",
-        justify=tk.LEFT,
-        wraplength=336,
-        cursor="hand2",
-        bd=0,
-        highlightthickness=0,
-        bg=workflow_card_bg,
-        fg=workflow_card_muted,
-    )
-        self.auto_route_card_desc.pack(anchor=tk.W, fill=tk.X, pady=(8, 0))
+    self.workflow_intro_lbl.pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
+    self._set_inline_label_state(self.workflow_intro_lbl, tone="muted", emphasis=False)
 
-        self.manual_route_card = tk.Frame(
-        self.workflow_cards_frame,
-        bd=0,
-        highlightthickness=1,
-        highlightbackground=workflow_card_border,
-        highlightcolor=workflow_card_border,
-        bg=workflow_card_bg,
-        padx=14,
-        pady=12,
-        cursor="hand2",
-    )
-        self.manual_route_card.pack(fill=tk.X)
-        self.manual_route_card_title = tk.Label(
-        self.manual_route_card,
-        text="Praca ręczna na runie Z2",
-        anchor="w",
-        justify=tk.LEFT,
-        font=("Segoe UI Semibold", 11),
-        cursor="hand2",
-        bd=0,
-        highlightthickness=0,
-        bg=workflow_card_bg,
-        fg=workflow_card_fg,
-    )
-        self.manual_route_card_title.pack(anchor=tk.W, fill=tk.X)
-        self.manual_route_card_desc = tk.Label(
-        self.manual_route_card,
-        text="Utwórz nowy run ręczny, otwórz lokalny run z historii albo wskaż dowolny run Z2 do korekty.",
-        anchor="w",
-        justify=tk.LEFT,
-        wraplength=336,
-        cursor="hand2",
-        bd=0,
-        highlightthickness=0,
-        bg=workflow_card_bg,
-        fg=workflow_card_muted,
-    )
-        self.manual_route_card_desc.pack(anchor=tk.W, fill=tk.X, pady=(8, 0))
+    self.workflow_cards_frame = ttk.Frame(self.workflow_entry_section, style="Panel.TFrame")
+    self.workflow_cards_frame.pack(fill=tk.X)
 
-        self._bind_workflow_card(self.auto_route_card, "auto")
-        self._bind_workflow_card(self.manual_route_card, "manual")
-        self._refresh_workflow_route_cards(refresh_content=True)
+    palette = getattr(self.app, "palette", {})
+    workflow_card_bg = palette.get("panel_alt", palette.get("panel", "#252526"))
+    workflow_card_border = blend_hex_colors(
+        palette.get("success", "#4ec9b0"),
+        palette.get("panel_border", palette.get("border", "#3c3c3c")),
+        0.18,
+    )
+    workflow_card_fg = palette.get("fg", "#f3f3f3")
+    workflow_card_muted = palette.get("muted", "#c7c7c7")
+
+    self.auto_route_card = tk.Frame(
+    self.workflow_cards_frame,
+    bd=0,
+    highlightthickness=1,
+    highlightbackground=workflow_card_border,
+    highlightcolor=workflow_card_border,
+    bg=workflow_card_bg,
+    padx=14,
+    pady=12,
+    cursor="hand2",
+)
+    self.auto_route_card.pack(fill=tk.X, pady=(0, 8))
+    self.auto_route_card_title = tk.Label(
+    self.auto_route_card,
+    text="Autoanotacja tablic",
+    anchor="w",
+    justify=tk.LEFT,
+    font=("Segoe UI Semibold", 11),
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+    bg=workflow_card_bg,
+    fg=workflow_card_fg,
+)
+    self.auto_route_card_title.pack(anchor=tk.W, fill=tk.X)
+    self.auto_route_card_desc = tk.Label(
+    self.auto_route_card,
+    text="Uruchom YOLO, zapisz run anotacji Z2 w workspace i przejdź potem do korekty oraz splitu.",
+    anchor="w",
+    justify=tk.LEFT,
+    wraplength=336,
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+    bg=workflow_card_bg,
+    fg=workflow_card_muted,
+)
+    self.auto_route_card_desc.pack(anchor=tk.W, fill=tk.X, pady=(8, 0))
+
+    self.manual_route_card = tk.Frame(
+    self.workflow_cards_frame,
+    bd=0,
+    highlightthickness=1,
+    highlightbackground=workflow_card_border,
+    highlightcolor=workflow_card_border,
+    bg=workflow_card_bg,
+    padx=14,
+    pady=12,
+    cursor="hand2",
+)
+    self.manual_route_card.pack(fill=tk.X)
+    self.manual_route_card_title = tk.Label(
+    self.manual_route_card,
+    text="Praca ręczna na runie Z2",
+    anchor="w",
+    justify=tk.LEFT,
+    font=("Segoe UI Semibold", 11),
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+    bg=workflow_card_bg,
+    fg=workflow_card_fg,
+)
+    self.manual_route_card_title.pack(anchor=tk.W, fill=tk.X)
+    self.manual_route_card_desc = tk.Label(
+    self.manual_route_card,
+    text="Utwórz nowy run ręczny, otwórz lokalny run z historii albo wskaż dowolny run Z2 do korekty.",
+    anchor="w",
+    justify=tk.LEFT,
+    wraplength=336,
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+    bg=workflow_card_bg,
+    fg=workflow_card_muted,
+)
+    self.manual_route_card_desc.pack(anchor=tk.W, fill=tk.X, pady=(8, 0))
+
+    self._bind_workflow_card(self.auto_route_card, "auto")
+    self._bind_workflow_card(self.manual_route_card, "manual")
+    self._refresh_workflow_route_cards(refresh_content=True)
     _log_build_phase("workflow_cards")
     self.workflow_entry_separator = self._build_left_section_separator(settings_col, pady=(16, 20))
     _log_build_phase("workflow_entry")
@@ -334,7 +339,6 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
         button_text="Wybierz obrazy",
         button_command=self._select_input_dir,
     )
-
     self.project_paths_info_lbl = tk.Label(
         source_section,
         textvariable=self.project_paths_info_var,
@@ -831,6 +835,14 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
     )
     self.manual_history_combo.pack(fill=tk.X, pady=(4, 4))
     self.manual_history_combo.bind("<<ComboboxSelected>>", self._on_manual_history_selection_changed)
+    self.manual_history_preview_btn = ttk.Button(
+        self.manual_history_section,
+        text="Podgląd anotacji",
+        style="WorkflowCard.TButton",
+        command=self._preview_selected_manual_review_history_run,
+        state=tk.DISABLED,
+    )
+    self.manual_history_preview_btn.pack(fill=tk.X, pady=(0, 4))
     self.manual_history_open_btn = ttk.Button(
         self.manual_history_section,
         text="Otwórz run Z2 z historii",
@@ -860,6 +872,7 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
         self.manual_history_section,
         self.manual_history_title_lbl,
         self.manual_history_combo,
+        self.manual_history_preview_btn,
         self.manual_history_open_btn,
         self.manual_history_import_btn,
         self.manual_history_hint_lbl,
@@ -1224,6 +1237,12 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
         bd=0,
         highlightthickness=0
     )
+    self.gt_completion_followup_box = z2_gt_completion.build_gt_completion_subpanel(
+        self,
+        self.followup_section,
+        key="followup",
+    )
+
     self._register_workflow_step_card(
         "workflow_followup",
         self.followup_section,
@@ -1231,6 +1250,10 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
             self.followup_intro_lbl,
             self.run_output_info_lbl,
             self.post_annotation_hint_lbl,
+        ],
+        child_frames=[
+            self.followup_actions_row,
+            self.gt_completion_followup_box,
         ],
         style_targets=[
             {
@@ -1305,6 +1328,12 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
         self.manual_stage_section,
         padding_px=54,
         min_px=220,
+    )
+
+    self.gt_completion_manual_box = z2_gt_completion.build_gt_completion_subpanel(
+        self,
+        self.manual_stage_section,
+        key="manual",
     )
 
     self.manual_stage_buttons_row = ttk.Frame(self.manual_stage_section, style="Panel.TFrame")
@@ -1719,6 +1748,59 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
     self.preview_host = preview_host
     preview_host.pack(fill=tk.BOTH, expand=True, padx=5, pady=0)
 
+    self.manual_history_preview_host = tk.Frame(
+        center_frame,
+        bg=panel_bg,
+        bd=0,
+        highlightthickness=0,
+    )
+    self.manual_history_preview_title_var = tk.StringVar(
+        value="Wybierz run i kliknij „Podgląd anotacji”."
+    )
+    self.manual_history_preview_title_lbl = tk.Label(
+        self.manual_history_preview_host,
+        textvariable=self.manual_history_preview_title_var,
+        bg=panel_bg,
+        fg=palette.get("fg", "#f3f3f3"),
+        anchor="w",
+        justify=tk.LEFT,
+        font=("Segoe UI", 11, "bold"),
+    )
+    self.manual_history_preview_title_lbl.pack(
+        fill=tk.X,
+        padx=12,
+        pady=(10, 2),
+    )
+    self.manual_history_preview_hint_lbl = tk.Label(
+        self.manual_history_preview_host,
+        text="Reprezentatywne AT są pokazane jako cropy z niewielkim marginesem.",
+        bg=panel_bg,
+        fg=palette.get("muted", "#c7c7c7"),
+        anchor="w",
+        justify=tk.LEFT,
+        font=("Segoe UI", 8),
+    )
+    self.manual_history_preview_hint_lbl.pack(
+        fill=tk.X,
+        padx=12,
+        pady=(0, 4),
+    )
+    self.manual_history_preview_grid = tk.Frame(
+        self.manual_history_preview_host,
+        bg=panel_bg,
+        bd=0,
+        highlightthickness=0,
+    )
+    self.manual_history_preview_grid.pack(
+        fill=tk.BOTH,
+        expand=True,
+        padx=6,
+        pady=(0, 6),
+    )
+    self.manual_history_preview_host.pack_forget()
+    self._manual_history_preview_loaded = False
+    self._manual_history_preview_photo_refs = []
+
     list_lf = ttk.LabelFrame(
         self.preview_left_list_host,
         text=" Lista wyników anotacji ",
@@ -1996,7 +2078,7 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
         self.preview_list_legend_problem_badge,
         self.preview_list_legend_problem_lbl,
         self.preview_list_legend_problem_count_lbl,
-    ) = _build_preview_list_legend_item(preview_list_legend_grid, 1, 0, "--", "Brak")
+    ) = _build_preview_list_legend_item(preview_list_legend_grid, 1, 0, "!", "Do poprawy")
     (
         self.preview_list_legend_dirty_item,
         self.preview_list_legend_dirty_badge,
@@ -2043,11 +2125,13 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
     self._bind_preview_sort_tile(self.preview_list_legend_corrected_item, "Status: ED, OK, problem")
     self._bind_preview_sort_tile(self.preview_list_legend_problem_item, "Status: problem, ED, OK")
     self._bind_preview_sort_tile(self.preview_list_legend_dirty_item, "Status: OK, ED, problem")
+    z2_gt_review.build_missing_gt_filter(self, preview_list_section)
     list_frame = ttk.Frame(preview_list_section)
     self.preview_list_frame = list_frame
     list_frame.pack(fill=tk.BOTH, expand=True)
-    self.preview_listbox = tk.Listbox(
+    self.preview_listbox = ImageListbox(
         list_frame,
+        owner=self,
         font=("Consolas", 9),
         height=9,
         activestyle="none",
@@ -2379,7 +2463,7 @@ def create_annotation_widgets(host, SlimProgressBar, nav_button_width):
         self._preview_controls_global_wheel_bound = True
     self.preview_canvas = ZoomableCanvas(
         canvas_frame,
-        bg=palette.get("panel_alt", palette.get("panel", "#1e1e1e")),
+        bg="#1e1e1e",
         highlightthickness=0,
     )
     self.preview_canvas.pack(fill=tk.BOTH, expand=True)

@@ -1,0 +1,327 @@
+{
+  "schema": "alpr.analysis.presentation.pl.v1",
+  "source_export_zip": "analiza_F4_20261102T190324Z_001.zip",
+  "source_export_sha256": "79686f87c9c5c66bdd3e47595eee9d34102d4921e6ddf2bc14ec163f428fb276",
+  "machine_metric_ids_unchanged": true,
+  "scenarios": {
+    "PAIR_DAY_01": "Zdjęcia dzienne wyświetlane na telewizorze",
+    "PAIR_NIGHT_01": "Zdjęcia nocne wyświetlane na telewizorze"
+  },
+  "variant": {
+    "DAY_FP32": "FP32",
+    "DAY_INT8": "INT8"
+  },
+  "note": "DAY/NIGHT oznacza materiał fotograficzny, nie model wytrenowany dla nocy.",
+  "metrics": {
+    "mt_p50_ms": {
+      "title": "Wykrywanie tablic — typowy czas działania modelu",
+      "subtitle": "Mediana czasu pojedynczego uruchomienia MT; mniej = szybciej.",
+      "x_axis": "Czas jednego uruchomienia [ms]",
+      "direction": "lower",
+      "display_type": "ms",
+      "observation_unit_ui": "mt_call",
+      "coverage_unit": "pomiarów",
+      "footnote": "ms = milisekundy (1000 ms = 1 s). Zarejestrowane czasy modeli DAY."
+    },
+    "mt_p95_ms": {
+      "title": "Wykrywanie tablic — czas w wolniejszych przypadkach",
+      "subtitle": "95. percentyl czasu pojedynczego uruchomienia MT (p95); mniej = szybciej.",
+      "x_axis": "Czas jednego uruchomienia [ms]",
+      "direction": "lower",
+      "display_type": "ms",
+      "observation_unit_ui": "mt_call",
+      "coverage_unit": "pomiarów",
+      "footnote": "ms = milisekundy (1000 ms = 1 s). Zarejestrowane czasy modeli DAY."
+    },
+    "mz_trace_p50_ms": {
+      "title": "Rozpoznawanie znaków — typowy czas etapu",
+      "subtitle": "Mediana łącznego czasu MZ w jednym śladzie telefonu; ślad może zawierać więcej niż jedno uruchomienie MZ. Mniej = lepiej.",
+      "x_axis": "Czas etapu na ślad [ms]",
+      "direction": "lower",
+      "display_type": "ms",
+      "observation_unit_ui": "trace",
+      "coverage_unit": "pomiarów",
+      "footnote": "ms = milisekundy (1000 ms = 1 s). Jeden ślad może obejmować kilka wywołań MZ."
+    },
+    "mz_trace_p95_ms": {
+      "title": "Rozpoznawanie znaków — czas w wolniejszych przypadkach",
+      "subtitle": "95. percentyl łącznego czasu MZ w śladzie telefonu; nie czas pojedynczego wywołania MZ. Mniej = lepiej.",
+      "x_axis": "Czas etapu na ślad [ms]",
+      "direction": "lower",
+      "display_type": "ms",
+      "observation_unit_ui": "trace",
+      "coverage_unit": "pomiarów",
+      "footnote": "ms = milisekundy (1000 ms = 1 s). Jeden ślad może obejmować kilka wywołań MZ."
+    },
+    "pipeline_p50_ms": {
+      "title": "Przetwarzanie ALPR — typowy czas",
+      "subtitle": "Mediana zarejestrowanego czasu potoku ALPR na ślad; nie pełny czas kamera–ekran. Mniej = lepiej.",
+      "x_axis": "Czas przetwarzania [ms]",
+      "direction": "lower",
+      "display_type": "ms",
+      "observation_unit_ui": "trace",
+      "coverage_unit": "pomiarów",
+      "footnote": "ms = milisekundy (1000 ms = 1 s). Pomiar nie obejmuje całego opóźnienia kamera–ekran."
+    },
+    "pipeline_p95_ms": {
+      "title": "Przetwarzanie ALPR — czas w wolniejszych przypadkach",
+      "subtitle": "95. percentyl czasu potoku ALPR na ślad; nie pełny czas kamera–ekran. Mniej = lepiej.",
+      "x_axis": "Czas przetwarzania [ms]",
+      "direction": "lower",
+      "display_type": "ms",
+      "observation_unit_ui": "trace",
+      "coverage_unit": "pomiarów",
+      "footnote": "ms = milisekundy (1000 ms = 1 s). Pomiar nie obejmuje całego opóźnienia kamera–ekran."
+    },
+    "mt_calls": {
+      "title": "Liczba uruchomień modelu wykrywania tablic",
+      "subtitle": "Liczba rzeczywiście zarejestrowanych wywołań MT.",
+      "x_axis": "Liczba uruchomień",
+      "direction": "none",
+      "display_type": "count",
+      "observation_unit_ui": "mt_call",
+      "coverage_unit": "śladów telefonu",
+      "footnote": "Liczba wywołań nie oznacza liczby niezależnych fotografii. Modele DAY, materiał z telewizora."
+    },
+    "mz_calls": {
+      "title": "Liczba uruchomień modelu rozpoznawania znaków",
+      "subtitle": "Liczba rzeczywiście zarejestrowanych uruchomień MZ; może przekraczać liczbę klatek.",
+      "x_axis": "Liczba uruchomień",
+      "direction": "none",
+      "display_type": "count",
+      "observation_unit_ui": "mz_call",
+      "coverage_unit": "śladów telefonu",
+      "footnote": "Liczba wywołań nie oznacza liczby niezależnych fotografii. Modele DAY, materiał z telewizora."
+    },
+    "mz_call_p95_ms": {
+      "title": "Rozpoznawanie znaków — czas pojedynczego uruchomienia (p95)",
+      "subtitle": "95. percentyl wiarygodnych czasów pojedynczych uruchomień MZ; mniej = szybciej.",
+      "x_axis": "Czas jednego uruchomienia [ms]",
+      "direction": "lower",
+      "display_type": "ms",
+      "observation_unit_ui": "mz_call",
+      "coverage_unit": "pomiarów",
+      "footnote": "ms = milisekundy (1000 ms = 1 s). Zarejestrowane czasy modeli DAY."
+    },
+    "scene_coverage_pct": {
+      "title": "Pokrycie zaplanowanych scen",
+      "subtitle": "Odsetek zaplanowanych scen, dla których potwierdzono prawidłowe powiązanie materiału z obserwacją. Więcej = lepiej.",
+      "x_axis": "Pokryte sceny [%]",
+      "direction": "higher",
+      "display_type": "percent",
+      "observation_unit_ui": "planned_scene",
+      "coverage_unit": "scen",
+      "footnote": "Bez mapy scen i reguły wyboru odczytu nie ma wyniku E2E. F4 nie jest niezależnym F6."
+    },
+    "exact_e2e_pct": {
+      "title": "Cały ALPR — całkowicie poprawne odczyty tablic",
+      "subtitle": "Wynik dla unikatowych tablic i z góry ustalonych okien; bez mapy scen brak wyniku. Więcej = lepiej.",
+      "x_axis": "Poprawne pełne odczyty [%]",
+      "direction": "higher",
+      "display_type": "percent",
+      "observation_unit_ui": "unique_plate",
+      "coverage_unit": "tablic",
+      "footnote": "Bez mapy scen i reguły wyboru odczytu nie ma wyniku E2E. F4 nie jest niezależnym F6."
+    },
+    "no_read_e2e_pct": {
+      "title": "Cały ALPR — tablice bez odczytu",
+      "subtitle": "Wynik dla unikatowych tablic i okien; bez mapy scen brak wyniku. Mniej = lepiej.",
+      "x_axis": "Tablice bez odczytu [%]",
+      "direction": "lower",
+      "display_type": "percent",
+      "observation_unit_ui": "unique_plate",
+      "coverage_unit": "tablic",
+      "footnote": "Bez mapy scen i reguły wyboru odczytu nie ma wyniku E2E. F4 nie jest niezależnym F6."
+    },
+    "pss_peak_mib": {
+      "title": "Zużycie pamięci — najwyższy dostępny pomiar PSS",
+      "subtitle": "Maksimum spośród faktycznie dostępnych próbek PSS; nie potwierdzony szczyt całej sesji. Mniej = lepiej.",
+      "x_axis": "Pamięć procesu [MiB]",
+      "direction": "lower",
+      "display_type": "memory",
+      "observation_unit_ui": "os_sample",
+      "coverage_unit": "próbek pamięci",
+      "footnote": "MiB = 1 048 576 bajtów. PSS uwzględnia proporcjonalny udział pamięci współdzielonej."
+    },
+    "mt_tp": {
+      "title": "Poprawnie znalezione tablice — liczba",
+      "subtitle": "Wskazania MT dopasowane do fizycznych tablic w ocenionym zakresie; jednostka: tablica.",
+      "x_axis": "Liczba tablic",
+      "direction": "none",
+      "display_type": "count",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "mt_fp": {
+      "title": "Fałszywe wskazania modelu tablic — liczba",
+      "subtitle": "Jedno źródłowe wskazanie MT FINAL = najwyżej jedno FP. Mniej = lepiej.",
+      "x_axis": "Liczba fałszywych wskazań",
+      "direction": "lower",
+      "display_type": "count",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "mt_fn": {
+      "title": "Tablice pominięte przez model — liczba",
+      "subtitle": "Dotyczy zapisanych referencji operatora, a nie niezależnego pełnego spisu sceny. Mniej = lepiej.",
+      "x_axis": "Liczba pominiętych tablic",
+      "direction": "lower",
+      "display_type": "count",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "mt_precision_pct": {
+      "title": "Trafność wskazań modelu wykrywania tablic",
+      "subtitle": "Trafne wskazania MT wśród wszystkich ocenionych wskazań FINAL; więcej = lepiej.",
+      "x_axis": "Trafne wskazania [%]",
+      "direction": "higher",
+      "display_type": "percent",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "mt_recall_pct": {
+      "title": "Odsetek oznaczonych tablic wykrytych przez model",
+      "subtitle": "Wykryte tablice wśród rzeczywistych referencji zapisanych przez operatora; więcej = lepiej.",
+      "x_axis": "Wykryte tablice [%]",
+      "direction": "higher",
+      "display_type": "percent",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "mt_f1_pct": {
+      "title": "Skuteczność wykrywania tablic — miara F1",
+      "subtitle": "F1 łączy trafność wskazań i odsetek odnalezionych referencji; więcej = lepiej.",
+      "x_axis": "Miara F1 [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "bbox_v1_tp": {
+      "title": "Historyczna ocena BBOX — trafienia",
+      "subtitle": "Pomiar pomocniczy starego dopasowania BBOX IoU, nie główny wynik F4.",
+      "x_axis": "Liczba tablic",
+      "direction": "none",
+      "display_type": "count",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Pomocnicza metoda BBOX v1: IoU ≥ 50%; nie jest główną oceną obiektu MT. Referencje asystowane."
+    },
+    "bbox_v1_fp": {
+      "title": "Historyczna ocena BBOX — fałszywe wskazania",
+      "subtitle": "Pomiar pomocniczy starego dopasowania BBOX IoU, nie główny wynik F4.",
+      "x_axis": "Liczba wskazań",
+      "direction": "none",
+      "display_type": "count",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Pomocnicza metoda BBOX v1: IoU ≥ 50%; nie jest główną oceną obiektu MT. Referencje asystowane."
+    },
+    "bbox_v1_fn": {
+      "title": "Historyczna ocena BBOX — pominięte tablice",
+      "subtitle": "Pomiar pomocniczy starego dopasowania BBOX IoU, nie główny wynik F4.",
+      "x_axis": "Liczba tablic",
+      "direction": "none",
+      "display_type": "count",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Pomocnicza metoda BBOX v1: IoU ≥ 50%; nie jest główną oceną obiektu MT. Referencje asystowane."
+    },
+    "bbox_v1_precision_pct": {
+      "title": "Historyczna ocena BBOX — trafność wskazań",
+      "subtitle": "Stara metodyka dopasowania samych BBOX; tylko diagnostyka. Więcej = lepiej.",
+      "x_axis": "Trafne BBOX [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Pomocnicza metoda BBOX v1: IoU ≥ 50%; nie jest główną oceną obiektu MT. Referencje asystowane."
+    },
+    "bbox_v1_recall_pct": {
+      "title": "Historyczna ocena BBOX — odnalezione referencje",
+      "subtitle": "Stara metodyka dopasowania samych BBOX; tylko diagnostyka. Więcej = lepiej.",
+      "x_axis": "Dopasowane referencje [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Pomocnicza metoda BBOX v1: IoU ≥ 50%; nie jest główną oceną obiektu MT. Referencje asystowane."
+    },
+    "bbox_v1_f1_pct": {
+      "title": "Historyczna ocena BBOX — miara F1",
+      "subtitle": "Stara metodyka dopasowania samych BBOX; tylko diagnostyka. Więcej = lepiej.",
+      "x_axis": "F1 dopasowania BBOX [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "mt_units",
+      "coverage_unit": "wywołań MT",
+      "footnote": "Pomocnicza metoda BBOX v1: IoU ≥ 50%; nie jest główną oceną obiektu MT. Referencje asystowane."
+    },
+    "pose_availability_pct": {
+      "title": "Dostępność poprawnej geometrii narożników",
+      "subtitle": "Udział ocenialnych, rzeczywistych źródłowych narożników Pose w kwalifikowanych wskazaniach. Więcej = lepiej.",
+      "x_axis": "Dostępne narożniki [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "pose_gt",
+      "coverage_unit": "par obrysów",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "polygon_iou_pct": {
+      "title": "Zgodność obrysu modelu z obrysem operatora",
+      "subtitle": "Średnia zgodność powierzchni obrysów: część wspólna / suma; więcej = lepiej.",
+      "x_axis": "Zgodność obrysów [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "pose_gt",
+      "coverage_unit": "par obrysów",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "nmce_pct": {
+      "title": "Błąd położenia narożników tablicy",
+      "subtitle": "Średni błąd narożników / przekątna prostokąta referencji; mniej = dokładniejsze narożniki.",
+      "x_axis": "Znormalizowany błąd narożników [%]",
+      "direction": "lower",
+      "display_type": "percent_unbounded",
+      "observation_unit_ui": "pose_gt",
+      "coverage_unit": "par obrysów",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "bbox_iou_pct": {
+      "title": "Zgodność prostokąta modelu z referencją",
+      "subtitle": "Pomocnicza zgodność prostokąta BBOX z referencją; nie jest oceną całego MT. Więcej = lepiej.",
+      "x_axis": "Zgodność prostokątów [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "bbox_gt",
+      "coverage_unit": "par prostokątów",
+      "footnote": "Referencje asystowane; ocena retrospektywna F4. Różne podzbiory nie uzasadniają rankingu."
+    },
+    "exact_mz_pct": {
+      "title": "Poprawnie odczytane numery rejestracyjne",
+      "subtitle": "Odsetek całych numerów zgodnych z referencją; więcej = lepiej.",
+      "x_axis": "Odsetek poprawnych odczytów [%]",
+      "direction": "higher",
+      "display_type": "bounded_percent",
+      "observation_unit_ui": "ocr_reads",
+      "coverage_unit": "odczytów",
+      "footnote": "Oceniono odczyty MZ z rzeczywistych tablic z czytelną referencją.\nOcena asystowana i retrospektywna; to nie skuteczność całego systemu."
+    },
+    "micro_cer_pct": {
+      "title": "Błędy w odczycie znaków",
+      "subtitle": "Liczba operacji edycyjnych przypadających na wszystkie znaki referencji; mniej = lepiej.",
+      "x_axis": "Błędy na 100 znaków GT [%]",
+      "direction": "lower",
+      "display_type": "percent_unbounded",
+      "observation_unit_ui": "ocr_chars",
+      "coverage_unit": "odczytów",
+      "footnote": "Wstawienia + usunięcia + podstawienia / znaki referencji. Referencje asystowane; ocena retrospektywna."
+    }
+  }
+}

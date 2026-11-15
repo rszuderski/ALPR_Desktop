@@ -317,9 +317,6 @@ def _format_compare_run_label(self, run, index: int) -> str:
 
 
 def _training_compare_run_key(run) -> str:
-    run_id = str(getattr(run, "id", "") or "").strip()
-    if run_id:
-        return run_id.lower()
     for attr in ("output_dir", "run_dir", "project_dir"):
         raw = str(getattr(run, attr, "") or "").strip()
         if not raw:
@@ -328,7 +325,9 @@ def _training_compare_run_key(run) -> str:
             return str(Path(raw).resolve()).lower()
         except Exception:
             return str(Path(raw)).lower()
-    return ""
+    run_id = str(getattr(run, "id", "") or "").strip()
+    target = str(getattr(run, "training_target", "") or "")
+    return f"{target}:{run_id}" if run_id else ""
 
 
 def _selected_training_compare_runs(self) -> list:
@@ -347,18 +346,16 @@ def _selected_training_compare_runs(self) -> list:
         if focused:
             selected_ids = [focused]
     runs = []
-    try:
-        self._reload_history_snapshot_from_disk()
-    except Exception:
-        pass
     seen: set[str] = set()
-    for run_id in selected_ids:
+    from . import z4_history_runtime
+    for row_id in selected_ids:
         try:
-            run = self.history.get_run(str(run_id))
+            ref = z4_history_runtime._history_row_ref(self, row_id)
+            run = ref["run"] if ref else None
         except Exception:
             run = None
         if run is not None:
-            key = _training_compare_run_key(run)
+            key = str(row_id)
             if key and key in seen:
                 continue
             if key:
@@ -416,7 +413,7 @@ def _draw_training_compare_chart(self):
 
     visible_series = []
     for item in runs_data:
-        run_id = str(item.get("run_id") or "")
+        run_id = str(item.get("row_id") or item.get("run_id") or "")
         var = getattr(self, "_training_compare_visible_vars", {}).get(run_id)
         if var is not None and not bool(var.get()):
             continue
@@ -551,7 +548,7 @@ def _refresh_training_compare_legend(self):
     fg = palette.get("fg", "#f3f3f3")
     self._training_compare_visible_vars = {}
     for row, item in enumerate(list(getattr(self, "_training_compare_runs_data", []) or [])):
-        run_id = str(item.get("run_id") or "")
+        run_id = str(item.get("row_id") or item.get("run_id") or "")
         color = str(item.get("color") or "#2f80ed")
         var = tk.BooleanVar(value=True)
         self._training_compare_visible_vars[run_id] = var
@@ -572,13 +569,14 @@ def _refresh_training_compare_legend(self):
 
 
 def _build_training_compare_runs_data(self, runs: list) -> list[dict[str, object]]:
+    from . import z4_history_runtime
     data = []
     seen: set[str] = set()
     for run in list(runs or []):
         run_id = str(getattr(run, "id", "") or "").strip()
         if not run_id:
             continue
-        key = _training_compare_run_key(run)
+        key = z4_history_runtime._history_row_id_for_run(self, run) or _training_compare_run_key(run)
         if key and key in seen:
             continue
         if key:
@@ -591,6 +589,7 @@ def _build_training_compare_runs_data(self, runs: list) -> list[dict[str, object
             {
                 "run": run,
                 "run_id": run_id,
+                "row_id": key or run_id,
                 "label": label,
                 "short_label": short_label,
                 "color": COMPARE_COLORS[index % len(COMPARE_COLORS)],
@@ -615,7 +614,7 @@ def _populate_training_compare_summary(self):
         run = item.get("run")
         if run is None:
             continue
-        run_id = str(item.get("run_id") or "")
+        run_id = str(item.get("row_id") or item.get("run_id") or "")
         try:
             target = self._format_history_run_target_label(self._infer_history_run_target(run))
         except Exception:
@@ -661,7 +660,7 @@ def _selected_training_compare_modal_run(self):
     if not run_id:
         return None
     for item in list(getattr(self, "_training_compare_runs_data", []) or []):
-        if str(item.get("run_id") or "") == run_id:
+        if str(item.get("row_id") or item.get("run_id") or "") == run_id:
             return item.get("run")
     return None
 
@@ -677,7 +676,8 @@ def _promote_training_compare_selected_run(self):
     run = _selected_training_compare_modal_run(self)
     if run is None:
         return messagebox.showwarning("Brak runu", "Najpierw wskaż run w tabeli porównania.")
-    run_id = str(getattr(run, "id", "") or "").strip()
+    from . import z4_history_runtime
+    run_id = z4_history_runtime._history_row_id_for_run(self, run)
     tree = getattr(self, "tree", None)
     if tree is not None and run_id:
         try:
@@ -895,7 +895,7 @@ def _open_training_compare_modal(self, runs: list):
     _populate_training_compare_summary(self)
     _refresh_training_compare_legend(self)
     try:
-        first = self._training_compare_runs_data[0]["run_id"]
+        first = self._training_compare_runs_data[0]["row_id"]
         self._training_compare_summary_tree.selection_set(first)
         self._training_compare_summary_tree.focus(first)
     except Exception:

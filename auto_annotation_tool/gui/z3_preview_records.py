@@ -149,6 +149,8 @@ def normalize_character_sign_source(host, rec, data=None, fallback_index: int = 
         return ""
 
     explicit = _normalized_record_text(rec, "sign_source")
+    if explicit in {"gt_assisted", "gt_assist_confirmed"}:
+        return "gt_assisted"
     if explicit in {"manual_sign", "manual", "local_manual", "cvat_manual", "preview_editor"}:
         return "manual_sign"
     if explicit in {"yolo_symbol", "yolo", "ys", "yolo_rescue"}:

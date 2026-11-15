@@ -1,0 +1,15 @@
+{
+  "normalization_policy": "uppercase_alphanumeric.v1",
+  "observed_by": [
+    "fixture-right"
+  ],
+  "operation": "set",
+  "parents": [
+    "rev-sha256-eaac9cfe8f2e6aaf66c59b8bcc5d8133d6c8b62a8cb1567914eec132edde2d51"
+  ],
+  "plate_id": "plate-ann-fixture-gt-conflict",
+  "revision_id": "rev-sha256-b38f07120c66b84453bf521c620a66e1b0b56ea6b16a002c9958be5aeb635661",
+  "schema": "alpr.gt.revision.v1",
+  "source": "manual_z2",
+  "value": "ABC125"
+}

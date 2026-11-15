@@ -1,0 +1,23 @@
+{
+  "aliases": [
+    "source_red.ppm"
+  ],
+  "blob_refs": [],
+  "height": 20,
+  "image_id": "img-sha256-0f8b6327327aa97711d20804dc230cba1940816aedbdc27c4e95726635dc1562",
+  "perceptual_dhash64s": [
+    "0000000000000000"
+  ],
+  "pixel_sha256s": [
+    "03e66f399d3756467553f14219778708b2babc4432697cde694ee943c848f4bc"
+  ],
+  "plate_ids": [
+    "plate-ann-fixture-single"
+  ],
+  "producers": [
+    "fixture-desktop"
+  ],
+  "schema": "alpr.gt.image.v1",
+  "source_file_sha256": "0f8b6327327aa97711d20804dc230cba1940816aedbdc27c4e95726635dc1562",
+  "width": 40
+}

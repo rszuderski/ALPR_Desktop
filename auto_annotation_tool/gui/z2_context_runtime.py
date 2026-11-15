@@ -225,6 +225,18 @@ def clear_campaign_context(self, *, restore_free_mode_preview: bool = True):
     Przywraca neutralny stan zakĹ‚adki Autoanotacji po wyjĹ›ciu z projektu
     i czyĹ›ci wszystkie artefakty poprzedniego projektu z UI.
     """
+    # Render Z2 ma własny guard reentrancy. Jeżeli poprzedni refresh kampanii
+    # zakończył się wyjątkiem, flaga mogła pozostać True i blokować każdy
+    # kolejny refresh po wyjściu z projektu.
+    self._workflow_ui_refresh_in_progress = False
+    self._workflow_ui_refresh_pending = False
+    # Abandon the project transition before restoring the free-mode layout.
+    # Its entry shell was hidden by _begin_campaign_step2_transition.
+    self._campaign_step2_transition_in_progress = False
+    self._campaign_step2_transition_refresh_pending = False
+    self._campaign_step2_transition_skip_heavy_finalize = False
+    self._campaign_step2_transition_defer_source_preview = False
+
     self._reset_campaign_step2_runtime_state()
     try:
         self._hide_campaign_step2_splash()
@@ -320,6 +332,63 @@ def clear_campaign_context(self, *, restore_free_mode_preview: bool = True):
                 pass
     except Exception as e:
         logger.debug(f"Nie udalo sie przywrocic ostatniego stanu Z2 po wyjsciu z projektu: {e}")
+    finally:
+        # Wyjście z projektu musi zawsze zakończyć się poprawnym layoutem
+        # trybu swobodnego, nawet jeśli częściowe odtworzenie snapshotu
+        # zakończyło się wyjątkiem. Nie odtwarzamy tu ciężkiego preview.
+        try:
+            if self._is_free_mode_session_context():
+                screen = self._normalize_free_mode_screen_value(
+                    self.free_mode_screen_var.get()
+                )
+                if not screen:
+                    self.free_mode_screen_var.set("route_choice")
+                    screen = "route_choice"
+
+                if screen == "route_choice":
+                    self.workflow_route_var.set("")
+                    self.workflow_step_var.set("")
+                    self._manual_review_active = False
+                    self._manual_review_from_auto = False
+                    self._manual_review_origin_route = ""
+                    self._manual_review_export_ready = False
+
+                # Stary render kampanii nie może zablokować pierwszego paintu
+                # trybu swobodnego.
+                self._workflow_ui_refresh_in_progress = False
+                self._workflow_ui_refresh_pending = False
+
+                try:
+                    self._refresh_left_panel_route_copy()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_detection_configuration_ui()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_step2_action_states()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_free_mode_workflow_ui()
+                except Exception as refresh_exc:
+                    logger.debug(
+                        "Nie udalo sie odbudowac layoutu Z2 free mode po wyjsciu z projektu: %s",
+                        refresh_exc,
+                    )
+
+                # Drugi lekki paint po opróżnieniu kolejki Tk zabezpiecza
+                # przypadek, w którym clear wykonano, gdy Z2 było niewidoczne.
+                try:
+                    self.frame.after_idle(self._refresh_free_mode_workflow_ui)
+                except Exception:
+                    pass
+        except Exception as refresh_exc:
+            logger.debug(
+                "Nie udalo sie wykonac fail-safe odbudowy Z2 po wyjsciu z projektu: %s",
+                refresh_exc,
+            )
 
 
 def _format_project_relative_path(self, path_value: str) -> str:
@@ -625,6 +694,7 @@ def _begin_campaign_step2_transition(self) -> None:
     self._campaign_step2_transition_in_progress = True
     self._campaign_step2_transition_refresh_pending = False
     self._campaign_step2_transition_skip_heavy_finalize = False
+    self._campaign_step2_transition_defer_source_preview = False
     try:
         workflow_shell = getattr(self, "workflow_entry_shell", None)
         if workflow_shell is not None:
@@ -653,6 +723,8 @@ def _end_campaign_step2_transition(self) -> None:
             pass
 
     self._campaign_step2_transition_in_progress = False
+    defer_source_preview = bool(getattr(self, "_campaign_step2_transition_defer_source_preview", False))
+    self._campaign_step2_transition_defer_source_preview = False
     if not bool(getattr(self, "_campaign_step2_transition_refresh_pending", False)):
         self._campaign_step2_transition_skip_heavy_finalize = False
         return
@@ -660,6 +732,11 @@ def _end_campaign_step2_transition(self) -> None:
     self._campaign_step2_transition_refresh_pending = False
     skip_heavy_finalize = bool(getattr(self, "_campaign_step2_transition_skip_heavy_finalize", False))
     self._campaign_step2_transition_skip_heavy_finalize = False
+    if defer_source_preview:
+        # The deferred source loader refreshes actions after publishing its
+        # payload. Scanning the same sources here blocks navigation to Z2.
+        _mark_finalize_phase("defer_action_states_until_source_preview")
+        return
     try:
         graph_context = dict(getattr(self, "_campaign_graph_entry_context", {}) or {})
     except Exception:

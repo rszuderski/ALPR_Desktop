@@ -42,6 +42,8 @@ from . import z2_run_lifecycle
 from . import z2_manifest_runtime
 from . import z2_annotation_startup
 from . import z2_status_ui_runtime
+from . import z2_gt_pack_creator
+from . import z2_gt_completion
 from .z2_main_widgets import create_annotation_widgets
 from .z2_annotation_delegates import bind_annotation_tab_delegates
 from .z2_auto_scope_modal import prompt_plate_auto_scope_choice
@@ -302,7 +304,7 @@ class AnnotationTab:
         self._preview_controls_legend_drag_state = None
         self._preview_controls_legend_click_state = None
         self._preview_controls_legend_active_grab_widget = None
-        self._preview_controls_legend_visible = True
+        self._preview_controls_legend_visible = False
         self._preview_metrics_overlay_expanded = True
         self._preview_metrics_overlay_visible = False
         self._preview_metrics_overlay_offset_x = 12.0
@@ -953,6 +955,18 @@ class AnnotationTab:
         p = filedialog.askdirectory(initialdir=str(Path(CONFIG.DIR_1_RAW).absolute()))
         if p:
             self._switch_annotation_input_dir(Path(p), show_hint=False)
+
+    def _open_gt_pack_creator(self):
+        return z2_gt_pack_creator.open_gt_pack_creator(self)
+
+    def _refresh_gt_completion_ui(self, *args, **kwargs):
+        return z2_gt_completion.refresh_gt_completion_ui(self, *args, **kwargs)
+
+    def _open_gt_pack_folder(self):
+        return z2_gt_completion.open_gt_pack_folder(self)
+
+    def _export_gt_snapshot(self):
+        return z2_gt_completion.export_gt_snapshot_dialog(self)
 
     def _set_input_dir_path_only(self, input_dir: Path, *, resolved_input_dir: Path | None = None) -> None:
         safe_input_dir = Path(resolved_input_dir or input_dir)
@@ -1832,6 +1846,10 @@ class AnnotationTab:
 
     def _open_selected_manual_review_history_run(self, *args, **kwargs):
         return z2_miniflow_runtime._open_selected_manual_review_history_run(self, *args, **kwargs)
+
+
+    def _preview_selected_manual_review_history_run(self, *args, **kwargs):
+        return z2_miniflow_runtime._preview_selected_manual_review_history_run(self, *args, **kwargs)
 
 
     def _on_manual_history_selection_changed(self, *args, **kwargs):
@@ -2762,6 +2780,8 @@ class AnnotationTab:
         return z2_canvas_interaction.on_zoomable_canvas_should_block_pan(self, *args, **kwargs)
     def on_zoomable_canvas_zoom(self, *args, **kwargs):
         return z2_canvas_interaction.on_zoomable_canvas_zoom(self, *args, **kwargs)
+    def on_zoomable_canvas_pan_applied(self, *args, **kwargs):
+        return z2_canvas_interaction.on_zoomable_canvas_pan_applied(self, *args, **kwargs)
     def on_zoomable_canvas_final_quality_delay_ms(self, *args, **kwargs):
         return z2_canvas_interaction.on_zoomable_canvas_final_quality_delay_ms(self, *args, **kwargs)
     def _get_preview_canvas_cursor(self, *args, **kwargs):
@@ -2998,6 +3018,26 @@ class AnnotationTab:
 
     def _save_preview_edits(self, *args, **kwargs):
         return z2_preview_editor._save_preview_edits(self, *args, **kwargs)
+
+    def _force_save_all(self):
+        """Flush canvas edits before shutdown cancels scheduled Tk callbacks."""
+        from .z2_preview_autosave import wait_for_pending_save
+        from .z2_plate_gt_inline import flush_inline_plate_gt_editors
+
+        flush_inline_plate_gt_editors(self)
+        self._cancel_preview_autosave()
+        wait_for_pending_save(self)
+        if getattr(self, "_preview_drag_state", None):
+            self._finish_preview_vertex_drag(
+                mark_dirty=bool(self._preview_drag_state.get("was_moved", False)),
+            )
+            self._cancel_preview_autosave()
+        if self._preview_dirty_images:
+            return self._save_preview_edits(
+                interactive=False, refresh_list=False,
+                refresh_workflow=False, refresh_export_sources=False,
+            )
+        return True
 
 
     def _delete_current_preview_image_hard(self, *args, **kwargs):

@@ -265,7 +265,13 @@ def format_plate_last_detection_line(host, data: dict | None) -> str:
     chars = int(last.get("characters", 0) or 0)
     result = str(last.get("result") or last.get("status") or "").strip()
     result_suffix = f" | wynik: {result}" if result else ""
-    return f"ta tablica: ostatnia detekcja {when} | {pipeline} | znaki {chars}{result_suffix}"
+    raw_hash = (data.get("raw_detection") or {}).get("result_hash")
+    working_hash = (data.get("working_annotation") or {}).get("source_raw_result_hash")
+    working_hash = working_hash or (data.get("review_state") or {}).get("raw_result_hash")
+    retained_suffix = ""
+    if raw_hash and working_hash and raw_hash != working_hash:
+        retained_suffix = " | zachowana wcześniejsza korekta; nowa detekcja w RAW"
+    return f"ta tablica: ostatnia detekcja {when} | {pipeline} | znaki {chars}{result_suffix}{retained_suffix}"
 
 
 def refresh_last_detection_status_label(host, summary: dict | None = None) -> None:
@@ -989,7 +995,8 @@ def show_last_detection_details(host) -> None:
             try:
                 yb_conf = float(summary.get("yolo_box_conf", 0.0) or 0.0)
                 ys_conf = float(summary.get("yolo_symbol_conf", 0.0) or 0.0)
-                technical_rows.append(("Progi YOLO", f"YB {yb_conf:.5g} | YS {ys_conf:.5g}"))
+                from .z3_threshold_percent import format_percent
+                technical_rows.append(("Progi YOLO", f"YB {format_percent(yb_conf, suffix=True)} | YS {format_percent(ys_conf, suffix=True)}"))
             except Exception:
                 pass
     else:

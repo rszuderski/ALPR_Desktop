@@ -39,6 +39,7 @@ from ..campaign_manager import CAMPAIGN
 from ..config import AVAILABLE_DETECT_MODELS, CONFIG, SESSION, YOLO_AVAILABLE, logger
 from ..data_models import AnnotationReport, AnnotationStatus, Detection, ImageAnnotation
 from ..exporters import CVATExporter, ReportGenerator
+from ..plate_import_validation import plate_import_error
 from ..icons import IconManager
 from ..project_cache import PROJECT_CACHE
 from ..quality_metrics import compute_plate_polygon_fit_metrics
@@ -231,6 +232,10 @@ def _import_external_annotation_run_to_workspace(
 
     if not annotations:
         return None, "Wybrany run nie zawiera obrazow zgodnych z wybranym katalogiem zdjęć.", False
+
+    geometry_error = plate_import_error(annotations)
+    if geometry_error:
+        return None, geometry_error, False
 
     source_manifest = self._load_annotation_run_manifest(source_run_dir)
     image_roots = self._get_external_run_image_roots(

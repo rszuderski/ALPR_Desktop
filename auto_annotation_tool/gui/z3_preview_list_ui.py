@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import tkinter as tk
+import re
 from typing import TYPE_CHECKING
 
 from ..config import logger
 from .web_slim_scrollbar import blend_hex_colors
+from .z3_gt_box_policy import plate_gt, limit_boxes_to_gt
 
 if TYPE_CHECKING:
     from .tab_character_annotation import CharacterAnnotationTab
@@ -97,6 +99,25 @@ def get_preview_layout_group_priority(
     return (0 if matches else 1, int(original_index))
 
 
+def preview_has_inherited_z2_gt(data: dict | None) -> bool:
+    """True only for a real, non-empty operator GT inherited from Z2."""
+    if not isinstance(data, dict):
+        return False
+
+    attrs = data.get("plate_attributes")
+    attrs = attrs if isinstance(attrs, dict) else {}
+    source = str(
+        data.get("ground_truth_source")
+        or attrs.get("ground_truth_source")
+        or ""
+    ).strip().lower()
+
+    if source != "manual_z2":
+        return False
+
+    return bool(plate_gt(data))
+
+
 def get_preview_sort_source_count(host: "CharacterAnnotationTab", mode_key: str, data: dict | None = None) -> int:
     normalized_key = str(mode_key or "").strip().upper()
     source_data = data if isinstance(data, dict) else {}
@@ -118,12 +139,35 @@ def get_preview_sort_source_count(host: "CharacterAnnotationTab", mode_key: str,
 
 def get_preview_sort_priority(host: "CharacterAnnotationTab", pid: str, data: dict, original_index: int):
     mode_key = host._get_preview_sort_mode_key()
+    if mode_key == "PLATE_ID":
+        natural_id = tuple(
+            int(part) if index % 2 else part
+            for index, part in enumerate(re.split(r"(\d+)", str(pid).casefold()))
+        )
+        return (natural_id, int(original_index))
+
     status = str((data or {}).get("status", "unknown")).strip().lower()
     strategy_bucket = host._get_perfect_strategy_bucket(data)
     total_boxes = len(list((data or {}).get("characters", []) or [])) if isinstance(data, dict) else 0
 
     if mode_key == "DEFAULT":
-        return (0, int(original_index))
+        gold_state = data.get("gold_state") if isinstance(data, dict) else {}
+        excluded = bool(
+            gold_state.get("excluded", False)
+        ) if isinstance(gold_state, dict) else False
+
+        # Domyślna lista ma trzy stabilne grupy:
+        #   0. pozostałe (OK, ZATWIERDŹ/niebieskie, inne neutralne),
+        #   1. czerwone rekordy wymagające korekty,
+        #   2. N / wykluczone.
+        # Zachowujemy kolejność źródłową wewnątrz każdej grupy.
+        if excluded:
+            group = 2
+        elif status == "needs_fix" and not _review_ready(host, data):
+            group = 1
+        else:
+            group = 0
+        return (group, int(original_index))
 
     if mode_key == "OK":
         if status == "perfect":
@@ -131,6 +175,12 @@ def get_preview_sort_priority(host: "CharacterAnnotationTab", pid: str, data: di
         if status == "needs_fix":
             return (1, -int(total_boxes), int(original_index))
         return (2, -int(total_boxes), int(original_index))
+
+    if mode_key == "GT_Z2":
+        return (
+            0 if preview_has_inherited_z2_gt(data) else 1,
+            int(original_index),
+        )
 
     if mode_key in {"1R", "2R"}:
         matches_layout = preview_layout_group_matches(host, data, mode_key)
@@ -170,8 +220,6 @@ def get_preview_sort_priority(host: "CharacterAnnotationTab", pid: str, data: di
 def get_sorted_preview_plate_ids(host: "CharacterAnnotationTab", ordered_pids):
     base_order = list(ordered_pids or [])
     mode_key = host._get_preview_sort_mode_key()
-    if mode_key == "DEFAULT":
-        return base_order
 
     indexed = list(enumerate(base_order))
     indexed.sort(
@@ -207,6 +255,15 @@ def get_preview_box_variants(host: "CharacterAnnotationTab", data: dict) -> dict
     if not isinstance(data, dict):
         data = {}
     canonical_chars = host._sort_character_records_by_x(data.get("characters", []))
+
+    raw_detection = data.get("raw_detection")
+    if isinstance(raw_detection, dict):
+        raw_result = host._sort_character_records_by_x(
+            raw_detection.get("characters", [])
+        )
+    else:
+        raw_result = []
+
     yolo_filtered = host._sort_character_records_by_x(data.get("yolo_detections", []))
     yolo_nms = host._sort_character_records_by_x(data.get("yolo_nms_detections", []))
     yolo_raw = host._sort_character_records_by_x(data.get("yolo_raw_detections", []))
@@ -219,6 +276,8 @@ def get_preview_box_variants(host: "CharacterAnnotationTab", data: dict) -> dict
         yolo_filtered = host._sort_character_records_by_x(yolo_from_canonical)
 
     return {
+        "GT_RESULT": limit_boxes_to_gt(host, data, raw_result)[0],
+        "RAW_RESULT": raw_result,
         "FINAL": canonical_chars,
         "YOLO_FILTERED": yolo_filtered,
         "YOLO_NMS": yolo_nms,
@@ -226,27 +285,68 @@ def get_preview_box_variants(host: "CharacterAnnotationTab", data: dict) -> dict
     }
 
 
+def resolve_preview_box_source(data: dict, mode_key: str) -> str:
+    """Choose the stage without changing RAW, review records, or their status."""
+    if mode_key != "AUTO":
+        return mode_key
+    data = data if isinstance(data, dict) else {}
+    review = data.get("review_state")
+    review_started = isinstance(review, dict) and bool(review.get("status"))
+    if data.get("characters") or review_started:
+        # An intentionally emptied review must not resurrect predicted boxes.
+        return "FINAL"
+    if isinstance(data.get("raw_detection"), dict):
+        # A frozen empty prediction is also a result, not a reason to show
+        # intermediate proposals rejected by the pipeline.
+        return "RAW_RESULT"
+    for mode, field in (
+        ("YOLO_FILTERED", "yolo_detections"),
+        ("YOLO_NMS", "yolo_nms_detections"),
+        ("YOLO_RAW", "yolo_raw_detections"),
+    ):
+        if data.get(field):
+            return mode
+    return "FINAL"
+
+
+def restore_preview_stage_mode(host: "CharacterAnnotationTab", metadata: dict) -> None:
+    """Recover old forced FINAL selection when opening an unreviewed RAW run."""
+    mode = host._get_preview_box_mode_key()
+    if mode == "GT_RESULT":
+        host.preview_box_mode_var.set(host._get_preview_box_mode_label("AUTO"))
+        host._save_local_setting("char_preview_box_mode", "AUTO")
+        return
+    if mode != "FINAL":
+        return
+    if any(resolve_preview_box_source(data, "AUTO") in {"RAW_RESULT", "GT_RESULT"}
+           for data in metadata.values()):
+        host.preview_box_mode_var.set(host._get_preview_box_mode_label("AUTO"))
+        host._save_local_setting("char_preview_box_mode", "AUTO")
+
+
 def get_preview_box_records(host: "CharacterAnnotationTab", data: dict):
-    variants = get_preview_box_variants(host, data)
-    method_name = host._get_detection_method_key()
-    mode_key = host._get_preview_box_mode_key()
-
-    if mode_key == "AUTO":
-        final_records = list(variants.get("FINAL", []) or [])
-        if final_records:
-            return final_records, "FINAL"
-        if method_name == "YOLO":
-            for candidate_key in ("YOLO_FILTERED", "YOLO_NMS", "YOLO_RAW"):
-                candidate_records = variants.get(candidate_key, [])
-                if candidate_records:
-                    return candidate_records, candidate_key
-        for candidate_key in ("YOLO_FILTERED", "YOLO_NMS", "YOLO_RAW"):
-            candidate_records = variants.get(candidate_key, [])
-            if candidate_records:
-                return candidate_records, candidate_key
-        return final_records, "FINAL"
-
-    return variants.get(mode_key, []), mode_key
+    data = data if isinstance(data, dict) else {}
+    mode_key = resolve_preview_box_source(data, host._get_preview_box_mode_key())
+    if mode_key in {"RAW_RESULT", "GT_RESULT"}:
+        raw = data.get("raw_detection")
+        records = raw.get("characters", []) if isinstance(raw, dict) else []
+        if mode_key == "GT_RESULT":
+            return limit_boxes_to_gt(host, data, records)[0], mode_key
+    else:
+        field = {
+            "FINAL": "characters",
+            "YOLO_FILTERED": "yolo_detections",
+            "YOLO_NMS": "yolo_nms_detections",
+            "YOLO_RAW": "yolo_raw_detections",
+        }.get(mode_key)
+        records = data.get(field, []) if field else []
+        if mode_key == "YOLO_FILTERED" and not records:
+            records = [rec for rec in data.get("characters", []) or []
+                       if isinstance(rec, dict)
+                       and str(rec.get("method", "")).strip().lower() == "yolo"]
+    # Navigation only needs the displayed layer; diagnostic proposals can be
+    # orders of magnitude larger than the frozen pipeline result.
+    return host._sort_character_records_by_x(records), mode_key
 
 
 def characters_to_text(host: "CharacterAnnotationTab", chars, data=None) -> str:
@@ -377,6 +477,22 @@ def format_preview_record_source_label(host: "CharacterAnnotationTab", data: dic
     return f"Źródło rekordu: {source_label}", tone
 
 
+def _review_ready(host, data) -> bool:
+    if not isinstance(data, dict):
+        return False
+
+    gold_state = data.get("gold_state")
+    if isinstance(gold_state, dict) and bool(gold_state.get("excluded", False)):
+        # N is terminal in the PZ2 presentation and must suppress ZATWIERDŹ.
+        return False
+
+    if (data.get("review_state") or {}).get("status") != "in_progress":
+        return False
+
+    check = getattr(host, "_get_review_quality_status", None)
+    return bool(callable(check) and check(data) == "perfect")
+
+
 def format_plate_listbox_label(host: "CharacterAnnotationTab", plate_id: str, data: dict, *,
                               ordinal: int | None = None, evaluate_status: bool = True) -> str:
     try:
@@ -399,8 +515,16 @@ def format_plate_listbox_label(host: "CharacterAnnotationTab", plate_id: str, da
     if ordinal is None:
         ordinal = host._get_plate_listbox_ordinal(plate_id)
 
-    if status == "perfect":
+    gold_state = data.get("gold_state") if isinstance(data, dict) else {}
+    excluded = bool(gold_state.get("excluded", False)) if isinstance(gold_state, dict) else False
+    ready = _review_ready(host, data)
+
+    if excluded:
+        icon = "⚫"
+    elif status == "perfect":
         icon = "🟢"
+    elif ready:
+        icon = "🔵"
     elif status == "needs_fix":
         icon = "🔴"
     else:
@@ -408,8 +532,13 @@ def format_plate_listbox_label(host: "CharacterAnnotationTab", plate_id: str, da
 
     prefix = f"{ordinal}. " if ordinal is not None else ""
     flags = []
-    if status == "perfect":
+    if excluded:
+        # N overrides both ZATWIERDŹ and OK in the visible list state.
+        flags.append("N")
+    elif status == "perfect":
         flags.append("OK")
+    elif ready:
+        flags.append("ZATWIERDŹ")
     layout_flag = host._get_plate_listbox_layout_flag(data)
     if layout_flag:
         flags.append(layout_flag)
@@ -426,8 +555,13 @@ def get_plate_row_foreground(host: "CharacterAnnotationTab", status: str) -> str
     status = str(status or "unknown").strip().lower()
     palette = getattr(host.app, "palette", {})
 
+    if status == "excluded":
+        return palette.get("muted", "#8b949e")
     if status == "perfect":
         return palette.get("success", "#27ae60")
+    if status == "ready_for_approval":
+        # "info" is olive/greenish in current themes. This role is always blue.
+        return palette.get("model_role_vehicle", "#3b82f6")
     if status == "needs_fix":
         return palette.get("error", "#c0392b")
     return palette.get("muted_dim", "#444444")
@@ -435,12 +569,22 @@ def get_plate_row_foreground(host: "CharacterAnnotationTab", status: str) -> str
 
 def apply_plate_listbox_row_style(host: "CharacterAnnotationTab", row_index: int, status: str) -> None:
     try:
+        ids = getattr(host, "_listbox_pid_by_index", []) or []
+        if 0 <= row_index < len(ids):
+            data = (getattr(host, "preview_metadata", {}) or {}).get(ids[row_index])
+            gold_state = data.get("gold_state") if isinstance(data, dict) else {}
+            if isinstance(gold_state, dict) and bool(gold_state.get("excluded", False)):
+                status = "excluded"
+            elif _review_ready(host, data):
+                status = "ready_for_approval"
         fg = get_plate_row_foreground(host, status)
-        _select_bg, select_fg = host.app.get_list_selection_colors()
+        select_bg, _select_fg = host.app.get_list_selection_colors()
         host.plates_listbox.itemconfig(
             row_index,
             foreground=fg,
-            selectforeground=select_fg,
+            # Keep the status colour on the active/selected list row too.
+            selectforeground=fg,
+            selectbackground=select_bg,
         )
     except Exception as e:
         logger.debug(f"Nie udało się ustawić stylu wiersza listy [{row_index}]: {e}")
@@ -460,11 +604,42 @@ def refresh_preview_import_focus_ui(host: "CharacterAnnotationTab") -> None:
     known_count = len(matching_ids)
     active = bool(getattr(host, "_preview_import_focus_active", False) and matching_ids)
 
+    material_button = getattr(host, "preview_add_material_btn", None)
+    export_button = getattr(host, "preview_export_material_btn", None)
+    project_append_available = bool(
+        material_button is not None
+        and getattr(host, "_step3_linear_mode", False)
+    )
+    export_available = bool(export_button is not None and (
+        project_append_available or any(
+            isinstance(row, dict) and row.get("crop_id")
+            for row in getattr(host, "preview_metadata", {}).values()
+        )
+    ))
+
+    if material_button is not None:
+        try:
+            if project_append_available:
+                material_button.grid()
+            else:
+                material_button.grid_remove()
+        except Exception:
+            pass
+
+    if export_button is not None:
+        try:
+            if export_available:
+                export_button.grid()
+            else:
+                export_button.grid_remove()
+        except Exception:
+            pass
+
     if frame is not None:
         try:
-            if known_count:
+            if known_count or project_append_available or export_available:
                 if not str(frame.winfo_manager()):
-                    frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+                    frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
             elif str(frame.winfo_manager()):
                 frame.grid_remove()
         except Exception:
@@ -474,7 +649,7 @@ def refresh_preview_import_focus_ui(host: "CharacterAnnotationTab") -> None:
         try:
             button.configure(
                 state=(tk.NORMAL if known_count else tk.DISABLED),
-                text=("Pokaż wszystkie tablice" if active else f"Pokaż tylko zaimportowane ({known_count})"),
+                text=("Pokaż wszystkie tablice" if active else f"Pokaż tylko dodane ({known_count})"),
             )
         except Exception:
             pass
@@ -483,14 +658,14 @@ def refresh_preview_import_focus_ui(host: "CharacterAnnotationTab") -> None:
         if active:
             host._set_inline_status_label_state(
                 hint,
-                text=f"Widok zawężony do ostatniego importu CVAT: {known_count} tablic.",
+                text=f"Widok zawężony do ostatnio dodanego materiału: {known_count} tablic.",
                 tone="success",
                 emphasis=False,
             )
         else:
             host._set_inline_status_label_state(
                 hint,
-                text=f"Ostatni import CVAT zaktualizował {known_count} tablic. Użyj widoku zaimportowanych, aby szybko je sprawdzić.",
+                text=f"Ostatnio dodany materiał obejmuje {known_count} tablic. Użyj tego widoku, aby szybko je sprawdzić.",
                 tone="muted",
                 emphasis=False,
             )
@@ -605,6 +780,38 @@ def apply_preview_sort_bar_style(
                     pass
 
     active_key = host._get_preview_sort_mode_key()
+
+    sort_cta = getattr(host, "preview_sort_cta", None)
+    if sort_cta is not None:
+        active_label = str(sort_labels.get(active_key, active_key) or active_key)
+        tone_key = sort_color_keys.get(active_key, "muted")
+        accent = palette.get(tone_key, palette.get("accent", "#4aa3ff"))
+        cta_bg = blend_hex_colors(accent, shell_bg, 0.82)
+        cta_active_bg = blend_hex_colors(accent, shell_bg, 0.66)
+        cta_fg = host._get_readable_text_color(
+            cta_bg,
+            preferred=palette.get("fg", "#f3f3f3"),
+        )
+        try:
+            sort_cta.configure(
+                text=f"Sortowanie: {active_label}  ▾",
+                bg=cta_bg,
+                fg=cta_fg,
+                activebackground=cta_active_bg,
+                activeforeground=host._get_readable_text_color(
+                    cta_active_bg,
+                    preferred=cta_fg,
+                ),
+                highlightbackground=border,
+                highlightcolor=accent,
+                highlightthickness=1,
+                bd=0,
+                relief=tk.FLAT,
+                font=("Segoe UI", 8, "bold"),
+            )
+        except Exception:
+            pass
+
     hover_key = str(getattr(host, "_preview_sort_hover_key", "") or "").strip().upper()
     for mode_key, button in getattr(host, "preview_sort_buttons", {}).items():
         if button is None:
@@ -645,5 +852,3 @@ def apply_preview_sort_bar_style(
             )
         except Exception:
             pass
-
-

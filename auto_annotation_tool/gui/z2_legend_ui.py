@@ -100,10 +100,17 @@ def build_preview_controls_context_rows(owner) -> list[tuple[str, str, str, str]
     plate_total = int(context.get("plate_total", 0) or 0)
     plate_fill = theme["badge_plate_multi_fill"] if plate_total > 1 else theme["badge_plate_fill"]
     plate_outline = theme["badge_plate_multi_outline"] if plate_total > 1 else theme["badge_plate_outline"]
+    image_label = str(context.get("image_label") or "Zdjęcie").strip() or "Zdjęcie"
+    image_text = str(context.get("image_text") or "")
+    for prefix in ("Zdjęcie: ", "Kontrola: "):
+        if image_text.startswith(prefix):
+            image_text = image_text[len(prefix):]
+            break
+
     rows = [
         (
-            "Zdjęcie",
-            str(context.get("image_text") or "").replace("Zdjęcie: ", ""),
+            image_label,
+            image_text,
             theme["badge_image_fill"],
             theme["badge_image_outline"],
         ),
@@ -121,10 +128,16 @@ def build_preview_controls_context_rows(owner) -> list[tuple[str, str, str, str]
         ),
     ]
     if str(context.get("pool_text") or "").strip():
+        pool_label = str(context.get("pool_label") or "Pula").strip() or "Pula"
+        pool_text = str(context.get("pool_text") or "")
+        for prefix in ("Pula O: ", "Pula: "):
+            if pool_text.startswith(prefix):
+                pool_text = pool_text[len(prefix):]
+                break
         rows.append(
             (
-                "Pula",
-                str(context.get("pool_text") or "").replace("Pula: ", ""),
+                pool_label,
+                pool_text,
                 theme["entry_fill"],
                 theme["panel_outline"],
             )
@@ -513,6 +526,9 @@ def _bind_preview_controls_interactive_items(owner, canvas) -> None:
 
 def refresh_preview_controls_legend(owner):
     if not bool(getattr(owner, "_startup_ui_ready", False)):
+        return
+    if not bool(getattr(owner, "_preview_fullscreen_active", False)):
+        owner._hide_preview_controls_legend_overlay()
         return
     if not bool(getattr(owner, "_preview_controls_legend_visible", True)):
         owner._hide_preview_controls_legend_overlay()

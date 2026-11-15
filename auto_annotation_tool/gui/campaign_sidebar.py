@@ -10,13 +10,47 @@ from .app_theme_definitions import CAMPAIGN_SIDEBAR_STYLE as STYLE
 class ProjectSidebarToggle(tk.Canvas):
     """One stationary, keyboard-accessible control for both sidebar states."""
 
-    def __init__(self, parent, palette, command, *, collapsed_text="Pokaż projekty", expanded_text="Ukryj panel"):
+    def __init__(
+        self,
+        parent,
+        palette,
+        command,
+        *,
+        collapsed_text="Pokaż projekty",
+        expanded_text="Ukryj panel",
+        orientation="horizontal",
+        side="right",
+    ):
         self.collapsed_text, self.expanded_text = collapsed_text, expanded_text
+        self.orientation = str(orientation or "horizontal").strip().lower()
+        self.side = str(side or "right").strip().lower()
         self._font = tkfont.Font(root=parent, font=STYLE["button_font"])
-        width = max(self._font.measure(text) for text in (collapsed_text, expanded_text)) + 66
-        height = max(STYLE["button_height"], self._font.metrics("linespace") + 18)
-        super().__init__(parent, width=width, height=height, bd=0, highlightthickness=0,
-                         takefocus=True, cursor="hand2")
+        if self.orientation == "vertical":
+            width = 30
+            text_extent = max(
+                self._font.measure(text)
+                for text in (collapsed_text, expanded_text)
+            )
+            height = max(96, text_extent + 42)
+        elif self.orientation == "horizontal_tab":
+            text_extent = max(
+                self._font.measure(text)
+                for text in (collapsed_text, expanded_text)
+            )
+            width = max(86, text_extent + 46)
+            height = 30
+        else:
+            width = max(self._font.measure(text) for text in (collapsed_text, expanded_text)) + 66
+            height = max(STYLE["button_height"], self._font.metrics("linespace") + 18)
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bd=0,
+            highlightthickness=0,
+            takefocus=True,
+            cursor="hand2",
+        )
         self.palette = palette
         self.command = command
         self.collapsed = False
@@ -39,14 +73,96 @@ class ProjectSidebarToggle(tk.Canvas):
         self.delete("all")
         p = self.palette
         self.configure(bg=p["panel"])
-        self.create_rectangle(1, 1, self._width-1, self._height-1, width=2, tags=("shell",))
-        cy = self._height / 2
-        self.create_rectangle(10, cy-10, 30, cy+10, outline=p["accent"], width=1.5)
-        self.create_rectangle(24, cy-8, 28, cy+8, fill=p["accent"], outline="")
-        points = (45, cy-6, 39, cy, 45, cy+6) if self.collapsed else (39, cy-6, 45, cy, 39, cy+6)
-        self.create_line(*points, fill=p["fg"], width=2.5, capstyle="round", joinstyle="round", tags=("direction",))
-        self.create_text(56, cy, anchor="w", text=self.collapsed_text if self.collapsed else self.expanded_text,
-                         font=self._font, fill=p["fg"], tags=("label",))
+
+        if self.orientation == "vertical":
+            self.create_rectangle(
+                1, 1, self._width - 1, self._height - 1,
+                width=1, tags=("shell",),
+            )
+            points_right = bool(
+                (self.side == "left" and self.collapsed)
+                or (self.side == "right" and not self.collapsed)
+            )
+            cy = 15
+            points = (
+                (20, cy, 10, cy - 6, 10, cy + 6)
+                if points_right
+                else (8, cy, 18, cy - 6, 18, cy + 6)
+            )
+            self.create_polygon(
+                *points,
+                fill=p["fg"],
+                outline="",
+                tags=("direction",),
+            )
+            label = self.collapsed_text if self.collapsed else self.expanded_text
+            angle = 90 if self.side == "left" else 270
+            self.create_text(
+                self._width / 2,
+                (self._height / 2) + 10,
+                text=label,
+                angle=angle,
+                font=self._font,
+                fill=p["fg"],
+                tags=("label",),
+            )
+        elif self.orientation == "horizontal_tab":
+            self.create_rectangle(
+                1, 1, self._width - 1, self._height - 1,
+                width=1, tags=("shell",),
+            )
+            cx = 15
+            cy = self._height / 2
+            points = (
+                (cx - 6, cy + 3, cx, cy - 4, cx + 6, cy + 3)
+                if self.collapsed
+                else (cx - 6, cy - 3, cx, cy + 4, cx + 6, cy - 3)
+            )
+            self.create_polygon(
+                *points,
+                fill=p["fg"],
+                outline="",
+                tags=("direction",),
+            )
+            self.create_text(
+                30,
+                cy,
+                anchor="w",
+                text=self.collapsed_text if self.collapsed else self.expanded_text,
+                font=self._font,
+                fill=p["fg"],
+                tags=("label",),
+            )
+        else:
+            self.create_rectangle(
+                1, 1, self._width - 1, self._height - 1,
+                width=2, tags=("shell",),
+            )
+            cy = self._height / 2
+            self.create_rectangle(10, cy-10, 30, cy+10, outline=p["accent"], width=1.5)
+            self.create_rectangle(24, cy-8, 28, cy+8, fill=p["accent"], outline="")
+            points = (
+                (45, cy-6, 39, cy, 45, cy+6)
+                if self.collapsed
+                else (39, cy-6, 45, cy, 39, cy+6)
+            )
+            self.create_line(
+                *points,
+                fill=p["fg"],
+                width=2.5,
+                capstyle="round",
+                joinstyle="round",
+                tags=("direction",),
+            )
+            self.create_text(
+                56,
+                cy,
+                anchor="w",
+                text=self.collapsed_text if self.collapsed else self.expanded_text,
+                font=self._font,
+                fill=p["fg"],
+                tags=("label",),
+            )
         self._paint_state()
 
     def _paint_state(self):

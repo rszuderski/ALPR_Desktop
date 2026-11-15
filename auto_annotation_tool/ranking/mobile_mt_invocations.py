@@ -1,3 +1,4 @@
+# Z4MOBREV032_FIX02_CURRENT_SHA_CANVAS_20261023
 """Validated MT backend invocations, independent of subjects and OCR predictions."""
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -15,6 +16,25 @@ IDENTITY_FIELDS = ("session_id", "scene_generation", "visual_epoch", "camera_tra
 
 def true(value):
     return value is True or str(value).lower() in {"true", "1", "yes"}
+
+def _optional_bool(value):
+    if value in (None, ""):
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    text = str(value).strip().lower()
+
+    if text in {"true", "1", "yes"}:
+        return True
+
+    if text in {"false", "0", "no"}:
+        return False
+
+    raise ValueError(
+        f"Nieprawidłowa wartość logiczna MT: {value}"
+    )
 
 
 def _canonical(value):
@@ -94,10 +114,122 @@ class MtInvocationGroup:
         return self.evidence_entries[0] if self.evidence_entries else ""
 
 
-def group_mt_invocations(attempts: dict[str, dict], session_id: str) -> dict[str, MtInvocationGroup]:
+def group_mt_invocations(
+    attempts: dict[str, dict],
+    session_id: str,
+    *,
+    strict_contract: bool = False,
+) -> dict[str, MtInvocationGroup]:
     buckets = {}
+
     for row in attempts.values():
-        key = str(row.get("mt_invocation_id") or row["id"])
+        invocation_id = str(
+            row.get("mt_invocation_id") or ""
+        ).strip()
+
+        if strict_contract:
+            status = str(
+                row.get("mt_status") or ""
+            ).strip().upper()
+
+            executed = _optional_bool(
+                row.get("mt_executed")
+            )
+
+            detection_count = row.get(
+                "mt_detection_count"
+            )
+
+            detection_index = row.get(
+                "mt_detection_index"
+            )
+
+            if status not in (
+                EXECUTED_STATUSES | {"NOT_RUN"}
+            ):
+                raise ValueError(
+                    f"Nieprawidłowy status MT: {status!r}"
+                )
+
+            # Jeśli backend MT został uruchomiony,
+            # wywołanie musi mieć swoją tożsamość.
+            if executed is True and not invocation_id:
+                raise ValueError(
+                    "Wykonane MT wymaga mt_invocation_id."
+                )
+
+            # Statusy powstałe po wejściu do backendu
+            # muszą odpowiadać rzeczywistemu wywołaniu.
+            if status in EXECUTED_STATUSES:
+                if executed is not True:
+                    raise ValueError(
+                        f"Status {status} wymaga mt_executed=true."
+                    )
+
+                if not invocation_id:
+                    raise ValueError(
+                        f"Status {status} wymaga mt_invocation_id."
+                    )
+
+            # NOT_RUN oznacza, że backend w ogóle
+            # nie został wywołany.
+            if status == "NOT_RUN":
+                if executed is not False:
+                    raise ValueError(
+                        "NOT_RUN wymaga mt_executed=false."
+                    )
+
+                if invocation_id:
+                    raise ValueError(
+                        "NOT_RUN nie może mieć mt_invocation_id."
+                    )
+
+                if detection_count not in (None, ""):
+                    raise ValueError(
+                        "NOT_RUN nie może mieć mt_detection_count."
+                    )
+
+                if detection_index not in (None, ""):
+                    raise ValueError(
+                        "NOT_RUN nie może mieć mt_detection_index."
+                    )
+
+            # Faktyczne wywołanie bez detekcji.
+            if status == "NO_DETECTION":
+                if detection_count in (None, ""):
+                    raise ValueError(
+                        "NO_DETECTION wymaga mt_detection_count=0."
+                    )
+
+                if _integer(detection_count) != 0:
+                    raise ValueError(
+                        "NO_DETECTION wymaga mt_detection_count=0."
+                    )
+
+                if detection_index not in (None, ""):
+                    raise ValueError(
+                        "NO_DETECTION nie może mieć mt_detection_index."
+                    )
+
+            # Każda rzeczywista detekcja jest jednym
+            # rekordem N-elementowego wyniku.
+            if status in DETECTION_STATUSES:
+                if detection_count in (None, ""):
+                    raise ValueError(
+                        "Detekcja MT wymaga mt_detection_count."
+                    )
+
+                if _integer(detection_count) <= 0:
+                    raise ValueError(
+                        "Detekcja MT wymaga mt_detection_count > 0."
+                    )
+
+                if detection_index in (None, ""):
+                    raise ValueError(
+                        "Detekcja MT wymaga mt_detection_index."
+                    )
+
+        key = invocation_id or str(row["id"])
         buckets.setdefault(key, []).append(row)
     groups = {}
     for key, rows in buckets.items():
@@ -154,8 +286,9 @@ def group_mt_invocations(attempts: dict[str, dict], session_id: str) -> dict[str
 
 
 def calculate_mt_invocations(session):
+    from .mobile_mt_postdedup import eligible_suppressed_id, post_nms_proof
     names = ("evaluable_mt_invocations", "mt_successful_invocations", "mt_no_detection_invocations",
-             "mt_invalid_quad_invocations", "mt_multi_plate_invocations", "mt_uncertain_invocations", "mt_false_detections",
+             "mt_invalid_quad_invocations", "mt_multi_plate_invocations", "mt_uncertain_invocations", "mt_false_detections", "mt_raw_suppressed_candidates",
              "mt_execution_error_invocations")
     counts = dict.fromkeys(names, 0)
     results = []
@@ -163,12 +296,18 @@ def calculate_mt_invocations(session):
                              if decision.get("is_plate") is False}
     for key, group in session.mt_invocations.items():
         annotation = session.invocation_annotation(key)
+        trace_proof = post_nms_proof(session, key)
+        discarded = eligible_suppressed_id(session, key)
         visible = annotation.get("visible_plate_count")
         evidence = any(entry in session.entry_names for entry in group.evidence_entries)
         active = group.executed and not group.cancelled and not group.execution_failed
-        included = active and annotation.get("evaluable") is True and evidence and visible == "one"
+        canvas_review = "canvas_review_v1" in annotation
+        included = active and annotation.get("evaluable") is True and evidence and visible == "one" and not canvas_review
         valid, invalid, false = False, False, 0
         for row in group.records:
+            if discarded and str(row.get("id") or "") == discarded:
+                # Raw pre-NMS candidate: not a final TP or FP.
+                continue
             child = session.review.attempt_annotations.get(row["id"], {})
             is_plate = False if row["id"] in false_sample_attempts else child.get("is_plate")
             if visible == "none":
@@ -190,9 +329,13 @@ def calculate_mt_invocations(session):
         elif group.execution_failed:
             outcome = "execution_error"
             counts["mt_execution_error_invocations"] += 1
+        if canvas_review:
+            false = 0  # Assisted canvas FP have a separate explicit denominator.
+            outcome = "canvas_review_separate"
         counts["mt_false_detections"] += false
-        counts["mt_multi_plate_invocations"] += active and visible == "multiple"
-        counts["mt_uncertain_invocations"] += active and visible == "uncertain"
+        counts["mt_raw_suppressed_candidates"] += int(bool(discarded))
+        counts["mt_multi_plate_invocations"] += active and visible == "multiple" and not canvas_review
+        counts["mt_uncertain_invocations"] += active and visible == "uncertain" and not canvas_review
         if included:
             counts["evaluable_mt_invocations"] += 1
             if valid:
@@ -206,7 +349,9 @@ def calculate_mt_invocations(session):
                         "executed": group.executed, "execution_failed": group.execution_failed,
                         "execution_errors": list(group.execution_errors),
                         "visible_plate_count": visible, "included": bool(included), "outcome": outcome,
-                        "false_detections": false, "decision_source": annotation.get("decision_source", "operator")})
+                        "false_detections": false, "raw_detection_count": (trace_proof["raw"] if trace_proof else group.detection_count),
+            "post_nms_detection_count": (trace_proof["after_dedup"] if trace_proof else None),
+            "raw_suppressed_candidates": int(bool(discarded)), "decision_source": annotation.get("decision_source", "operator")})
     denominator = counts["evaluable_mt_invocations"]
     counts["mt_localization_success_rate"] = counts["mt_successful_invocations"] / denominator if denominator else None
     if not session.attempts_available:

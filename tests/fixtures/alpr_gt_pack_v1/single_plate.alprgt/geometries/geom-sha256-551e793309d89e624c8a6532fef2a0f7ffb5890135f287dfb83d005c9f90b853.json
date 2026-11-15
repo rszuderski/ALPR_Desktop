@@ -1,0 +1,25 @@
+{
+  "geometry_id": "geom-sha256-551e793309d89e624c8a6532fef2a0f7ffb5890135f287dfb83d005c9f90b853",
+  "parents": [],
+  "plate_id": "plate-ann-fixture-single",
+  "points": [
+    [
+      0.1,
+      0.2
+    ],
+    [
+      0.75,
+      0.2
+    ],
+    [
+      0.75,
+      0.7
+    ],
+    [
+      0.1,
+      0.7
+    ]
+  ],
+  "schema": "alpr.gt.geometry.v1",
+  "type": "polygon4-normalized"
+}

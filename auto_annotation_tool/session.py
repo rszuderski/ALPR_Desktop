@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
+from alpr_runtime import user_data_root, workspace_root
 
 logger = logging.getLogger("AutoAnnotationTool")
 
@@ -23,8 +24,8 @@ class SessionManager:
             session_file: Ścieżka do pliku sesji. Jeśli None, używa domyślnego.
         """
         if session_file is None:
-            # Domyślnie: ~/.auto_annotation_tool/session.json
-            app_data_dir = Path.home() / ".auto_annotation_tool"
+            # Separate release preferences; never overwrite the old application's profile.
+            app_data_dir = user_data_root()
             app_data_dir.mkdir(parents=True, exist_ok=True)
             session_file = app_data_dir / "session.json"
         
@@ -48,7 +49,7 @@ class SessionManager:
     
     def _get_default_session(self) -> Dict[str, Any]:
         """Zwróć domyślne ustawienia sesji."""
-        default_output = str(Path.home() / "Auto-Annotation-Tool-Output")
+        default_output = str(workspace_root())
         
         return {
             "rectification": {

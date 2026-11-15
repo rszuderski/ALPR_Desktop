@@ -11,6 +11,11 @@ from .z3_metadata_cache import mark_preview_metadata_changed, PreviewMetadataAut
 import tkinter as tk
 
 from ..config import logger
+from ..plate_ground_truth import normalize_plate_ground_truth_text
+from .z3_gt_contract import (
+    canonical_raw_detection_hash,
+    revision_ids_from_data,
+)
 
 
 def _is_exportable_character_record(self, rec) -> bool:
@@ -39,8 +44,62 @@ def _derive_preview_status_from_characters(self, chars) -> str:
             valid_count += 1
     return "perfect" if valid_count == len(chars) and valid_count > 0 else "needs_fix"
 
+def _get_preview_ground_truth_text(self, data: dict | None = None) -> str:
+    source_data = data if isinstance(data, dict) else self._get_preview_active_data(create=False)
+    if not isinstance(source_data, dict):
+        return ""
+
+    direct = normalize_plate_ground_truth_text(
+        source_data.get("ground_truth_text")
+    )
+    if direct:
+        return direct
+
+    attrs = source_data.get("plate_attributes")
+    if isinstance(attrs, dict):
+        nested = normalize_plate_ground_truth_text(
+            attrs.get("ground_truth_text")
+        )
+        if nested:
+            return nested
+    return ""
+
+
+def _preview_uses_plate_gt_contract(self, data: dict | None = None) -> bool:
+    source_data = data if isinstance(data, dict) else self._get_preview_active_data(create=False)
+    if not isinstance(source_data, dict):
+        return False
+
+    if source_data.get("working_annotation"):
+        return True
+    if self._get_preview_ground_truth_text(source_data):
+        return True
+
+    for field_name in (
+        "source_annotation_id",
+        "plate_annotation_id",
+        "ground_truth_source",
+    ):
+        if str(source_data.get(field_name, "") or "").strip():
+            return True
+
+    attrs = source_data.get("plate_attributes")
+    if isinstance(attrs, dict):
+        for field_name in (
+            "plate_annotation_id",
+            "ground_truth_source",
+            "ground_truth_text",
+        ):
+            if str(attrs.get(field_name, "") or "").strip():
+                return True
+
+    return False
+
+
 def _preview_has_reference_text_source(self, data: dict | None = None) -> bool:
     source_data = data if isinstance(data, dict) else self._get_preview_active_data(create=False)
+    if self._preview_uses_plate_gt_contract(source_data):
+        return True
     return any(bool(value) for value in self._get_preview_reference_text_values(source_data))
 
 def _get_preview_reference_text_values(self, data: dict | None = None) -> list[str]:
@@ -99,6 +158,10 @@ def _merge_preview_expected_text_values(*groups) -> list[str]:
 
 def _get_preview_filename_expected_texts(self, data: dict | None = None) -> list[str]:
     source_data = data if isinstance(data, dict) else self._get_preview_active_data(create=False)
+    if self._preview_uses_plate_gt_contract(source_data):
+        return []
+    if isinstance(source_data, dict) and source_data.get("source_expected_text_source") == "mobile_crop_human_review":
+        return []
     normalized = []
     seen = set()
     for candidate in self._get_preview_reference_text_values(source_data):
@@ -139,6 +202,11 @@ def _should_merge_filename_expected_texts(data: dict | None, explicit_values: li
 
 def _get_preview_expected_texts(self, data: dict | None = None) -> list[str]:
     source_data = data if isinstance(data, dict) else self._get_preview_active_data(create=False)
+
+    if self._preview_uses_plate_gt_contract(source_data):
+        ground_truth_text = self._get_preview_ground_truth_text(source_data)
+        return [ground_truth_text] if ground_truth_text else []
+
     filename_values = self._get_preview_filename_expected_texts(source_data if isinstance(source_data, dict) else None)
     if isinstance(source_data, dict):
         for field_name in ("source_expected_texts", "expected_texts", "ground_truth_texts"):
@@ -180,6 +248,9 @@ def _resolve_preview_expected_text_for_crop(self, data: dict | None = None, char
     if not isinstance(source_chars, list):
         source_chars = []
 
+    uses_gt_contract = self._preview_uses_plate_gt_contract(
+        source_data if isinstance(source_data, dict) else None
+    )
     expected_texts = self._get_preview_expected_texts(source_data if isinstance(source_data, dict) else None)
     expected_texts = [
         str(text or "").strip().upper()
@@ -191,6 +262,82 @@ def _resolve_preview_expected_text_for_crop(self, data: dict | None = None, char
         candidate_text = self._characters_to_text(source_chars, data=source_data).strip().upper()
     except Exception:
         candidate_text = ""
+
+    if uses_gt_contract:
+        ground_truth_text = self._get_preview_ground_truth_text(source_data)
+        if not ground_truth_text:
+            return {
+                "candidate_text": candidate_text,
+                "expected_texts": [],
+                "expected_lengths": [],
+                "matched_text": "",
+                "target_text": "",
+                "target_length": 0,
+                "target_lengths": [],
+                "text_resolved": False,
+                "count_resolved": False,
+                "ambiguous": False,
+                "expected_source": "ground_truth",
+                "resolution": "missing_ground_truth",
+            }
+
+        attrs = source_data.get("plate_attributes") if isinstance(source_data, dict) else {}
+        attrs = attrs if isinstance(attrs, dict) else {}
+        ground_truth_source = str(
+            (source_data or {}).get("ground_truth_source")
+            or attrs.get("ground_truth_source")
+            or ""
+        ).strip().lower()
+        protected_z2_gt = bool(ground_truth_source == "manual_z2")
+
+        matched_text = (
+            ground_truth_text
+            if candidate_text and candidate_text == ground_truth_text
+            else ""
+        )
+
+        # Only inherited Z2 GT may resolve/count the expected number of boxes.
+        # Local manual_z3 or legacy/fallback text may remain visible as the
+        # saved number, but completeness of manual boxes is the operator's
+        # decision and must never be rendered as N/M.
+        if not protected_z2_gt:
+            return {
+                "candidate_text": candidate_text,
+                "expected_texts": [ground_truth_text],
+                "expected_lengths": [],
+                "matched_text": matched_text,
+                "target_text": "",
+                "target_length": 0,
+                "target_lengths": [],
+                "text_resolved": bool(matched_text),
+                "count_resolved": False,
+                "ambiguous": False,
+                "expected_source": "local_ground_truth",
+                "resolution": (
+                    "local_ground_truth_exact"
+                    if matched_text
+                    else "local_ground_truth_review"
+                ),
+            }
+
+        return {
+            "candidate_text": candidate_text,
+            "expected_texts": [ground_truth_text],
+            "expected_lengths": [len(ground_truth_text)],
+            "matched_text": matched_text,
+            "target_text": ground_truth_text,
+            "target_length": len(ground_truth_text),
+            "target_lengths": [len(ground_truth_text)],
+            "text_resolved": bool(matched_text),
+            "count_resolved": True,
+            "ambiguous": False,
+            "expected_source": "ground_truth",
+            "resolution": (
+                "ground_truth_exact"
+                if matched_text
+                else "ground_truth_expected"
+            ),
+        }
 
     expected_lengths = sorted({len(text) for text in expected_texts if text})
     matched_text = candidate_text if candidate_text and candidate_text in expected_texts else ""
@@ -227,10 +374,261 @@ def _resolve_preview_expected_text_for_crop(self, data: dict | None = None, char
         "text_resolved": bool(matched_text),
         "count_resolved": bool(count_resolved),
         "ambiguous": bool(expected_lengths and not count_resolved),
+        "expected_source": ("ground_truth" if uses_gt_contract else "legacy"),
         "resolution": resolution,
     }
 
+RAW_VALIDATION_SCHEMA = "alpr.pz2.raw_validation.v1"
+
+
+def _raw_validation_edit_distance(left: str, right: str) -> int:
+    left = str(left or "")
+    right = str(right or "")
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            current.append(
+                min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + cost,
+                )
+            )
+        previous = current
+    return int(previous[-1])
+
+
+def _build_raw_detection_validation(
+    self,
+    data: dict | None,
+    chars,
+) -> dict:
+    source_data = data if isinstance(data, dict) else {}
+    source_chars = list(chars or []) if isinstance(chars, list) else []
+
+    try:
+        candidate_text = str(
+            self._characters_to_text(
+                source_chars,
+                data=source_data,
+            )
+            or ""
+        ).strip().upper()
+    except TypeError:
+        candidate_text = str(
+            self._characters_to_text(source_chars) or ""
+        ).strip().upper()
+    except Exception:
+        candidate_text = ""
+
+    try:
+        uses_gt_contract = bool(
+            self._preview_uses_plate_gt_contract(source_data)
+        )
+    except Exception:
+        uses_gt_contract = False
+
+    try:
+        ground_truth_text = str(
+            self._get_preview_ground_truth_text(source_data)
+            or ""
+        ).strip().upper()
+    except Exception:
+        ground_truth_text = ""
+
+    expected_source = "ground_truth" if uses_gt_contract else "legacy"
+    if uses_gt_contract:
+        expected_texts = [ground_truth_text] if ground_truth_text else []
+    else:
+        try:
+            expected_texts = [
+                str(value or "").strip().upper()
+                for value in (
+                    self._get_preview_expected_texts(source_data)
+                    or []
+                )
+                if str(value or "").strip()
+            ]
+        except Exception:
+            expected_texts = []
+
+    target_text = ""
+    if uses_gt_contract:
+        target_text = ground_truth_text
+    elif len(expected_texts) == 1:
+        target_text = expected_texts[0]
+
+    detected_count = int(len(source_chars))
+    exportable_count = 0
+    for rec in source_chars:
+        try:
+            if self._is_exportable_character_record(rec):
+                exportable_count += 1
+        except Exception:
+            pass
+
+    try:
+        layout_conflict = bool(
+            self._preview_layout_separator_conflicts_with_chars(
+                source_data,
+                source_chars,
+            )
+        )
+    except Exception:
+        layout_conflict = False
+
+    reasons: list[str] = []
+    if not source_chars:
+        reasons.append("no_detection")
+    if exportable_count != detected_count:
+        reasons.append("invalid_character_or_box")
+    if layout_conflict:
+        reasons.append("layout_conflict")
+
+    if uses_gt_contract and not ground_truth_text:
+        reasons.append("missing_ground_truth")
+    elif not target_text and len(expected_texts) > 1:
+        reasons.append("ambiguous_reference")
+    elif target_text:
+        expected_count = len(target_text)
+        if detected_count < expected_count:
+            reasons.append("missing_boxes")
+        elif detected_count > expected_count:
+            reasons.append("extra_boxes")
+        if candidate_text != target_text:
+            reasons.append("text_mismatch")
+
+    exact_text_match = bool(
+        target_text
+        and candidate_text == target_text
+    )
+    exact_count_match = bool(
+        target_text
+        and detected_count == len(target_text)
+    )
+    box_count_error = (
+        int(detected_count - len(target_text))
+        if target_text
+        else None
+    )
+    box_count_abs_error = (
+        abs(int(box_count_error))
+        if box_count_error is not None
+        else None
+    )
+    geometry_ok = bool(
+        detected_count > 0
+        and exportable_count == detected_count
+        and not layout_conflict
+    )
+    perfect = bool(
+        target_text
+        and exact_text_match
+        and exact_count_match
+        and geometry_ok
+    )
+
+    if target_text:
+        edit_distance = _raw_validation_edit_distance(
+            candidate_text,
+            target_text,
+        )
+        cer = float(edit_distance) / float(
+            max(1, len(target_text))
+        )
+    else:
+        edit_distance = None
+        cer = None
+
+    raw_detection = source_data.get("raw_detection")
+    if isinstance(raw_detection, dict):
+        raw_result_hash = str(
+            raw_detection.get("result_hash") or ""
+        ).strip()
+        if not raw_result_hash:
+            raw_result_hash = canonical_raw_detection_hash(
+                raw_detection
+            )
+    else:
+        raw_result_hash = ""
+
+    gt_revision_ids = revision_ids_from_data(
+        source_data,
+        "source_gt_revision_ids",
+        "source_gt_revision_id",
+    )
+    geometry_revision_ids = revision_ids_from_data(
+        source_data,
+        "source_geometry_revision_ids",
+        "source_geometry_revision_id",
+    )
+
+    gt_revision_id = (
+        gt_revision_ids[0]
+        if len(gt_revision_ids) == 1
+        else None
+    )
+    geometry_revision_id = (
+        geometry_revision_ids[0]
+        if len(geometry_revision_ids) == 1
+        else None
+    )
+
+    return {
+        "schema": RAW_VALIDATION_SCHEMA,
+        "raw_contract": "gt_blind.v1",
+        "status": "perfect" if perfect else "needs_fix",
+        "reason_codes": list(dict.fromkeys(reasons)),
+        "expected_source": expected_source,
+        "raw_result_hash": raw_result_hash or None,
+        "gt_hash": str(
+            source_data.get("source_gt_hash") or ""
+        ).strip() or None,
+        "gt_revision_id": gt_revision_id,
+        "gt_revision_ids": list(gt_revision_ids),
+        "geometry_revision_id": geometry_revision_id,
+        "geometry_revision_ids": list(geometry_revision_ids),
+        "ground_truth_text": target_text or None,
+        "prediction_text": candidate_text,
+        "expected_char_count": len(target_text) if target_text else 0,
+        "detected_char_count": detected_count,
+        "exportable_char_count": int(exportable_count),
+        "exact_text_match": bool(exact_text_match),
+        "exact_count_match": bool(exact_count_match),
+        "exact_plate_match": bool(perfect),
+        "box_count_error": box_count_error,
+        "box_count_abs_error": box_count_abs_error,
+        "geometry_ok": bool(geometry_ok),
+        "layout_conflict": bool(layout_conflict),
+        "edit_distance": edit_distance,
+        "cer": round(float(cer), 8) if cer is not None else None,
+    }
+
+
 def _derive_preview_status_from_data(self, data: dict | None, chars) -> str:
+    # REVIEW requires explicit human approval before GOLD/perfect.
+    if isinstance(data, dict):
+        review_state = data.get("review_state")
+        if isinstance(review_state, dict):
+            review_status = str(review_state.get("status", "") or "").strip().lower()
+            if review_status == "in_progress":
+                return "needs_fix"
+            if review_status == "approved":
+                try:
+                    if not self._review_approval_is_current(data):
+                        return "needs_fix"
+                except Exception:
+                    return "needs_fix"
+
     base_status = self._derive_preview_status_from_characters(chars)
     if base_status != "perfect":
         return base_status
@@ -284,6 +682,23 @@ def _recalculate_preview_statuses_in_metadata(self, metadata: dict | None):
             data=raw_data,
         )
         raw_data["characters"] = chars
+
+        raw_detection = raw_data.get("raw_detection")
+        if isinstance(raw_detection, dict):
+            raw_chars = raw_detection.get("characters", [])
+            if isinstance(raw_chars, list):
+                raw_data["raw_validation"] = (
+                    self._build_raw_detection_validation(
+                        raw_data,
+                        raw_chars,
+                    )
+                )
+
+        try:
+            self._reconcile_review_gold_integrity(raw_data)
+        except Exception:
+            pass
+
         if not chars:
             raw_data["status"] = "needs_fix"
             continue
@@ -310,7 +725,11 @@ def _persist_preview_metadata(
         self._preview_autosave_writer = None
     perf_start = time.perf_counter()
     write_ms = refresh_ms = sync_ms = info_ms = 0.0
-    meta_path = self._get_preview_metadata_path()
+    # Zapis należy do datasetu faktycznie załadowanego w pamięci.
+    # preview_dir_var może już wskazywać inny run (np. po wyborze historycznego
+    # źródła albo podczas przełączania runów), więc synchronizowany zapis musi
+    # używać tej samej zasady co autosave: _loaded_meta_path ma pierwszeństwo.
+    meta_path = getattr(self, "_loaded_meta_path", None) or self._get_preview_metadata_path()
     if meta_path is None:
         raise RuntimeError("Brak aktywnego preview runu do zapisania.")
 
@@ -678,25 +1097,28 @@ def _refresh_preview_listbox_row(self, plate_id: str | None = None):
     status = str(data.get("status", "unknown")).strip().lower()
 
     try:
-        selected_rows = {int(idx) for idx in listbox.curselection()}
+        row_selected = bool(listbox.selection_includes(row_index))
     except Exception:
-        selected_rows = set()
+        row_selected = False
     try:
         active_row = int(listbox.index(tk.ACTIVE))
     except Exception:
         active_row = None
-    row_selected = row_index in selected_rows
+    anchor_row = int(listbox.index(tk.ANCHOR))
+    view_top = listbox.yview()[0]
 
     try:
         listbox.delete(row_index)
         listbox.insert(row_index, label)
         self._apply_plate_listbox_row_style(row_index, status)
+        # Tk shifts the other selected indices back on insertion. Restore only
+        # the replaced row, avoiding O(selection size) Tcl calls for every row.
         if row_selected:
             listbox.selection_set(row_index)
-        if active_row == row_index:
-            listbox.activate(row_index)
-        if row_selected or active_row == row_index:
-            listbox.see(row_index)
+        listbox.selection_anchor(anchor_row)
+        if active_row is not None:
+            listbox.activate(active_row)
+        listbox.yview_moveto(view_top)
     except Exception as exc:
         logger.debug(f"Nie udało się odświeżyć pojedynczego wiersza listy tablic [{pid}]: {exc}")
 
@@ -707,7 +1129,33 @@ def _restore_preview_plate_history_snapshot(self, snapshot, *, action_label: str
 
     self._preview_history_replaying = True
     try:
-        self.preview_metadata[pid] = copy.deepcopy(snapshot if isinstance(snapshot, dict) else {})
+        restored_data = copy.deepcopy(snapshot if isinstance(snapshot, dict) else {})
+        self.preview_metadata[pid] = restored_data
+        from .z3_plate_gt_runtime import refresh_working_ground_truth
+        refresh_working_ground_truth(self, {pid: restored_data})
+
+        # Reopen existing REVIEW/GOLD, but keep a pre-review snapshot as a
+        # prediction. Marking its empty canonical layer would hide RAW on undo.
+        try:
+            if restored_data.get("review_state") or restored_data.get("characters"):
+                self._mark_review_edit_started(restored_data)
+        except Exception:
+            pass
+
+        chars = (
+            list(restored_data.get("characters", []) or [])
+            if isinstance(restored_data.get("characters"), list)
+            else []
+        )
+        try:
+            restored_data["status"] = self._derive_preview_status_from_data(
+                restored_data,
+                chars,
+            )
+        except Exception:
+            if isinstance(restored_data.get("review_state"), dict):
+                restored_data["status"] = "needs_fix"
+
         self._preview_char_selected_index = None
         self._preview_char_drag_state = None
         self._preview_char_add_state = None
@@ -715,6 +1163,9 @@ def _restore_preview_plate_history_snapshot(self, snapshot, *, action_label: str
         self._preview_char_hover_index = None
         self._preview_char_hover_label_index = None
         self._preview_char_label_active_index = None
+        mode_var = getattr(self, "preview_box_mode_var", None)
+        if mode_var is not None:
+            mode_var.set(self._get_preview_box_mode_label("AUTO"))
         self._refresh_preview_live_metadata_ui(
             status_message=action_label,
             status_tone="info",
@@ -724,6 +1175,7 @@ def _restore_preview_plate_history_snapshot(self, snapshot, *, action_label: str
         if not self._redraw_preview_character_overlays_light():
             self._on_preview_select(None)
         self._persist_preview_metadata(success_message=None, refresh_list=False, sync_access=False)
+        self._refresh_detection_review_controls()
         try:
             self._schedule_preview_info_refresh(delay_ms=900)
         except Exception:
@@ -797,7 +1249,8 @@ def _get_current_preview_list_index(self):
     try:
         sel = listbox.curselection()
         if sel:
-            idx = int(sel[0])
+            active = int(listbox.index(tk.ACTIVE))
+            idx = active if active in sel else int(sel[0])
             if 0 <= idx < len(getattr(self, "_listbox_pid_by_index", [])):
                 return idx
     except Exception:

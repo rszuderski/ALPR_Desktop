@@ -1122,7 +1122,7 @@ def _approve_step3_from_wizard(self):
     if not (has_outputs and bool(readiness.get("ok")) and perfect_count > 0):
         message = str(readiness.get("message") or "").strip() or (
             "E3 nie jest jeszcze gotowe do zatwierdzenia. W PZ2 przygotuj co najmniej jedną tablicę "
-            "ze statusem perfect, a potem wykonaj eksport w PZ3."
+            "sprawdzoną i zatwierdzoną, a potem utwórz zbiór znaków."
         )
         try:
             self.app.update_status(message, "warning")
@@ -1244,7 +1244,7 @@ def _get_campaign_step3_view_model(
         current_step=int(current_step or 0),
         step3_status=normalized_step3_status or "pending",
         state="locked",
-        title="E3. Znaki i gold pack",
+        title="E3. Przygotowanie znaków",
         summary="Z3 odblokuje się po przygotowaniu i zatwierdzeniu tablic w Z2.",
         details="Najpierw domknij E2.",
         body_mode="",
@@ -1260,7 +1260,7 @@ def _get_campaign_step3_view_model(
             current_step=int(current_step or 0),
             step3_status=normalized_step3_status or "pending",
             state="skipped",
-            title="E3. Znaki i gold pack",
+            title="E3. Przygotowanie znaków",
             summary="Tor tablic pomija Z3.",
             details="Po zatwierdzeniu Z2 projekt przechodzi od razu do Z4.",
         )
@@ -1272,7 +1272,7 @@ def _get_campaign_step3_view_model(
             current_step=int(current_step or 0),
             step3_status=normalized_step3_status or "pending",
             state="locked",
-            title="E3. Znaki i gold pack",
+            title="E3. Przygotowanie znaków",
             summary="Najpierw wybierz tor iteracji w E1.",
             details="Z3 dotyczy wyłącznie toru znaków, a tor jest decyzją wejściową E1.",
         )
@@ -1517,7 +1517,7 @@ def _get_campaign_step3_view_model(
         current_step=int(current_step or 0),
         step3_status=normalized_step3_status or "pending",
         state=state,
-        title="E3. Znaki i gold pack",
+        title="E3. Przygotowanie znaków",
         summary=summary,
         details=details,
         body_mode=body_mode,
@@ -1819,7 +1819,7 @@ def _detect_campaign_char_ready_dataset_state(self) -> dict:
         "reason": "missing_char_dataset",
         "message": (
             "Brakuje eksportu datasetu znaków z PZ3. Sama anotacja boxów w PZ2 nie otwiera T05: "
-            "po oznaczeniu znaków i uzyskaniu tablic perfect przejdź do PZ3 i wyeksportuj dataset znaków YOLO Detect."
+            "po oznaczeniu znaków i zatwierdzeniu tablic utwórz źródłowy zbiór znaków."
         ),
         "ready_dataset": "",
         "dataset_hint": "",
@@ -2410,7 +2410,7 @@ def _get_iteration_target_lock_reason(self) -> str:
 
 def _get_step1_char_preflight_image_count(self) -> int:
     try:
-        plan = dict(self.current_ingest_plan or {})
+        plan = dict(self._get_active_step1_draft_plan() or {})
     except Exception:
         plan = {}
 

@@ -467,11 +467,31 @@ def _execute_validate_and_adopt_annotations(host: Any, _payload: Mapping[str, An
 
 
 def _execute_continue_z3(host: Any, payload: Mapping[str, Any]) -> CampaignGraphActionResult:
+    # continue_z3 jest używane w więcej niż jednym miejscu:
+    # - po E2 może oznaczać zwykłe wejście do pracy Z3,
+    # - w T05 / E3->E4Z oznacza konkretnie krok 2: eksport datasetu w PZ3.
+    #
+    # Dlatego dopiero kontekst bramki T05 wymusza PZ3.
+    prepared_payload = dict(payload or {})
+    context = _graph_context_from_payload(prepared_payload)
+
+    gate_id = campaign_gate_id_for_edge(
+        context.get("graph_edge_key"),
+        context.get("graph_gate_id"),
+    )
+    edge_key = str(context.get("graph_edge_key") or "").strip()
+
+    if gate_id == "T05" or edge_key == "e3_to_e4":
+        context["target_substep"] = "pz3"
+        context["force_pz3"] = "1"
+        context.pop("force_pz2", None)
+        prepared_payload["context"] = context
+
     return _execute_host_method_with_context(
         host,
         "continue_z3",
         "_step_continue_characters_from_ready_source",
-        payload,
+        prepared_payload,
         success_message="Z3 przekazano do kontynuacji na gotowym źródle.",
         error_message="Nie udało się kontynuować pracy w Z3.",
     )

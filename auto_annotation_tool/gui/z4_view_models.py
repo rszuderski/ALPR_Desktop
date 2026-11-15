@@ -27,7 +27,7 @@ class Step4DatasetWorkflowViewModel:
     split_summary: str = ""
     split_action_label: str = "Przygotuj wariant treningowy"
     show_split_toggle: bool = False
-    split_toggle_label: str = "Popraw split"
+    split_toggle_label: str = "Dostosuj wariant"
     show_split_details: bool = True
 
 

@@ -119,6 +119,7 @@ def _step_goto_auto_annotation(
             on_complete(result)
 
     source_context = dict(preferred_source_context or {})
+    graph_work_entry = bool(source_context.get("graph_edge_key") or source_context.get("graph_gate_id"))
     t02_at_review = bool(
         str(source_context.get("z2_work_mode") or "").strip().lower() == "t02_at_review"
         or (
@@ -318,7 +319,7 @@ def _step_goto_auto_annotation(
     v_mod = CAMPAIGN.get_global_model("vehicle")
     p_mod = CAMPAIGN.get_global_model("plate")
     _show_nav_overlay(28.0, "Sprawdzam model tablic i źródła poprzedniej pracy.")
-    plate_source_state = {} if t02_at_review else self._get_annotation_step2_source_state("plate")
+    plate_source_state = {} if (t02_at_review or graph_work_entry) else self._get_annotation_step2_source_state("plate")
     plate_model_ready = bool(plate_source_state.get("plate_model_ready"))
     if plate_model_ready and (not p_mod or not Path(p_mod).exists()):
         try:
@@ -327,13 +328,13 @@ def _step_goto_auto_annotation(
             p_mod = str(p_mod or "").strip()
     char_source_state = {}
     char_has_existing_source = False
-    if iteration_target == "char" and not force_annotation_tab and not t02_at_review:
+    if iteration_target == "char" and not force_annotation_tab and not t02_at_review and not graph_work_entry:
         _show_nav_overlay(36.0, "Sprawdzam źródło tablic dla toru znaków.")
         char_source_state = self._get_char_route_source_state()
         char_has_existing_source = bool(char_source_state.get("has_source"))
     _mark_nav_phase("source_state")
 
-    if iteration_target == "char" and not force_annotation_tab and not t02_at_review:
+    if iteration_target == "char" and not force_annotation_tab and not t02_at_review and not graph_work_entry:
         # STEP2-P1 is an entry into Z2, not an implicit approval of E2.
         # A ready plate source only enables the wizard badge; the user can still
         # enter Z2 to add more plate annotations before closing the stage.
@@ -397,7 +398,7 @@ def _step_goto_auto_annotation(
             return _reject(t02_source["message"])
         source_context.update(t02_source["context"])
 
-    defer_preview_load = bool(force_annotation_tab or iteration_target == "plate")
+    defer_preview_load = bool(graph_work_entry or force_annotation_tab or iteration_target == "plate")
     splash_token = 0
     _show_nav_overlay(62.0, "Przygotowuję bezpieczne przełączenie widoku.")
     _mark_nav_phase("z2_splash_prepare")
@@ -427,7 +428,7 @@ def _step_goto_auto_annotation(
             result = tab_ann.open_campaign_step2_entry(
                 iteration_target=iteration_target,
                 entry_strategy=entry_strategy,
-                restore_preview=bool(not t02_at_review and not force_annotation_tab and not char_has_existing_source),
+                restore_preview=bool(not graph_work_entry and not t02_at_review and not force_annotation_tab and not char_has_existing_source),
                 open_existing_run=open_existing_run,
                 defer_preview_load=defer_preview_load,
                 source_context=dict(source_context or {}),
@@ -961,7 +962,7 @@ def _step_continue_characters_from_ready_source(self, preferred_source_context: 
             except Exception:
                 pass
             return
-    self._step_goto_characters(preferred_source_context=source_context)
+    return self._step_goto_characters(preferred_source_context=source_context)
 
 
 def _step_goto_characters_detect(self, preferred_source_context: dict | None = None):
@@ -971,7 +972,7 @@ def _step_goto_characters_detect(self, preferred_source_context: dict | None = N
     source_context = dict(preferred_source_context or {})
     source_context["target_substep"] = "detect"
     source_context["force_pz2"] = "1"
-    self._step_goto_characters(preferred_source_context=source_context)
+    return self._step_goto_characters(preferred_source_context=source_context)
 
 
 def _step_goto_characters(self, preferred_source_context: dict | None = None):
@@ -1013,8 +1014,9 @@ def _step_goto_characters(self, preferred_source_context: dict | None = None):
         ).strip().lower()
         explicit_pz2 = bool(source_context.get("force_pz2")) or target_hint in {"2", "detect", "pz2", "z3_pz2"}
         explicit_pz3 = bool(source_context.get("force_pz3")) or target_hint in {"3", "dataset", "pz3", "z3_pz3"}
-        if gate_hint == "T06":
-            # T06 ma dwa kroki robocze: PZ2 przygotowuje ramki znaków, a PZ3 eksportuje AZ.
+        if gate_hint in {"T05", "T06"}:
+            # T05 ma dwa kroki robocze: PZ2 przygotowuje ramki znaków, a PZ3 eksportuje AZ.
+            # T06 pozostaje akceptowany wyłącznie jako legacy identyfikator starszych sesji.
             # Jeśli kontrakt PZ2 jest już spełniony, kontynuacja powinna wracać od razu do PZ3.
             if explicit_pz3:
                 source_context["target_substep"] = "pz3"
@@ -1086,6 +1088,12 @@ def _step_goto_characters(self, preferred_source_context: dict | None = None):
 
     try:
         tab_char._step3_linear_mode = True
+        # T05PZ3FIX001: prime PZ3 navigation before NotebookTabChanged
+        if should_prime_dataset_surface:
+            tab_char._campaign_force_pz2_entry = False
+            tab_char._campaign_force_detect_entry = False
+            tab_char._campaign_force_pz3_entry = True
+            tab_char._campaign_graph_entry_context = dict(source_context or {})
         if should_prime_dataset_surface:
             tab_char._campaign_pz2_sync_loading = False
             tab_char._campaign_step3_entry_splash_pinned = False
@@ -1113,7 +1121,7 @@ def _step_goto_characters(self, preferred_source_context: dict | None = None):
                 title="Wyodrębniam tablice dla Z3",
                 body="Startuję wyodrębnianie tablic z aktualnego źródła T06.",
                 tone="info",
-                progress=0.0,
+                progress=None,
                 show_progress=True,
                 show_return=False,
             )
@@ -1157,7 +1165,7 @@ def _step_goto_characters(self, preferred_source_context: dict | None = None):
             tab_char._hide_campaign_detect_splash()
         except Exception:
             pass
-        return
+        return result
 
     latest_xml = str(result.get("latest_xml") or "").strip()
     images_dir = str(result.get("images_dir") or "").strip()
@@ -1205,6 +1213,9 @@ def _step_goto_characters(self, preferred_source_context: dict | None = None):
             tab_char._campaign_pz2_sync_loading = False
     except Exception:
         pass
+
+    # Z3NAVRET001: propagate real Z3 entry result
+    return result
 
 
 def _step_goto_training(self, preferred_subtab: str | None = None):

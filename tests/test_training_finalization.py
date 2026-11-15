@@ -165,3 +165,28 @@ class TrainingFinalizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def test_training_finalization_avoids_heavy_checkpoint_reload():
+    import ast
+    from pathlib import Path
+    import auto_annotation_tool.training.trainer as trainer_module
+
+    source = Path(trainer_module.__file__).read_text(encoding="utf-8-sig")
+    tree = ast.parse(source)
+    trainer_cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "YOLOPoseTrainer"
+    )
+    loop = next(
+        node for node in trainer_cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_training_loop"
+    )
+    body = ast.get_source_segment(source, loop) or ""
+
+    assert "inspect_checkpoint_epoch=False" in body
+    assert "allow_heavy_load=True" not in body
+    assert "metadata_scope" in body
+    assert "lightweight_completed_training_output" in body
+    assert body.index("self._reset_runtime_state()") < body.index("build_output_checkpoint_training_snapshot(")

@@ -29,6 +29,7 @@ from .zoomable_canvas import ZoomableCanvas
 from .section_header_label import SectionHeaderLabel
 from . import z2_workflow_methods
 from . import z2_canvas_overlays
+from . import z2_plate_gt_inline
 from .z2_main_widgets import create_annotation_widgets
 from .z2_auto_scope_modal import prompt_plate_auto_scope_choice
 from .z2_canvas_metrics_ui import (
@@ -115,6 +116,7 @@ from ..annotators.runtime_factory import validate_pt_model_path_for_runtime
 from ..icons import IconManager
 from ..exporters import CVATExporter, ReportGenerator
 from ..quality_metrics import compute_plate_polygon_fit_metrics
+from ..pose_geometry import finalize_manual_geometry
 from ..project_cache import PROJECT_CACHE
 from ..training import DatasetCreator
 from ..utils import cleanup_gpu_memory, count_images_in_directory, format_duration, get_image_files, get_image_size
@@ -237,12 +239,15 @@ def _compute_preview_plate_focus_view_state(self, polygon: list[tuple[float, flo
 def _refresh_preview_plate_context_overlays(self) -> None:
     """Refresh lightweight fullscreen overlays after changing image/plate context."""
     try:
+        z2_plate_gt_inline.refresh_inline_plate_gt_editors(self)
+    except Exception:
+        pass
+    try:
         self._refresh_preview_legend_backdrop()
     except Exception:
         pass
     try:
-        self._preview_metrics_overlay_render_key = None
-        self._update_preview_canvas_metrics_overlay(force_render=True)
+        self._update_preview_canvas_metrics_overlay(force_render=False)
     except Exception:
         pass
     try:
@@ -316,11 +321,16 @@ def _focus_preview_plate(
             return False
         mark_phase("set_view")
         try:
-            canvas._update_display(interaction_fast=True)
-            canvas._schedule_final_quality_display(delay_ms=900)
+            canvas._navigation_rendering = True
+            # This is the final fitted view, not an intermediate zoom frame.
+            # Render it at full quality instead of relying on a cancellable
+            # idle pass, which may leave NEAREST pixels visible during review.
+            canvas._update_display(interaction_fast=False)
         except Exception:
             canvas.refresh_overlay_only(skip_info=True)
-        mark_phase("fast_render")
+        finally:
+            canvas._navigation_rendering = False
+        mark_phase("render")
     else:
         try:
             canvas._cancel_zoom_animation()
@@ -332,11 +342,10 @@ def _focus_preview_plate(
             return False
         mark_phase("set_view")
         try:
-            canvas._update_display(interaction_fast=True)
-            canvas._schedule_final_quality_display(delay_ms=500)
+            canvas._update_display(interaction_fast=False)
         except Exception:
             canvas.refresh_overlay_only(skip_info=True)
-        mark_phase("fast_render")
+        mark_phase("render")
 
     self._set_preview_focus_target("plate", int(safe_idx))
     self._refresh_preview_plate_context_overlays()
@@ -382,7 +391,6 @@ def _focus_preview_plate(
         view=f"{phase_ms.get('view_state', 0.0):.1f}",
         cancel=f"{phase_ms.get('cancel', 0.0):.1f}",
         set_view=f"{phase_ms.get('set_view', 0.0):.1f}",
-        fast_render=f"{phase_ms.get('fast_render', 0.0):.1f}",
         render=f"{phase_ms.get('render', 0.0):.1f}",
         context=f"{phase_ms.get('context', 0.0):.1f}",
         status=f"{phase_ms.get('status', 0.0):.1f}",
@@ -745,6 +753,15 @@ def _event_has_control_modifier(event=None) -> bool:
         return False
 
 def _preview_shortcuts_enabled(self, event=None, allow_when_fullscreen: bool = False) -> bool:
+    target_widget = getattr(event, "widget", None)
+    if target_widget is None:
+        try:
+            target_widget = self.frame.focus_get()
+        except Exception:
+            target_widget = None
+    if bool(getattr(target_widget, "_z2_inline_gt_entry", False)):
+        return False
+
     if allow_when_fullscreen and bool(getattr(self, "_preview_fullscreen_active", False)):
         return True
 
@@ -1266,8 +1283,11 @@ def _on_preview_toggle_image_approval_shortcut(self, event=None):
     )
     next_approved = not currently_approved
     if next_approved and not self._preview_annotation_can_be_approved_for_export(ann):
+        from .z2_gt_readiness import approval_block_reason
+        from .z2_gt_review import refresh_annotation_gt_review
+        refresh_annotation_gt_review(self, ann)
         self._update_preview_edit_status(
-            "Nie można zatwierdzić zdjęcia spacją: najpierw dodaj ramkę tablicy."
+            "Nie można oznaczyć zdjęcia jako OK. " + approval_block_reason(self, ann)
         )
         try:
             self._update_preview_canvas_metrics_overlay(force_render=True)
@@ -1555,6 +1575,9 @@ def _place_preview_legend_overlay(
         return
 
     fullscreen = bool(getattr(self, "_preview_fullscreen_active", False))
+    if not fullscreen:
+        self._hide_preview_controls_legend_overlay()
+        return
     if width_override is not None:
         overlay_width = float(width_override or 0.0)
     elif fullscreen and self._is_preview_controls_legend_expanded():
@@ -1735,6 +1758,11 @@ def _set_preview_fullscreen(self, active: bool):
         self._update_preview_edit_status("Pełny ekran jest dostępny po załadowaniu obrazu podglądu.")
         return
 
+    from .z2_workspace_drawers import workspace_drawers
+
+    drawers = workspace_drawers(self)
+    new_fullscreen_session = next_state and not drawers.detached
+    self._cancel_preview_layout_restore_jobs()
     self._preview_fullscreen_transition_active = True
     self._preview_fullscreen_overlay_ready = False
 
@@ -1757,24 +1785,22 @@ def _set_preview_fullscreen(self, active: bool):
     self._preview_fullscreen_transition_seq = transition_seq
 
     if next_state:
-        self._preview_fullscreen_restore_log_visible = bool(getattr(self, "_annotation_log_visible", False))
-        try:
-            self._preview_fullscreen_restore_root_state = bool(root.attributes("-fullscreen")) if root is not None else False
-        except Exception:
-            self._preview_fullscreen_restore_root_state = False
-        try:
-            self._preview_fullscreen_restore_window_state = str(root.state()) if root is not None else "normal"
-        except Exception:
-            self._preview_fullscreen_restore_window_state = "normal"
-        try:
-            self._preview_fullscreen_restore_geometry = str(root.geometry()) if root is not None else ""
-        except Exception:
-            self._preview_fullscreen_restore_geometry = ""
+        if new_fullscreen_session:
+            self._preview_fullscreen_restore_log_visible = bool(getattr(self, "_annotation_log_visible", False))
+            try:
+                self._preview_fullscreen_restore_root_state = bool(root.attributes("-fullscreen")) if root is not None else False
+            except Exception:
+                self._preview_fullscreen_restore_root_state = False
+            try:
+                self._preview_fullscreen_restore_window_state = str(root.state()) if root is not None else "normal"
+            except Exception:
+                self._preview_fullscreen_restore_window_state = "normal"
+            try:
+                self._preview_fullscreen_restore_geometry = str(root.geometry()) if root is not None else ""
+            except Exception:
+                self._preview_fullscreen_restore_geometry = ""
 
-        if self._pane_has_child(self.main_pane, self.main_left_frame):
-            self.main_pane.forget(self.main_left_frame)
-        if self._pane_has_child(self.main_pane, self.main_right_frame):
-            self.main_pane.forget(self.main_right_frame)
+        drawers.enter()
         self._set_annotation_process_log_visibility(False)
         if root is not None:
             try:
@@ -1791,6 +1817,12 @@ def _set_preview_fullscreen(self, active: bool):
             except Exception:
                 pass
         self._preview_fullscreen_active = True
+        # Fullscreen changes the canvas geometry after the current image
+        # has already been rendered. Force a fit only for this layout
+        # transition so the first image is centered like subsequent ones.
+        self._preview_force_fit_after_resize = True
+        self._preview_polygon_focus_restore_state = None
+        self._preview_focus_target = None
         self._preview_controls_legend_fullscreen_expanded = False
         self._preview_controls_legend_current_width = 0.0
         self._preview_controls_legend_current_height = 0.0
@@ -1818,14 +1850,8 @@ def _set_preview_fullscreen(self, active: bool):
         self._preview_polygon_focus_restore_state = None
         self._preview_focus_target = None
         self._preview_force_fit_after_resize = True
-        # _should_show_right_panel() celowo zwraca False w fullscreen,
-        # więc najpierw zdejmujemy flagę, dopiero potem odtwarzamy panele.
+        # Return the same panels to their saved column widths after sliding in.
         self._preview_fullscreen_active = False
-        if not self._pane_has_child(self.main_pane, self.main_left_frame):
-            self.main_pane.insert(0, self.main_left_frame, weight=2)
-        if self._should_show_right_panel() and not self._pane_has_child(self.main_pane, self.main_right_frame):
-            self.main_pane.add(self.main_right_frame, weight=1)
-
         self._set_annotation_process_log_visibility(bool(getattr(self, "_preview_fullscreen_restore_log_visible", False)))
         self._preview_controls_legend_current_width = 0.0
         self._preview_controls_legend_current_height = 0.0
@@ -1837,13 +1863,6 @@ def _set_preview_fullscreen(self, active: bool):
         "fullscreen",
         f"active={int(bool(self._preview_fullscreen_active))} mode={'native' if use_native_root_fullscreen else 'zoomed'} ws={windowing_system or '-'}"
     )
-    self._schedule_preview_layout_restore_after_resize()
-    if not self._preview_fullscreen_active:
-        self._sync_main_pane_right_panel_visibility()
-        self._schedule_right_panel_content_restore_after_fullscreen(delay_ms=180)
-        self._schedule_main_pane_layout_refresh(force_defaults=True, delay_ms=120)
-    refresh_delay_ms = 210 if bool(getattr(self, "_preview_fullscreen_active", False)) else 230
-
     def _refresh_after_fullscreen_transition():
         if transition_seq != int(getattr(self, "_preview_fullscreen_transition_seq", 0) or 0):
             return
@@ -1913,16 +1932,26 @@ def _set_preview_fullscreen(self, active: bool):
         except Exception:
             pass
 
-    def _schedule_transition_refresh(delay_ms: int) -> None:
+        # Fullscreen zmienia geometrię canvasu już po wcześniejszym
+        # renderze overlay. Odtwórz GT po finalnym resize.
         try:
-            self.frame.after(int(delay_ms), _refresh_after_fullscreen_transition)
+            self._refresh_preview_canvas(refresh_chrome=False)
         except Exception:
-            _refresh_after_fullscreen_transition()
+            pass
+        try:
+            z2_plate_gt_inline.refresh_gt_overlay_after_layout(self)
+        except Exception:
+            pass
 
-    try:
-        _schedule_transition_refresh(refresh_delay_ms)
-    except Exception:
-        _refresh_after_fullscreen_transition()
+        self._schedule_preview_layout_restore_after_resize()
+
+    def _drawer_transition_complete():
+        if transition_seq != int(getattr(self, "_preview_fullscreen_transition_seq", 0) or 0):
+            return
+        # Let Tk settle the final pane geometry once; no content reconstruction.
+        self.frame.after_idle(_refresh_after_fullscreen_transition)
+
+    drawers.animate_mode(next_state, _drawer_transition_complete)
     try:
         self.preview_canvas.focus_set()
     except Exception:
@@ -2100,16 +2129,32 @@ def _set_preview_corner_drag_modifier(self, active: bool):
         self._finish_preview_vertex_drag(
             mark_dirty=bool(self._preview_drag_state.get("was_moved", False))
         )
-        return
+        # Continue: earlier plates in this W sequence may still await
+        # finalization when W is released during the final active drag.
     if not next_state and self._preview_drag_state is None and self._preview_dirty_images:
         ann = self._get_preview_annotation()
         if ann is not None:
             try:
-                for det in self._get_plate_detections(ann):
-                    fixed_polygon = PolygonValidator.fix_polygon(self._detection_polygon(det))
-                    det.polygon = fixed_polygon
-                    det.bbox = self._bbox_from_polygon(fixed_polygon)
-                    det.keypoints = self._keypoints_from_polygon(fixed_polygon)
+                touched_by_image = getattr(self, "_preview_geometry_touched", {})
+                # Navigation can change the current image while W remains
+                # held. Finalize only touched detections across that sequence.
+                candidates = getattr(self, "current_annotations", None) or [ann]
+                for edited_ann in candidates:
+                    touched = touched_by_image.pop(edited_ann.filename, set())
+                    if not touched:
+                        continue
+                    finalized = False
+                    for det in self._get_plate_detections(edited_ann):
+                        if id(det) in touched:
+                            finalize_manual_geometry(det, self._detection_polygon(det),
+                                                     image_size=(edited_ann.width, edited_ann.height))
+                            finalized = True
+                    if finalized:
+                        # A worker may still be saving the pre-release W
+                        # snapshot. Version the final geometry so its later
+                        # completion cannot clear this newer dirty state.
+                        self._mark_preview_image_dirty(edited_ann, refresh_list=False,
+                                                       refresh_row=False, invalidate_runtime=False)
             except Exception:
                 pass
         try:
@@ -2303,6 +2348,23 @@ def on_zoomable_canvas_zoom(self, canvas: ZoomableCanvas, event):
         "zoom",
         f"level={float(getattr(canvas, 'zoom_level', 0.0) or 0.0):.3f} at=({float(getattr(event, 'x', 0.0)):.1f},{float(getattr(event, 'y', 0.0)):.1f})"
     )
+    return False
+
+
+def on_zoomable_canvas_pan_applied(
+    self,
+    canvas: ZoomableCanvas,
+    event,
+):
+    if canvas is not self.preview_canvas:
+        return False
+    try:
+        z2_plate_gt_inline.relocate_inline_plate_gt_editors(
+            self,
+            canvas=canvas,
+        )
+    except Exception:
+        pass
     return False
 
 

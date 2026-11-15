@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Campaign graph assistant context and focus helpers."""
 
@@ -43,7 +43,7 @@ def _build_campaign_graph_assistant_context(self, status: WizardStageStatus | No
             "Próg w PZ2 mówi tylko, czy baza znaków jest sensowna. Bramkę T05 domyka dopiero artefakt AZ utworzony w PZ3.",
         )
         step3_glossary = (
-            "baza PZ2 = tablice perfect i ramki znaków przygotowane do eksportu",
+            "gotowy materiał = sprawdzone i zatwierdzone tablice z poprawnymi ramkami znaków",
             "AZ = źródłowy dataset znaków utworzony w PZ3",
         )
         step3_caution = "W E3 nie traktuj progu PZ2 jako pełnego otwarcia T05: to tylko pierwszy składnik pracy."

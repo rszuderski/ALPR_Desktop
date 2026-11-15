@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .z3_gt_box_policy import working_characters
 
 import tkinter as tk
 from typing import TYPE_CHECKING
@@ -134,6 +135,7 @@ def apply_preview_info_stats_style(host: "CharacterAnnotationTab", progress_bar_
         ("preview_perfect_count_lbl", {"bg": bg, "fg": success_fg, "font": ("Segoe UI", 12, "bold")}),
         ("preview_error_count_lbl", {"bg": bg, "fg": error_fg, "font": ("Segoe UI", 12, "bold")}),
         ("preview_unknown_count_lbl", {"bg": bg, "fg": info_fg, "font": ("Segoe UI", 12, "bold")}),
+        ("preview_approved_char_count_lbl", {"bg": bg, "fg": success_fg, "font": ("Segoe UI", 9, "bold")}),
         ("preview_layout_summary_lbl", {"bg": bg, "fg": muted_fg, "font": ("Segoe UI", 8)}),
         ("preview_repair_progress_title_lbl", {"bg": bg, "fg": fg, "font": ("Segoe UI", 9, "bold")}),
     )
@@ -387,6 +389,7 @@ def set_preview_counts_info(
     needs_fix: int = 0,
     unknown: int = 0,
     char_boxes: int = 0,
+    approved_char_boxes: int = 0,
 ) -> None:
     ok_count = max(0, int(perfect))
     bad_count = max(0, int(needs_fix) + int(unknown))
@@ -404,6 +407,7 @@ def set_preview_counts_info(
         ("preview_perfect_count_lbl", str(ok_count)),
         ("preview_error_count_lbl", str(bad_count)),
         ("preview_unknown_count_lbl", str(total_count)),
+        ("preview_approved_char_count_lbl", f"Zatwierdzone ramki znaków: {max(0, int(approved_char_boxes))}"),
     )
     for attr_name, value_text in label_map:
         widget = getattr(host, attr_name, None)
@@ -471,7 +475,7 @@ def build_plates_list_legend_counts(host: "CharacterAnnotationTab", counts: dict
         if not isinstance(data, dict):
             continue
 
-        chars = list(data.get("characters", []) or [])
+        chars = working_characters(host, data)
         source_counts = host._count_character_sources(chars, data=data)
         manual_count = max(
             int(source_counts.get("manual", 0) or 0),
@@ -513,6 +517,7 @@ def build_plates_list_legend_counts(host: "CharacterAnnotationTab", counts: dict
         "plate_ocr": int(plate_ocr),
         "plate_hybrid": int(plate_hybrid),
         "box_total": int(box_total),
+        "box_perfect": int(status_counts.get("approved_char_boxes", 0) or 0),
         "box_manual": int(box_manual),
         "box_yolo": int(box_yolo),
         "box_ocr": int(box_ocr),
@@ -530,7 +535,7 @@ def set_plates_legend_info(host: "CharacterAnnotationTab", counts: dict | None =
         ("plates_legend_tab_ocr_lbl", str(int(snapshot.get("plate_ocr", 0) or 0))),
         ("plates_legend_tab_hybrid_lbl", str(int(snapshot.get("plate_hybrid", 0) or 0))),
         ("plates_legend_box_total_lbl", str(int(snapshot.get("box_total", 0) or 0))),
-        ("plates_legend_box_perfect_lbl", "-"),
+        ("plates_legend_box_perfect_lbl", str(int(snapshot.get("box_perfect", 0) or 0))),
         ("plates_legend_box_manual_lbl", str(int(snapshot.get("box_manual", 0) or 0))),
         ("plates_legend_box_yolo_lbl", str(int(snapshot.get("box_yolo", 0) or 0))),
         ("plates_legend_box_ocr_lbl", str(int(snapshot.get("box_ocr", 0) or 0))),
@@ -776,23 +781,12 @@ def get_preview_repair_progress_snapshot(host, counts: dict | None = None) -> di
     split_ready = bool(export_ready)
     missing_for_split = max(0, int(min_required_perfect) - int(exportable_plate_count or 0))
     in_campaign = bool(getattr(host, "_step3_linear_mode", False) and CAMPAIGN.get_active_project_name())
-    dataset_ready = False
-    dataset_message = ""
-    if in_campaign:
-        try:
-            training_readiness = host._get_campaign_step3_training_readiness()
-            dataset_ready = bool(training_readiness.get("ok"))
-            dataset_message = str(training_readiness.get("message", "") or "").strip()
-        except Exception:
-            dataset_ready = False
-            dataset_message = ""
-
     if total <= 0:
         tone = "muted"
         summary = "Warunek eksportu PZ3: czekam na tablice."
         details = (
-            f"Warunek eksportu PZ3 w kampanii: co najmniej {min_required_perfect} tablic perfect, "
-            "z przynajmniej jednym poprawnym boxem znaku i etykietą, objęta aktywnym zakresem gold packa."
+            f"Warunek eksportu PZ3 w kampanii: co najmniej {min_required_perfect} zatwierdzonych tablic, "
+            "z przynajmniej jednym poprawnym ramką znaku i etykietą, objęta aktywnym zakresem gold packa."
         )
     elif not split_ready:
         tone = "error"
@@ -801,12 +795,12 @@ def get_preview_repair_progress_snapshot(host, counts: dict | None = None) -> di
             details = (
                 f"W PZ2 są tablice perfect ({perfect}), ale minimum kampanii to {min_required_perfect} "
                 "tablic eksportowalnych do PZ3. Każda musi mieć zapisany przynajmniej jeden poprawny box znaku "
-                "z etykietą i przechodzić przez aktualne strategie oraz źródła gold packa."
+                "z etykietą i przechodzić przez aktualne wybrany zakres danych."
             )
         else:
             details = (
-                f"Aby wejście do PZ3 miało sens, przygotuj w PZ2 co najmniej {min_required_perfect} tablic perfect: "
-                "oznacz wszystkie znaki, zapisz boxy z etykietami i doprowadź tablicę do statusu perfect."
+                f"Aby wejście do PZ3 miało sens, przygotuj w PZ2 co najmniej {min_required_perfect} zatwierdzonych tablic: "
+                "oznacz wszystkie znaki, zapisz ramki z etykietami i doprowadź tablicę do statusu perfect."
             )
     else:
         ready_target = (
@@ -818,8 +812,8 @@ def get_preview_repair_progress_snapshot(host, counts: dict | None = None) -> di
         if ratio < 0.6:
             tone = "warning"
             details = (
-                f"Warunek eksportu PZ3 jest spełniony: minimum {min_required_perfect} eksportowalnych tablic perfect jest osiągnięte. "
-                "Dataset można utworzyć, ale im więcej tablic perfect, tym większy sens treningu w Z4."
+                f"Warunek eksportu PZ3 jest spełniony: minimum {min_required_perfect} eksportowalnych zatwierdzonych tablic jest osiągnięte. "
+                "Dataset można utworzyć, ale im więcej zatwierdzonych tablic, tym większy sens treningu w Z4."
             )
         else:
             tone = "success"
@@ -829,31 +823,29 @@ def get_preview_repair_progress_snapshot(host, counts: dict | None = None) -> di
     if in_campaign:
         if not split_ready:
             if missing_for_split > 0:
-                gate_summary = f"Krok 1/2: zbiór PZ2 nie jest jeszcze gotowy. Brakuje {missing_for_split} tablic perfect."
+                gate_summary = "PZ2 w toku: wymagane minimum zatwierdzonych tablic nie jest jeszcze spełnione."
             else:
-                gate_summary = "Krok 1/2: zbiór PZ2 nie jest jeszcze gotowy. Brakuje eksportowalnych ramek znaków."
+                gate_summary = "PZ2 w toku: brakuje kompletnych ramek znaków."
             gate_details = (
-                f"Cel PZ2: przygotować anotacje znaków do późniejszego datasetu. Masz {exportable_plate_count}/{min_required_perfect} "
-                f"eksportowalnych tablic perfect i {exportable_char_count} znaków. "
-                "Po spełnieniu tego minimum użyj przycisku „Krok 2: dataset PZ3”; w PZ3 powstanie właściwy dataset."
+                f"Masz {exportable_plate_count}/{min_required_perfect} eksportowalnych zatwierdzonych tablic "
+                f"i {exportable_char_count} znaków. Kontynuuj sprawdzanie i poprawianie tablic w PZ2."
             )
             if perfect != exportable_plate_count:
                 gate_details += (
-                    f" Na liście jest {perfect} tablic perfect, ale do bramki liczy się {exportable_plate_count}; "
-                    "sprawdź zakres strategii i źródeł gold packa."
+                    f" Na liście jest {perfect} zatwierdzonych tablic, ale do bramki liczy się {exportable_plate_count}; "
+                    "sprawdź wybrany zakres danych."
                 )
             summary = gate_summary
-            details = f"{gate_details} {details}".strip()
-        elif not dataset_ready:
-            summary = "Krok 1/2 gotowy: zbiór PZ2 spełnia minimum. Krok 2/2: utwórz dataset znaków w PZ3."
-            gate_details = (
-                f"Zbiór PZ2 zawiera {exportable_plate_count}/{min_required_perfect} eksportowalnych tablic perfect "
-                f"i {exportable_char_count} znaków. To odblokowuje przejście do PZ3, ale nie otwiera jeszcze T06. "
-                "Dopiero eksport źródłowego datasetu znaków w PZ3 domyka warunek bramki."
-            )
-            if dataset_message:
-                gate_details += f" {dataset_message}"
             details = gate_details
+        else:
+            if total > 0 and perfect >= total:
+                summary = "PZ2 gotowe: wszystkie tablice zostały zatwierdzone."
+            else:
+                summary = "Minimum PZ2 spełnione: wymagany materiał został zatwierdzony."
+            details = (
+                f"Masz {exportable_plate_count}/{min_required_perfect} eksportowalnych zatwierdzonych tablic "
+                f"i {exportable_char_count} znaków. Następna akcja: „Zapisz PZ2 i wróć do pracy T05”."
+            )
 
     return {
         "perfect": perfect,
@@ -1020,6 +1012,7 @@ def update_preview_info_label(host: "CharacterAnnotationTab") -> None:
             needs_fix=counts["needs_fix"],
             unknown=counts["unknown"],
             char_boxes=counts.get("char_boxes", 0),
+            approved_char_boxes=counts.get("approved_char_boxes", 0),
         )
         host._set_preview_layout_summary_info(counts)
         host._set_plates_legend_info(counts)
@@ -1147,4 +1140,3 @@ def refresh_preview_layout_override_ui_light(host, *, message: str, tone: str = 
     host._refresh_preview_editor_toolbar()
     host._update_preview_edit_status(message, tone=tone)
     host._focus_preview_canvas()
-

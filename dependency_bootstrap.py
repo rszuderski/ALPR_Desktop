@@ -326,11 +326,15 @@ def _build_dependency_report(issues: list[DependencyIssue]) -> str:
 
 
 def _restart_current_process(app_argv: list[str]) -> None:
+    if getattr(sys, 'frozen', False):
+        raise RuntimeError('Samodzielne wydanie nie restartuje interpretera. Uruchom ponownie ALPR Desktop.')
     argv = [sys.executable] + list(app_argv or sys.argv)
     os.execv(sys.executable, argv)
 
 
 def _run_pip_install(packages: list[str], line_callback) -> int:
+    if getattr(sys, 'frozen', False):
+        raise RuntimeError('Samodzielne wydanie korzysta z dołączonych bibliotek i nie uruchamia pip.')
     if not packages:
         return 0
 
@@ -629,6 +633,11 @@ def _show_tk_dependency_assistant(issues: list[DependencyIssue], app_argv: list[
 
 def ensure_runtime_dependencies(app_argv: list[str] | None = None) -> bool:
     issues = probe_runtime_dependencies(print)
+    if getattr(sys, 'frozen', False):
+        if issues:
+            raise RuntimeError('Niekompletna instalacja ALPR Desktop. Rozpakuj ponownie cały pakiet.\n' +
+                               '\n'.join(f'{i.spec.display_name}: {i.error_text}' for i in issues))
+        return True
     if not issues:
         return True
 

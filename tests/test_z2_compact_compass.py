@@ -46,6 +46,10 @@ def test_compact_text_is_larger_and_stays_inside_shell(root, theme, fullscreen, 
         context["filename"] = filename
         owner._place_preview_legend_overlay()
         canvas = owner.preview_controls_canvas
+        if not fullscreen:
+            assert not owner.preview_hint_frame.place_info()
+            assert not canvas.find_all()
+            continue
         bbox = canvas.bbox("preview_legend_context")
         assert bbox is not None
         assert float(owner.preview_hint_frame.place_info()["height"]) - bbox[3] >= 18
@@ -58,7 +62,7 @@ def test_compact_text_is_larger_and_stays_inside_shell(root, theme, fullscreen, 
 
 
 def test_context_only_update_keeps_bigger_value_fonts(root):
-    owner, context = compass_owner(root)
+    owner, context = compass_owner(root, fullscreen=True)
     owner._place_preview_legend_overlay()
     canvas = owner.preview_controls_canvas
     file_item = owner._preview_controls_legend_context_item_ids["file"]
@@ -71,10 +75,22 @@ def test_context_only_update_keeps_bigger_value_fonts(root):
 
 
 def test_expanded_compass_keeps_original_fonts_and_scroll(root):
-    owner, _ = compass_owner(root)
-    owner._preview_controls_legend_inline_expanded = True
+    owner, _ = compass_owner(root, fullscreen=True)
+    owner._preview_controls_legend_fullscreen_expanded = True
     owner.canvas_frame.winfo_height = lambda: 320
     owner._place_preview_legend_overlay()
     assert legend._preview_controls_context_fonts(owner)[0].actual("size") == 8
     assert owner._preview_controls_legend_scroll_enabled
     assert owner._preview_controls_legend_content_height > owner._preview_controls_legend_viewport_height
+
+
+def test_return_from_fullscreen_hides_compass_even_with_old_expanded_setting(root):
+    owner, _ = compass_owner(root, fullscreen=True)
+    owner._place_preview_legend_overlay()
+    assert owner.preview_hint_frame.place_info()
+    owner._preview_fullscreen_active = False
+    owner._preview_controls_legend_inline_expanded = True
+    owner._place_preview_legend_overlay()
+    owner._refresh_preview_controls_legend()
+    assert not owner.preview_hint_frame.place_info()
+    assert not owner.preview_controls_canvas.find_all()

@@ -173,7 +173,6 @@ def _ensure_step4_train_tab_built(self) -> bool:
         self._build_train_tab_placeholder()
         return False
 
-    self._schedule_initial_step4_refresh()
     return True
 
 def _on_main_nb_tab_changed(self, event=None):
@@ -182,6 +181,7 @@ def _on_main_nb_tab_changed(self, event=None):
     try:
         if str(self.main_nb.select()) == str(getattr(self, "tab_train", "")):
             self._ensure_step4_train_tab_built()
+            self._refresh_training_cockpit()
     except Exception:
         pass
     try:

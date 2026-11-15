@@ -53,6 +53,7 @@ from ..training import (
     augment_yolo_dataset_train_split,
     build_character_dataset_file_fingerprint,
     build_character_training_variant_manifest,
+    build_training_dataset_snapshot,
     compare_character_val_test_unchanged,
     describe_augmentation_randomness_mode,
     ensure_yolo_dataset_yaml_points_to_root,
@@ -72,6 +73,7 @@ from .web_slim_scrollbar import WebSlimScrollbar, blend_hex_colors
 from .zoomable_canvas import ZoomableCanvas
 from .z4_augmentation_modal import ask_step4_augmentation_profile
 from .z4_dataset_preview import open_yolo_dataset_preview
+from .dataset_display import build_dataset_display_ref
 from .z4_campaign_flow import (
     build_step4_campaign_navigation_view_model,
     build_step4_dataset_workflow_view_model,
@@ -1055,6 +1057,874 @@ def _on_creator_source_mode_change(self):
     except Exception:
         pass
 
+
+def _normalize_dataset_browser_path(path_like) -> str:
+    raw = str(path_like or "").strip()
+    if not raw:
+        return ""
+    try:
+        path = Path(raw)
+        if path.is_file() and path.name.lower() == "data.yaml":
+            path = path.parent
+        return str(path.resolve())
+    except Exception:
+        return os.path.normcase(os.path.normpath(raw))
+
+
+def _collect_ready_plate_dataset_browser_rows(self) -> list[dict]:
+    """Zbierz gotowe datasety YOLO Pose z globalnego workspace i projektów.
+
+    Przeglądarka nie może ograniczać się do Workspace/4_training_datasets/plates,
+    bo historyczne datasety treningowe mogą żyć wewnątrz
+    Workspace/9_projects/<projekt>/4_training_datasets.
+    """
+    candidate_map: dict[str, tuple[Path, str, float]] = {}
+
+    def _add_candidate(path, target="plate", stamp=0.0):
+        try:
+            root = Path(path)
+            if root.is_file() and root.name.lower() == "data.yaml":
+                root = root.parent
+            key = _normalize_dataset_browser_path(root)
+            if not key or not root.exists() or not root.is_dir():
+                return
+            yaml_path = root / "data.yaml"
+            if not yaml_path.is_file():
+                return
+            if key not in candidate_map:
+                try:
+                    effective_stamp = float(stamp or root.stat().st_mtime)
+                except Exception:
+                    effective_stamp = float(stamp or 0.0)
+                candidate_map[key] = (root, str(target or "plate"), effective_stamp)
+        except Exception:
+            return
+
+    def _scan_dataset_base(base_dir):
+        base = Path(base_dir)
+        try:
+            for path, target, stamp in list(
+                self._find_ready_dataset_candidates(base) or []
+            ):
+                _add_candidate(path, target, stamp)
+        except Exception:
+            pass
+
+        # Historyczne projekty nie zawsze mają płaski układ katalogów.
+        # Dodatkowy skan data.yaml odnajduje również datasety osadzone głębiej.
+        try:
+            if base.exists() and base.is_dir():
+                for yaml_path in base.rglob("data.yaml"):
+                    try:
+                        root = yaml_path.parent
+                        rel_parts = root.relative_to(base).parts
+                        if len(rel_parts) > 4:
+                            continue
+                        _add_candidate(root, "plate", root.stat().st_mtime)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # 1) Globalne datasety aktywnego workspace.
+    try:
+        _scan_dataset_base(Path(CONFIG.get_datasets_dir("plate")))
+    except Exception:
+        pass
+    try:
+        _scan_dataset_base(self._get_datasets_base_dir())
+    except Exception:
+        pass
+
+    # 2) Wszystkie podłączone / zachowane projekty, nie tylko aktywny projekt.
+    project_roots: list[Path] = []
+    try:
+        projects_root = Path(CONFIG.DIR_9_PROJECTS)
+        if projects_root.exists():
+            project_roots = [
+                path for path in projects_root.iterdir()
+                if path.is_dir()
+            ]
+    except Exception:
+        project_roots = []
+
+    for project_root in project_roots:
+        _scan_dataset_base(project_root / "4_training_datasets")
+        _scan_dataset_base(project_root / "4_training_datasets" / "plates")
+
+    # 3) Historia treningów: globalna + wszystkie projekty.
+    history_dirs: list[Path] = []
+    try:
+        history_dirs.append(Path(CONFIG.get_training_runs_dir("plate")))
+    except Exception:
+        pass
+    for project_root in project_roots:
+        history_dirs.append(project_root / "5_training_runs")
+
+    runs = []
+    seen_history_dirs: set[str] = set()
+    for history_dir in history_dirs:
+        try:
+            key = str(history_dir.resolve())
+        except Exception:
+            key = str(history_dir)
+        if key in seen_history_dirs:
+            continue
+        seen_history_dirs.add(key)
+        try:
+            if not history_dir.exists():
+                continue
+            history = TrainingHistory(
+                history_dir=history_dir,
+                reconcile_on_load=False,
+            )
+            runs.extend(list(history.get_all_runs() or []))
+        except Exception:
+            continue
+
+    run_map: dict[str, list] = {}
+    snapshot_records: list[dict] = []
+    snapshot_count_keys: set[tuple[int, int, int]] = set()
+
+    for run in runs:
+        run_dataset = _normalize_dataset_browser_path(
+            getattr(run, "dataset_path", "")
+        )
+        if run_dataset:
+            run_map.setdefault(run_dataset, []).append(run)
+
+        # Zachowaj identyfikatory/fingerprint historycznego datasetu niezależnie
+        # od tego, czy po przeniesieniu projektu ścieżka dataset_path nadal jest
+        # identyczna.
+        for payload in (
+            getattr(run, "training_dataset_snapshot", None),
+            getattr(run, "training_dataset_input_snapshot", None),
+        ):
+            if not isinstance(payload, dict) or not payload:
+                continue
+            try:
+                counts_key = (
+                    int(payload.get("train_images", 0) or 0),
+                    int(payload.get("val_images", 0) or 0),
+                    int(payload.get("test_images", 0) or 0),
+                )
+            except Exception:
+                counts_key = (0, 0, 0)
+            if all(value > 0 for value in counts_key):
+                snapshot_count_keys.add(counts_key)
+
+            local_hint = str(payload.get("local_path_hint") or "").strip()
+            snapshot_name = str(payload.get("name") or "").strip()
+            if not snapshot_name and local_hint:
+                try:
+                    snapshot_name = Path(local_hint).name
+                except Exception:
+                    snapshot_name = ""
+
+            snapshot_records.append(
+                {
+                    "run": run,
+                    "dataset_id": str(payload.get("dataset_id") or "").strip(),
+                    "name": snapshot_name,
+                    "counts": counts_key,
+                    "split_sha256": str(payload.get("split_sha256") or "").strip(),
+                    "data_yaml_sha256": str(payload.get("data_yaml_sha256") or "").strip(),
+                }
+            )
+
+        # Jeżeli dataset jest wskazany przez historię, dodaj go nawet wtedy,
+        # gdy leży poza standardowym katalogiem skanowanym przez PZ1.
+        try:
+            raw_run_path = str(getattr(run, "dataset_path", "") or "").strip()
+            if raw_run_path:
+                run_root = Path(raw_run_path)
+                if run_root.is_file() and run_root.name.lower() == "data.yaml":
+                    run_root = run_root.parent
+                _add_candidate(run_root, "plate", 0.0)
+        except Exception:
+            pass
+
+    candidates = list(candidate_map.values())
+    rows: list[dict] = []
+    for path, target, stamp in candidates:
+        try:
+            root = Path(path)
+        except Exception:
+            continue
+
+        try:
+            cfg = safe_load_yaml(root / "data.yaml")
+        except Exception:
+            cfg = {}
+        if not isinstance(cfg, dict) or "kpt_shape" not in cfg:
+            continue
+
+        counts = dict(self._get_dataset_split_image_counts(root) or {})
+        train_count = int(counts.get("train", 0) or 0)
+        val_count = int(counts.get("val", 0) or 0)
+        test_count = int(counts.get("test", 0) or 0)
+        total_count = int(
+            counts.get("total", 0)
+            or (train_count + val_count + test_count)
+        )
+        if train_count <= 0 or val_count <= 0 or test_count <= 0:
+            continue
+
+        key = _normalize_dataset_browser_path(root)
+        linked_runs = list(run_map.get(key, []) or [])
+
+        # Po przeniesieniu projektu absolutna ścieżka z historii może być stara.
+        # Najpierw próbujemy zgodności nazwy + liczników splitu, a gdy to nie
+        # rozstrzyga, porównujemy właściwy fingerprint splitu.
+        counts_key = (train_count, val_count, test_count)
+        matched_snapshot_records: list[dict] = []
+
+        if not linked_runs:
+            same_name = [
+                record
+                for record in snapshot_records
+                if str(record.get("name") or "").strip().lower() == root.name.lower()
+                and tuple(record.get("counts") or ()) == counts_key
+            ]
+            same_name_runs = []
+            seen_run_ids = set()
+            for record in same_name:
+                run = record.get("run")
+                run_id = str(getattr(run, "id", "") or "").strip()
+                if run is not None and run_id not in seen_run_ids:
+                    seen_run_ids.add(run_id)
+                    same_name_runs.append(run)
+            if len(same_name_runs) == 1:
+                linked_runs = same_name_runs
+                matched_snapshot_records = same_name
+
+        if not linked_runs and counts_key in snapshot_count_keys:
+            try:
+                current_snapshot = build_training_dataset_snapshot(
+                    root,
+                    target="plate",
+                )
+            except Exception:
+                current_snapshot = {}
+            current_split = str(
+                (current_snapshot or {}).get("split_sha256") or ""
+            ).strip()
+            current_yaml = str(
+                (current_snapshot or {}).get("data_yaml_sha256") or ""
+            ).strip()
+            if current_split:
+                fingerprint_matches = []
+                for record in snapshot_records:
+                    if tuple(record.get("counts") or ()) != counts_key:
+                        continue
+                    if str(record.get("split_sha256") or "").strip() != current_split:
+                        continue
+                    historical_yaml = str(
+                        record.get("data_yaml_sha256") or ""
+                    ).strip()
+                    if historical_yaml and current_yaml and historical_yaml != current_yaml:
+                        continue
+                    fingerprint_matches.append(record)
+
+                seen_run_ids = set()
+                for record in fingerprint_matches:
+                    run = record.get("run")
+                    run_id = str(getattr(run, "id", "") or "").strip()
+                    if run is not None and run_id not in seen_run_ids:
+                        seen_run_ids.add(run_id)
+                        linked_runs.append(run)
+                matched_snapshot_records = fingerprint_matches
+
+        snapshot_ids = [
+            str(record.get("dataset_id") or "").strip()
+            for record in matched_snapshot_records
+            if str(record.get("dataset_id") or "").strip()
+        ]
+        run_ids = []
+        run_models = []
+        for run in linked_runs:
+            run_ids.append(str(getattr(run, "id", "") or "").strip())
+            model_name = Path(str(getattr(run, "base_model", "") or "")).name
+            if model_name:
+                run_models.append(model_name)
+
+            for payload in (
+                getattr(run, "training_dataset_snapshot", None),
+                getattr(run, "training_dataset_input_snapshot", None),
+            ):
+                if not isinstance(payload, dict):
+                    continue
+                dataset_id = str(payload.get("dataset_id") or "").strip()
+                if dataset_id:
+                    snapshot_ids.append(dataset_id)
+
+        snapshot_ids = list(dict.fromkeys(item for item in snapshot_ids if item))
+        run_ids = list(dict.fromkeys(item for item in run_ids if item))
+        run_models = list(dict.fromkeys(item for item in run_models if item))
+
+        try:
+            display_ref = build_dataset_display_ref(
+                root,
+                target_hint="plate",
+                counts=counts,
+            )
+            ui_id = display_ref.id
+            created = display_ref.created_label
+        except Exception:
+            ui_id = ""
+            try:
+                created = datetime.datetime.fromtimestamp(
+                    root.stat().st_mtime
+                ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                created = ""
+
+        scope = {}
+        try:
+            scope_path = root / "augmentation_scope.json"
+            if scope_path.is_file():
+                scope = json.loads(scope_path.read_text(encoding="utf-8-sig"))
+                if not isinstance(scope, dict):
+                    scope = {}
+        except Exception:
+            scope = {}
+
+        if scope:
+            generated = int(
+                scope.get("generated", 0)
+                or scope.get("requested_extra", 0)
+                or 0
+            )
+            role = f"AUG +{generated}" if generated > 0 else "AUG"
+            base_dataset = str(scope.get("source_dataset_dir") or "").strip()
+        else:
+            role = "BAZA"
+            base_dataset = ""
+
+        canonical_id = snapshot_ids[0] if snapshot_ids else ui_id
+        try:
+            display_path = self._format_workspace_relative_path(root)
+        except Exception:
+            display_path = str(root)
+
+        search_blob = " ".join(
+            [
+                canonical_id,
+                ui_id,
+                root.name,
+                role,
+                " ".join(snapshot_ids),
+                " ".join(run_ids),
+                " ".join(run_models),
+                display_path,
+                str(train_count),
+                str(val_count),
+                str(test_count),
+            ]
+        ).lower()
+
+        rows.append(
+            {
+                "path": str(root),
+                "canonical_id": canonical_id,
+                "ui_id": ui_id,
+                "role": role,
+                "train": train_count,
+                "val": val_count,
+                "test": test_count,
+                "total": total_count,
+                "created": created,
+                "run_ids": run_ids,
+                "models": run_models,
+                "display_path": display_path,
+                "base_dataset": base_dataset,
+                "stamp": float(stamp or 0.0),
+                "search_blob": search_blob,
+            }
+        )
+
+    rows.sort(key=lambda item: float(item.get("stamp", 0.0) or 0.0), reverse=True)
+    return rows
+
+
+def _open_ready_plate_dataset_browser(self):
+    """Otwórz aplikacyjną przeglądarkę gotowych datasetów tablic."""
+    existing = getattr(self, "_ready_plate_dataset_browser", None)
+    try:
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return existing
+    except Exception:
+        pass
+
+    rows = _collect_ready_plate_dataset_browser_rows(self)
+
+    dialog = tk.Toplevel(self.frame)
+    self._ready_plate_dataset_browser = dialog
+    dialog.title("Datasety tablic YOLO Pose")
+    try:
+        dialog.wm_transient("")
+    except Exception:
+        pass
+    try:
+        dialog.attributes("-toolwindow", False)
+    except Exception:
+        pass
+    dialog.resizable(True, True)
+    dialog.geometry("1280x680")
+    try:
+        dialog.minsize(900, 520)
+    except Exception:
+        pass
+
+    palette = getattr(getattr(self, "app", None), "palette", {}) or {}
+    bg = palette.get("panel", "#252526")
+    fg = palette.get("fg", "#f3f3f3")
+    muted = palette.get("muted", "#c7c7c7")
+    dialog.configure(bg=bg)
+
+    shell = tk.Frame(dialog, bg=bg, padx=12, pady=10)
+    shell.pack(fill=tk.BOTH, expand=True)
+
+    title = tk.Label(
+        shell,
+        text="Wybierz gotowy dataset tablic",
+        font=("Segoe UI Semibold", 12),
+        bg=bg,
+        fg=fg,
+        anchor=tk.W,
+    )
+    title.pack(fill=tk.X)
+
+    subtitle = tk.Label(
+        shell,
+        text=(
+            "Lista pokazuje tylko gotowe datasety YOLO Pose z niepustym train / val / test. "
+            "ID historyczne pochodzą z zapisanych runów treningowych, także po przeniesieniu projektu. "
+            "`Pokaż w Eksploratorze` służy tylko do inspekcji folderu; wyboru dokonujesz tutaj "
+            "przyciskiem `Wybierz dataset`."
+        ),
+        font=("Segoe UI", 9),
+        bg=bg,
+        fg=muted,
+        justify=tk.LEFT,
+        anchor=tk.W,
+        wraplength=1180,
+    )
+    subtitle.pack(fill=tk.X, pady=(3, 10))
+
+    filter_row = ttk.Frame(shell)
+    filter_row.pack(fill=tk.X, pady=(0, 8))
+    ttk.Label(filter_row, text="Filtr:").pack(side=tk.LEFT)
+    filter_var = tk.StringVar()
+    filter_entry = ttk.Entry(filter_row, textvariable=filter_var)
+    filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 8))
+
+    count_var = tk.StringVar(value="")
+    ttk.Label(filter_row, textvariable=count_var).pack(side=tk.RIGHT)
+
+    tree_frame = ttk.Frame(shell)
+    tree_frame.pack(fill=tk.BOTH, expand=True)
+
+    columns = (
+        "id",
+        "role",
+        "train",
+        "val",
+        "test",
+        "runs",
+        "created",
+        "folder",
+    )
+    tree = ttk.Treeview(
+        tree_frame,
+        columns=columns,
+        show="headings",
+        selectmode="browse",
+    )
+    headings = {
+        "id": "ID datasetu",
+        "role": "Wariant",
+        "train": "Train",
+        "val": "Val",
+        "test": "Test",
+        "runs": "Użyty przez run",
+        "created": "Utworzono",
+        "folder": "Folder",
+    }
+    widths = {
+        "id": 190,
+        "role": 90,
+        "train": 70,
+        "val": 60,
+        "test": 60,
+        "runs": 220,
+        "created": 125,
+        "folder": 330,
+    }
+    for column in columns:
+        tree.heading(column, text=headings[column])
+        tree.column(
+            column,
+            width=widths[column],
+            minwidth=50,
+            stretch=(column in {"id", "runs", "folder"}),
+            anchor=(tk.CENTER if column in {"train", "val", "test"} else tk.W),
+        )
+
+    vbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+    hbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=tree.xview)
+    tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    hbar.grid(row=1, column=0, sticky="ew")
+    tree_frame.rowconfigure(0, weight=1)
+    tree_frame.columnconfigure(0, weight=1)
+
+    detail_var = tk.StringVar(value="Zaznacz dataset, aby zobaczyć szczegóły.")
+    detail = tk.Label(
+        shell,
+        textvariable=detail_var,
+        font=("Segoe UI", 9),
+        bg=bg,
+        fg=muted,
+        justify=tk.LEFT,
+        anchor=tk.W,
+        wraplength=1180,
+    )
+    detail.pack(fill=tk.X, pady=(8, 6))
+
+    row_by_iid = {}
+    visible_rows = []
+
+    def _selected_row():
+        selection = tree.selection()
+        if not selection:
+            return None
+        return row_by_iid.get(selection[0])
+
+    def _update_details(_event=None):
+        row = _selected_row()
+        if not row:
+            detail_var.set("Zaznacz dataset, aby zobaczyć szczegóły.")
+            return
+        snapshots = row.get("canonical_id") or "-"
+        ui_id = row.get("ui_id") or "-"
+        runs_text = ", ".join(row.get("run_ids") or []) or "brak powiązanego runu"
+        models_text = ", ".join(row.get("models") or []) or "-"
+        base_text = row.get("base_dataset") or "-"
+        detail_var.set(
+            f"ID historyczne: {snapshots} | ID UI: {ui_id}\\n"
+            f"Split: train {row['train']} | val {row['val']} | test {row['test']} | razem {row['total']}\\n"
+            f"Runy: {runs_text} | modele startowe: {models_text}\\n"
+            f"Źródło bazowe: {base_text}\\n"
+            f"Ścieżka: {row['display_path']}"
+        )
+
+    def _populate(*_args):
+        query = str(filter_var.get() or "").strip().lower()
+        for item in tree.get_children():
+            tree.delete(item)
+        row_by_iid.clear()
+        visible_rows.clear()
+
+        for index, row in enumerate(rows):
+            if query and query not in str(row.get("search_blob") or ""):
+                continue
+            iid = f"ds_{index:05d}"
+            runs_text = ", ".join(row.get("run_ids") or [])
+            tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(
+                    row.get("canonical_id") or row.get("ui_id") or "-",
+                    row.get("role") or "-",
+                    row.get("train", 0),
+                    row.get("val", 0),
+                    row.get("test", 0),
+                    runs_text or "-",
+                    row.get("created") or "-",
+                    Path(str(row.get("path") or "")).name,
+                ),
+            )
+            row_by_iid[iid] = row
+            visible_rows.append(row)
+
+        count_var.set(f"{len(visible_rows)} datasetów")
+        children = tree.get_children()
+        if children:
+            tree.selection_set(children[0])
+            tree.focus(children[0])
+            tree.see(children[0])
+            _update_details()
+        else:
+            detail_var.set("Brak datasetów pasujących do filtra.")
+
+    def _choose(_event=None):
+        row = _selected_row()
+        if not row:
+            return
+        path = str(row.get("path") or "").strip()
+        if not path:
+            return
+        try:
+            self.creator_ready_dataset_var.set(path)
+            self._set_creator_source_mode("ready")
+            self._refresh_step4_dataset_mode_ui()
+            self._refresh_dataset_creator_cta_state()
+        except Exception:
+            pass
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+
+    def _preview():
+        row = _selected_row()
+        if not row:
+            return
+        try:
+            open_yolo_dataset_preview(self, row.get("path"))
+        except Exception as exc:
+            messagebox.showerror(
+                "Podgląd datasetu",
+                f"Nie udało się otworzyć podglądu:\\n{exc}",
+                parent=dialog,
+            )
+
+    def _open_folder():
+        row = _selected_row()
+        if not row:
+            return
+        path = Path(str(row.get("path") or ""))
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                webbrowser.open(path.as_uri())
+        except Exception as exc:
+            messagebox.showerror(
+                "Folder datasetu",
+                f"Nie udało się otworzyć folderu:\\n{exc}",
+                parent=dialog,
+            )
+
+    button_row = ttk.Frame(shell)
+    button_row.pack(fill=tk.X, pady=(6, 0))
+    ttk.Button(
+        button_row,
+        text="Podgląd",
+        command=_preview,
+    ).pack(side=tk.LEFT)
+    ttk.Button(
+        button_row,
+        text="Pokaż w Eksploratorze",
+        command=_open_folder,
+    ).pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Button(
+        button_row,
+        text="Anuluj",
+        command=dialog.destroy,
+    ).pack(side=tk.RIGHT)
+    ttk.Button(
+        button_row,
+        text="Wybierz dataset",
+        command=_choose,
+        style="Accent.TButton",
+    ).pack(side=tk.RIGHT, padx=(0, 8))
+
+    tree.bind("<<TreeviewSelect>>", _update_details, add="+")
+    tree.bind("<Double-Button-1>", _choose, add="+")
+    filter_var.trace_add("write", _populate)
+    filter_entry.bind("<Return>", lambda _e: _choose(), add="+")
+
+    def _cleanup(_event=None):
+        try:
+            if getattr(self, "_ready_plate_dataset_browser", None) is dialog:
+                self._ready_plate_dataset_browser = None
+        except Exception:
+            pass
+
+    dialog.bind("<Destroy>", _cleanup, add="+")
+    dialog.bind("<Escape>", lambda _e: dialog.destroy(), add="+")
+    _populate()
+    try:
+        filter_entry.focus_set()
+        dialog.lift()
+        dialog.focus_force()
+    except Exception:
+        pass
+    return dialog
+
+
+def _resolve_ready_plate_dataset_source(self) -> dict:
+    result = {
+        "ok": False,
+        "dataset_path": None,
+        "counts": {},
+        "message": "Wskaż gotowy split tablic YOLO Pose.",
+    }
+    raw = str(getattr(self, "creator_ready_dataset_var", tk.StringVar()).get() or "").strip()
+    if not raw:
+        return result
+
+    try:
+        root = Path(raw)
+        if root.is_file() and root.name.lower() == "data.yaml":
+            root = root.parent
+    except Exception:
+        result["message"] = "Nie udało się odczytać ścieżki gotowego splitu."
+        return result
+
+    yaml_path = root / "data.yaml"
+    if not root.exists() or not root.is_dir() or not yaml_path.is_file():
+        result["message"] = "Wybrany katalog nie zawiera pliku data.yaml."
+        return result
+
+    try:
+        cfg = safe_load_yaml(yaml_path)
+    except Exception as exc:
+        result["message"] = f"Nie udało się odczytać data.yaml: {exc}"
+        return result
+    if not isinstance(cfg, dict) or "kpt_shape" not in cfg:
+        result["message"] = "Wybrany dataset nie jest datasetem YOLO Pose tablic."
+        return result
+
+    counts = dict(self._get_dataset_split_image_counts(root) or {})
+    train_count = int(counts.get("train", 0) or 0)
+    val_count = int(counts.get("val", 0) or 0)
+    test_count = int(counts.get("test", 0) or 0)
+    if train_count <= 0 or val_count <= 0 or test_count <= 0:
+        result["message"] = (
+            "Gotowy split musi zawierać niepuste train, val i test. "
+            f"Rozpoznano: train={train_count}, val={val_count}, test={test_count}."
+        )
+        return result
+
+    result.update(
+        {
+            "ok": True,
+            "dataset_path": root,
+            "counts": counts,
+            "message": (
+                "Gotowy split YOLO Pose: "
+                f"train={train_count} | val={val_count} | test={test_count}. "
+                "PZ1 zachowa ten podział; syntetyki trafią wyłącznie do train."
+            ),
+        }
+    )
+    return result
+
+
+def _create_ready_plate_dataset_variant_thread(self):
+    info = _resolve_ready_plate_dataset_source(self)
+    if not bool(info.get("ok")):
+        self._refresh_dataset_creator_cta_state()
+        self._handle_step4_dataset_failure_result(
+            message=str(info.get("message") or "Wskaż poprawny gotowy split tablic."),
+            target="plate",
+            critical=False,
+        )
+        return
+
+    source_dir = Path(info["dataset_path"])
+    source_counts = dict(info.get("counts") or {})
+    profile = self._get_step4_augmentation_profile("plate")
+
+    if not self._begin_step4_operation(
+        "z4.dataset.build",
+        "Z4: wariant z gotowego splitu tablic",
+    ):
+        return
+    self.dataset_build_is_running = True
+    self.ds_progress_var.set(0)
+    self._style_training_success_label(self.ds_status)
+    self._set_training_widget_text(
+        self.ds_status,
+        "Przygotowuję wariant z zamrożonego splitu tablic...",
+    )
+
+    def worker():
+        try:
+            if _step4_profile_requests_augmentation(profile):
+                variant = self._create_step4_augmented_dataset_variant(
+                    source_dataset_path=source_dir,
+                    target="plate",
+                    profile=profile,
+                    progress_var_name="ds_progress_var",
+                    status_attr_name="ds_status",
+                )
+                if not bool(variant.get("ok", True)):
+                    failure_msg = str(
+                        variant.get("message")
+                        or "Nie udało się utworzyć wariantu augmentowanego."
+                    )
+                    self._ui(
+                        lambda msg=failure_msg: self._handle_step4_dataset_failure_result(
+                            message=msg,
+                            target="plate",
+                            critical=False,
+                        )
+                    )
+                    return
+                result_path = Path(str(variant.get("dataset_path") or source_dir))
+                counts = dict(
+                    variant.get("counts")
+                    or self._get_dataset_split_image_counts(result_path)
+                )
+                meta = dict(variant)
+                message = str(variant.get("message") or "").strip()
+                if not message:
+                    message = (
+                        "Utworzono wariant potomny z gotowego splitu. "
+                        "Val i test pozostają oryginalne; augmentacja dotyczy wyłącznie train."
+                    )
+            else:
+                result_path = source_dir
+                counts = source_counts
+                meta = {
+                    "augmented": False,
+                    "generated": 0,
+                    "requested_extra": 0,
+                    "base_total": int(source_counts.get("total", 0) or 0),
+                    "augmented_total": int(source_counts.get("total", 0) or 0),
+                }
+                message = (
+                    "Wybrano istniejący gotowy split bez tworzenia nowego podziału. "
+                    "Train / val / test pozostają bez zmian."
+                )
+
+            self._ui(lambda p=str(result_path): self.ds_out_var.set(p))
+            self._ui(
+                lambda p=str(result_path), msg=message, c=dict(counts), m=dict(meta):
+                self._handle_step4_dataset_success_result(
+                    dataset_path=p,
+                    message=msg,
+                    target="plate",
+                    counts=c,
+                    result_meta=m,
+                )
+            )
+        except Exception as exc:
+            logger.exception("Nie udało się przygotować wariantu z gotowego splitu tablic")
+            self._ui(
+                lambda err=str(exc): self._handle_step4_dataset_failure_result(
+                    message=err,
+                    target="plate",
+                    critical=True,
+                )
+            )
+        finally:
+            self.dataset_build_is_running = False
+            self._end_step4_operation("z4.dataset.build")
+            self._ui(self._refresh_dataset_creator_cta_state)
+            self._ui(self._refresh_training_start_state)
+
+    threading.Thread(target=worker, daemon=True).start()
+
 def _resolve_dataset_creator_inputs(self) -> dict:
     result = {
         "ok": False,
@@ -1168,25 +2038,55 @@ def _refresh_dataset_creator_cta_state(self):
     except Exception:
         in_campaign = False
     if not in_campaign and self._get_creator_source_mode() == "ready":
+        info = _resolve_ready_plate_dataset_source(self)
         try:
-            self._pending_step4_input_training_source = None
+            busy = bool(self._step4_has_active_operation())
+        except Exception:
+            busy = False
+        profile = self._get_step4_augmentation_profile("plate")
+        requested_extra = max(0, int(getattr(profile, "extra_count", 0) or 0))
+        enabled = bool(info.get("ok")) and not busy
+        try:
+            btn.configure(
+                state=(tk.NORMAL if enabled else tk.DISABLED),
+                text=(
+                    f"Utwórz wariant z gotowego splitu (+{requested_extra} train)"
+                    if requested_extra > 0
+                    else "Użyj gotowego splitu bez zmian"
+                ),
+            )
         except Exception:
             pass
-        self._schedule_step4_dataset_summary_refresh()
-        try:
-            btn.configure(state=tk.DISABLED)
-        except Exception:
-            pass
+
+        ready_label = getattr(self, "creator_ready_dataset_lbl", None)
+        if ready_label is not None:
+            try:
+                self._set_training_widget_text(
+                    ready_label,
+                    str(info.get("message") or "Wskaż gotowy split tablic YOLO Pose."),
+                )
+            except Exception:
+                pass
+
         status = getattr(self, "ds_status", None)
         if status is not None:
             try:
                 self._style_training_success_label(status)
                 self._set_training_widget_text(
                     status,
-                    "Gotowy dataset jest już wejściem treningowym. Przejdź dalej do PZ2.",
+                    (
+                        "Gotowy do utworzenia wariantu potomnego z zachowaniem splitu."
+                        if enabled and requested_extra > 0
+                        else (
+                            "Gotowy split może zostać użyty bez ponownego losowania train / val / test."
+                            if enabled
+                            else str(info.get("message") or "Wskaż gotowy split tablic.")
+                        )
+                    ),
                 )
             except Exception:
                 pass
+        self._schedule_step4_dataset_summary_refresh()
         return
 
     info = self._resolve_dataset_creator_inputs()
@@ -2091,6 +2991,15 @@ def _legacy_step4_augmentation_summary_details(profile: AugmentationProfile, tar
 def _get_step4_augmentation_source_signature(self, target: str) -> str:
     normalized = CONFIG.normalize_task_target(target)
     if normalized == "plate":
+        try:
+            ready_mode = self._get_creator_source_mode() == "ready"
+        except Exception:
+            ready_mode = False
+        if ready_mode:
+            ready_raw = str(
+                getattr(self, "creator_ready_dataset_var", tk.StringVar()).get() or ""
+            ).strip()
+            return f"plate_ready|{ready_raw}"
         images_raw = str(getattr(self, "cvat_images_var", tk.StringVar()).get() or "").strip()
         xml_raw = str(getattr(self, "cvat_xml_var", tk.StringVar()).get() or "").strip()
         return f"plate|{images_raw}|{xml_raw}"
@@ -2102,11 +3011,14 @@ def _get_step4_augmentation_source_count(self, target: str) -> int:
     prefix = _get_step4_augmentation_prefix(normalized)
     signature = _get_step4_augmentation_source_signature(self, normalized)
     parts = signature.split("|")
-    source_incomplete = (
-        len(parts) < 3 or not parts[1] or not parts[2]
-        if normalized == "plate"
-        else len(parts) < 2 or not parts[1]
-    )
+    if normalized == "plate" and parts and parts[0] == "plate_ready":
+        source_incomplete = len(parts) < 2 or not parts[1]
+    else:
+        source_incomplete = (
+            len(parts) < 3 or not parts[1] or not parts[2]
+            if normalized == "plate"
+            else len(parts) < 2 or not parts[1]
+        )
     if source_incomplete:
         try:
             setattr(self, f"{prefix}_aug_source_count", 0)
@@ -2354,6 +3266,26 @@ def _get_step4_augmentation_preview_images(self, target: str) -> list[Path]:
     roots: list[Path] = []
     source_count = 0
     if normalized == "plate":
+        try:
+            ready_mode = self._get_creator_source_mode() == "ready"
+        except Exception:
+            ready_mode = False
+        if ready_mode:
+            ready_raw = str(
+                getattr(self, "creator_ready_dataset_var", tk.StringVar()).get() or ""
+            ).strip()
+            if ready_raw:
+                try:
+                    ready_root = Path(ready_raw)
+                    if ready_root.is_file() and ready_root.name.lower() == "data.yaml":
+                        ready_root = ready_root.parent
+                    train_root = ready_root / "images" / "train"
+                    ready_images = list(get_image_files(train_root))
+                    source_count = len(ready_images)
+                    setattr(self, "creator_aug_source_count", int(source_count))
+                    return ready_images[:80]
+                except Exception:
+                    pass
         images_raw = str(getattr(self, "cvat_images_var", tk.StringVar()).get() or "").strip()
         xml_raw = str(getattr(self, "cvat_xml_var", tk.StringVar()).get() or "").strip()
         if images_raw and xml_raw:
@@ -2427,6 +3359,13 @@ def _estimate_step4_augmentation_train_pool_limit(self, target: str, source_coun
         total = 0
     if total <= 0:
         return 0
+    if CONFIG.normalize_task_target(target) == "plate":
+        try:
+            if self._get_creator_source_mode() == "ready":
+                # Dla gotowego splitu source_count jest już licznością train.
+                return total
+        except Exception:
+            pass
     try:
         train_pct = float(getattr(self, "train_pct", tk.DoubleVar(value=80)).get() or 80.0)
     except Exception:
@@ -2959,17 +3898,21 @@ def _format_step4_mz_completion_label(status: str, deficits: dict | None = None,
     normalized = str(status or "").strip().upper()
     deficits = dict(deficits or {})
     warnings = list(warnings or [])
+    if normalized == "SOURCE_ONLY_READY_WITH_REPRESENTATION_WARNING":
+        return "Niepełne — wariant dopuszczony"
+    if normalized == "SOURCE_ONLY_READY":
+        return "Wystarczające"
     if normalized == "REPRESENTATION_OK":
-        return "OK - próg AUTO spełniony"
+        return "Wystarczające"
     if normalized == "REPRESENTATION_OK_WITH_DIVERSITY_WARNING":
-        return "OK - próg spełniony, ale sprawdź różnorodność: " + (", ".join(map(str, warnings)) or "wybrane klasy")
+        return "Wystarczające, ale mała różnorodność: " + (", ".join(map(str, warnings)) or "wybrane znaki")
     if normalized == "PLAN_NOT_FEASIBLE":
-        return "Nieosiągalna przy aktualnym materiale"
+        return "Nie można osiągnąć ustawionego progu"
     if normalized == "TARGET_NOT_REACHED":
-        return "Nie osiągnięto progu: " + (", ".join(f"{key}: {value}" for key, value in sorted(deficits.items())) or "pozostały braki")
+        return "Nie osiągnięto ustawionego progu"
     if normalized == "VAL_TEST_CHANGED":
-        return "Błąd freeze - zmienił się split val/test"
-    return "Status zapisany w manifeście"
+        return "Błąd: zmienił się podział val/test"
+    return "Stan nieokreślony"
 
 
 def _invalidate_pending_character_balance_plan(self, message: str | None = None) -> None:
@@ -3063,6 +4006,7 @@ def _finalize_step4_mz_representation_variant(
     requested_extra: int = 0,
     augmented: bool = False,
     pending_real_sources: dict | None = None,
+    representation_required: bool = True,
 ) -> dict:
     dataset_dir = Path(dataset_path)
     counts = dict(counts or self._get_dataset_split_image_counts(dataset_dir))
@@ -3078,23 +4022,35 @@ def _finalize_step4_mz_representation_variant(
     representation_status, remaining_deficits, diversity_warnings = _step4_mz_completion_status_from_distribution(after_distribution)
     freeze_status = _step4_mz_freeze_status(val_test_guard)
     plan_feasible = bool(_step4_plan_attr(plan, "feasible", True))
-    if not plan_feasible and remaining_deficits and generated <= 0:
-        execution_status = "NOT_RUN"
+
+    if representation_required:
+        if not plan_feasible and remaining_deficits and generated <= 0:
+            execution_status = "NOT_RUN"
+        else:
+            execution_status = _step4_mz_execution_status(generated, requested_extra)
+        completion_status = _step4_mz_final_completion_status(
+            representation_status=representation_status,
+            freeze_status=freeze_status,
+            execution_status=execution_status,
+            plan_feasible=plan_feasible,
+            generated=generated,
+            deficits=remaining_deficits,
+        )
+        ready_for_training = _step4_mz_ready_for_training(
+            execution_status=execution_status,
+            representation_status=representation_status,
+            freeze_status=freeze_status,
+        )
     else:
-        execution_status = _step4_mz_execution_status(generated, requested_extra)
-    completion_status = _step4_mz_final_completion_status(
-        representation_status=representation_status,
-        freeze_status=freeze_status,
-        execution_status=execution_status,
-        plan_feasible=plan_feasible,
-        generated=generated,
-        deficits=remaining_deficits,
-    )
-    ready_for_training = _step4_mz_ready_for_training(
-        execution_status=execution_status,
-        representation_status=representation_status,
-        freeze_status=freeze_status,
-    )
+        # Przy syntetykach = 0 pokrycie klas jest diagnostyką jakości,
+        # a nie warunkiem utworzenia zwykłego wariantu train/val/test.
+        execution_status = "NOT_REQUESTED"
+        completion_status = (
+            "SOURCE_ONLY_READY_WITH_REPRESENTATION_WARNING"
+            if remaining_deficits or diversity_warnings
+            else "SOURCE_ONLY_READY"
+        )
+        ready_for_training = bool(str(freeze_status or "").upper() == "UNCHANGED")
 
     analysis_dir = dataset_dir / "analysis"
     before_refs = save_character_distribution_artifacts(
@@ -3122,7 +4078,7 @@ def _finalize_step4_mz_representation_variant(
         },
         base_dataset_sha_or_fingerprint=base_fingerprint,
         val_test_unchanged=val_test_guard,
-        augmentation_mode="mz_auto_representation",
+        augmentation_mode=("mz_auto_representation" if representation_required else "source_only"),
         requested_images=requested_extra,
         planned_images=max(0, int(_step4_plan_attr(plan, "planned_images", requested_extra) or 0)),
         generated_images=generated,
@@ -3132,7 +4088,9 @@ def _finalize_step4_mz_representation_variant(
     manifest["augmentation"]["randomness_mode"] = str(getattr(profile, "randomness_mode", "") or "")
     manifest["deficit_after"] = dict(remaining_deficits)
     manifest["diversity_warnings"] = list(diversity_warnings)
-    manifest["approved_balance_plan"] = True
+    manifest["approved_balance_plan"] = bool(representation_required)
+    manifest["representation_required"] = bool(representation_required)
+    manifest["representation_policy"] = "blocking" if representation_required else "advisory"
     manifest["execution_status"] = execution_status
     manifest["representation_status"] = representation_status
     manifest["freeze_status"] = freeze_status
@@ -3143,19 +4101,38 @@ def _finalize_step4_mz_representation_variant(
     )
 
     ok = bool(ready_for_training)
-    if completion_status == "REPRESENTATION_OK":
-        status_message = "Reprezentacja MZ: OK"
-    elif completion_status == "REPRESENTATION_OK_WITH_DIVERSITY_WARNING":
-        status_message = "Reprezentacja MZ: OK, ale sprawdź różnorodność klas " + ", ".join(diversity_warnings)
-    elif completion_status == "PLAN_NOT_FEASIBLE":
-        status_message = "Reprezentacja MZ: nieosiągalna przy aktualnym materiale"
+    if not representation_required:
+        status_message = "Wariant źródłowy gotowy bez syntetycznego uzupełniania"
+        if remaining_deficits:
+            missing_text = ", ".join(
+                f"{symbol}: {count}"
+                for symbol, count in sorted(remaining_deficits.items())
+            )
+            message = (
+                f"{status_message}. Pokrycie znaków MZ jest niepełne: {missing_text}. "
+                "To ostrzeżenie jakościowe, nie blokada wariantu."
+            )
+        elif diversity_warnings:
+            message = (
+                f"{status_message}. Niska różnorodność klas: {', '.join(diversity_warnings)}. "
+                "To ostrzeżenie jakościowe, nie blokada wariantu."
+            )
+        else:
+            message = f"{status_message}. Pokrycie znaków MZ nie wymaga dodatkowego ostrzeżenia."
     else:
-        status_message = "Reprezentacja MZ: wymaga poprawy"
-    if remaining_deficits:
-        missing_text = ", ".join(f"{symbol}: {count}" for symbol, count in sorted(remaining_deficits.items()))
-        message = f"{status_message}. Pozostałe braki: {missing_text}."
-    else:
-        message = f"{status_message}. Próg AUTO: {int(_step4_plan_attr(plan, 'target_count', 0) or 0)}."
+        if completion_status == "REPRESENTATION_OK":
+            status_message = "Reprezentacja MZ: OK"
+        elif completion_status == "REPRESENTATION_OK_WITH_DIVERSITY_WARNING":
+            status_message = "Reprezentacja MZ: OK, ale sprawdź różnorodność klas " + ", ".join(diversity_warnings)
+        elif completion_status == "PLAN_NOT_FEASIBLE":
+            status_message = "Reprezentacja MZ: nieosiągalna przy aktualnym materiale"
+        else:
+            status_message = "Reprezentacja MZ: wymaga poprawy"
+        if remaining_deficits:
+            missing_text = ", ".join(f"{symbol}: {count}" for symbol, count in sorted(remaining_deficits.items()))
+            message = f"{status_message}. Pozostałe braki: {missing_text}."
+        else:
+            message = f"{status_message}. Próg AUTO: {int(_step4_plan_attr(plan, 'target_count', 0) or 0)}."
     if not bool(val_test_guard.get("unchanged")):
         message += " Walidacja freeze: split val/test zmienił się podczas finalizacji."
 
@@ -3750,6 +4727,8 @@ def _handle_step4_dataset_success_result(
     elif total_count > 0:
         summary_rows.append(("Razem", f"{total_count} obrazów"))
     mz_manifest = result_meta.get("mz_training_variant_manifest") if isinstance(result_meta, dict) else None
+    source_only_variant = False
+    source_only_has_warning = False
     if CONFIG.normalize_task_target(target) == "char" and isinstance(mz_manifest, dict) and mz_manifest:
         status = str(mz_manifest.get("completion_status") or "").strip()
         target_count = int(mz_manifest.get("target_count", 0) or 0)
@@ -3757,35 +4736,66 @@ def _handle_step4_dataset_success_result(
         generated_images = int(mz_manifest.get("generated_images", 0) or 0)
         deficits_after = dict(mz_manifest.get("deficit_after") or {})
         diversity_warnings = list(mz_manifest.get("diversity_warnings") or [])
+        representation_required = bool(mz_manifest.get("representation_required", True))
+        source_only_variant = not representation_required
+        source_only_has_warning = bool(deficits_after or diversity_warnings)
+
         summary_rows.append((
-            "Reprezentacja MZ",
+            "Pokrycie znaków",
             _format_step4_mz_completion_label(status, deficits_after, diversity_warnings),
         ))
-        if target_count > 0:
-            summary_rows.append(("Miarka reprezentacji", f"{target_count} przykładów znaku w train"))
-        summary_rows.append(("Uzupełnienie train", f"ustawiono +{planned_images} | wygenerowano +{generated_images}"))
+        if representation_required and target_count > 0:
+            summary_rows.append(("Próg pokrycia", f"{target_count} przykładów każdego znaku w train"))
+        if representation_required:
+            summary_rows.append((
+                "Syntetyczne uzupełnienie",
+                f"ustawiono +{planned_images} | wygenerowano +{generated_images}",
+            ))
+        else:
+            summary_rows.append(("Syntetyczne uzupełnienie", "wyłączone (0 obrazów)"))
     if path_text:
         summary_rows.append(("Lokalizacja", path_text))
 
     if augmented and generated > 0:
-        hero_text = "WARIANT UTWORZONO"
+        hero_text = "WARIANT GOTOWY"
         hero_subtitle = (
             f"Dodano +{generated} syntetycznych obrazów train. "
-            f"Wariant ma teraz {augmented_total or total_count} obrazów i jest wejściem treningu. "
+            f"Wariant ma teraz {augmented_total or total_count} obrazów i jest gotowy do dalszej pracy. "
             "Syntetyki nie zasilają puli projektu ani kolejnej iteracji."
         )
+    elif source_only_variant:
+        hero_text = "WARIANT GOTOWY"
+        hero_subtitle = (
+            f"Utworzono podział train {train_count} / val {val_count} / test {test_count} "
+            f"z {total_count} obrazów. Syntetyczne uzupełnienie jest wyłączone."
+        )
     else:
-        hero_text = "WARIANT UTWORZONO"
-        hero_subtitle = f"Wariant ma {total_count} obrazów i jest ustawiony jako bieżące wejście treningu." if total_count else "Wariant został zapisany i ustawiony jako bieżące wejście treningu."
+        hero_text = "WARIANT GOTOWY"
+        hero_subtitle = (
+            f"Wariant ma {total_count} obrazów i jest gotowy do dalszej pracy."
+            if total_count
+            else "Wariant został zapisany i jest gotowy do dalszej pracy."
+        )
 
-    body = "Sprawdź krótkie podsumowanie i wybierz, co zrobić z utworzonym wariantem."
-    guidance = "Jeśli wariant wygląda dobrze, możesz od razu trenować model. Jeśli nie, usuń wariant i zbuduj go ponownie."
+    body = "Wariant jest gotowy. Sprawdź podział i ewentualne ostrzeżenia."
+    if source_only_variant and source_only_has_warning:
+        guidance = (
+            "Niepełne pokrycie znaków jest ostrzeżeniem jakościowym i nie blokuje treningu. "
+            "Możesz przejść do treningu albo zamknąć podsumowanie."
+        )
+    elif source_only_variant:
+        guidance = "Wariant jest gotowy do treningu bez syntetycznego uzupełniania."
+    else:
+        guidance = (
+            "Jeśli wariant wygląda dobrze, przejdź do treningu. "
+            "Jeśli nie, usuń wariant i zbuduj go ponownie."
+        )
 
     result_action = self._show_step4_dataset_result_modal(
-        title="Wariant datasetu gotowy",
+        title="Wariant treningowy gotowy",
         body=body,
         allow_pz2=True,
-        primary_text="Trenuj na tym wariancie",
+        primary_text="Przejdź do treningu",
         secondary_text="Zamknij podsumowanie",
         preview_path=dataset_path,
         summary_rows=summary_rows,
@@ -3844,6 +4854,17 @@ def _handle_step4_dataset_failure_result(
         self._open_pz2_from_dataset_result()
 
 def _create_dataset_thread(self):
+    try:
+        ready_mode = (
+            not bool(CAMPAIGN.get_active_project_name())
+            and self._get_selected_training_target() == "plate"
+            and self._get_creator_source_mode() == "ready"
+        )
+    except Exception:
+        ready_mode = False
+    if ready_mode:
+        return _create_ready_plate_dataset_variant_thread(self)
+
     source_info = self._resolve_dataset_creator_inputs()
     if not bool(source_info.get("ok")):
         self._refresh_dataset_creator_cta_state()
@@ -4147,6 +5168,7 @@ def _split_dataset_thread(self):
     }
 
     augmentation_profile = self._get_step4_augmentation_profile("char")
+    augmentation_requested = bool(_step4_profile_requests_augmentation(augmentation_profile))
     try:
         profile_requested_extra = max(0, int(getattr(augmentation_profile, "extra_count", 0) or 0))
     except Exception:
@@ -4169,7 +5191,7 @@ def _split_dataset_thread(self):
     except Exception:
         pending_target_count = 0
     manual_augmentation_requested = bool(
-        _step4_profile_requests_augmentation(augmentation_profile)
+        augmentation_requested
         and (pending_balance_plan is None or profile_requested_extra != pending_planned_extra)
     )
 
@@ -4265,6 +5287,62 @@ def _split_dataset_thread(self):
                     _clear_pending_character_balance_plan(self)
                 except Exception:
                     pass
+
+                if not augmentation_requested:
+                    variant = _finalize_step4_mz_representation_variant(
+                        self,
+                        dataset_path=out,
+                        plan=exact_balance_plan,
+                        profile=augmentation_profile,
+                        counts=dataset_counts,
+                        generated=0,
+                        requested_extra=0,
+                        augmented=False,
+                        representation_required=False,
+                    )
+                    if str(variant.get("message") or "").strip():
+                        msg = f"{msg}\n{variant.get('message')}"
+                    if bool(variant.get("ok", True)):
+                        result_meta = dict(variant)
+                        final_status_message = str(variant.get("status_message") or "").strip() or None
+                        self._ui(lambda: self._style_training_success_label(self.split_status))
+                        self._ui(
+                            lambda counts=dict(dataset_counts), final_msg=final_status_message: self._set_training_widget_text(
+                                self.split_status,
+                                final_msg or (
+                                    "Wariant treningowy został przygotowany: "
+                                    f"train={int(counts.get('train', 0) or 0)}, "
+                                    f"val={int(counts.get('val', 0) or 0)}, "
+                                    f"test={int(counts.get('test', 0) or 0)}"
+                                ),
+                            )
+                        )
+                        self._ui(
+                            lambda p=str(result_dataset_path), msg=str(msg), counts=dict(dataset_counts), meta=dict(result_meta): self._handle_step4_dataset_success_result(
+                                dataset_path=p,
+                                message=msg,
+                                target="char",
+                                counts=counts,
+                                result_meta=meta,
+                            )
+                        )
+                    else:
+                        failure_msg = str(
+                            variant.get("message")
+                            or "Nie udało się zapisać zwykłego wariantu źródłowego."
+                        )
+                        self._ui(lambda: self._style_training_error_label(self.split_status))
+                        self._ui(lambda msg=failure_msg: self._set_training_widget_text(self.split_status, msg))
+                        self._ui(
+                            lambda msg=failure_msg: self._handle_step4_dataset_failure_result(
+                                message=msg,
+                                target="char",
+                                critical=False,
+                                allow_pz2_override=False,
+                            )
+                        )
+                    return
+
                 if not exact_feasible and exact_planned_images <= 0:
                     try:
                         result_meta = _finalize_step4_mz_representation_variant(

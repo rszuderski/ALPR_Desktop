@@ -21,13 +21,18 @@ import random
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from ..config import CONFIG, CV2_AVAILABLE, YAML_AVAILABLE, cv2, logger, np, yaml
+from ..config import CONFIG, CV2_AVAILABLE, YAML_AVAILABLE, cv2, logger, np, yaml, get_torch_module, is_cuda_available
 from ..utils import safe_load_yaml
+from .augmentation_ranges import (
+    GROUP_LABELS, SPEC_BY_KEY, is_range_config, normalize_range_config, sample_explicit_ranges,
+)
 
 
+_PREVIEW_RENDER_LOCK = threading.RLock()
 MAX_DIRT_FLOW_POINTS = 2000
 MAX_RAIN_DROPS = 60000
 MAX_RAIN_LENS_PIXELS = 1_600_000
@@ -526,15 +531,15 @@ def _percent(value: object, default: float = 100.0) -> float:
 
 
 def default_manual_randomness_config(target: str | None = None) -> dict:
+    """Ręczne odchyłki są opt-in: domyślnie wszystko OFF / 0%."""
     normalized_target = _normalize_task_target_value(target, fallback="char") if target else "char"
     groups: dict[str, dict] = {}
     for spec in manual_randomness_group_specs(normalized_target):
-        applicable = bool(spec.get("applicable", True))
         groups[spec["key"]] = {
-            "enabled": bool(applicable),
-            "amount": 100.0 if applicable else 0.0,
+            "enabled": False,
+            "amount": 0.0,
             "fields": {
-                field_spec["key"]: {"enabled": bool(applicable), "amount": 100.0 if applicable else 0.0}
+                field_spec["key"]: {"enabled": False, "amount": 0.0}
                 for field_spec in spec.get("fields", [])
             },
         }
@@ -543,6 +548,8 @@ def default_manual_randomness_config(target: str | None = None) -> dict:
 
 def normalize_manual_randomness_config(value: object, target: str | None = None) -> dict:
     normalized_target = _normalize_task_target_value(target, fallback="char") if target else "char"
+    if is_range_config(value):
+        return normalize_range_config(value, normalized_target, normalize_manual_randomness_config)
     base = default_manual_randomness_config(normalized_target)
     incoming = value if isinstance(value, dict) else {}
     incoming_groups = incoming.get("groups") if isinstance(incoming.get("groups"), dict) else incoming
@@ -586,6 +593,20 @@ def normalize_manual_randomness_config(value: object, target: str | None = None)
 
 def describe_manual_randomness_config(value: object, target: str | None = None) -> dict:
     normalized = normalize_manual_randomness_config(value, target)
+    if is_range_config(normalized):
+        summary = describe_manual_randomness_config(normalized["legacy"], normalized["target"])
+        overridden = {field for key in normalized["overrides"] for field in SPEC_BY_KEY[key].fields}
+        for group in summary["groups"]:
+            for item in group["fields"]:
+                if item["key"] in overridden:
+                    item["enabled"] = False
+            group["enabled"] = group["enabled"] and any(item["enabled"] for item in group["fields"])
+        summary["schema"] = "augmentation_manual_randomness_summary_v2"
+        summary["ranges"] = [dict(key=key, label=SPEC_BY_KEY[key].label,
+                                  group=GROUP_LABELS[SPEC_BY_KEY[key].group], unit=SPEC_BY_KEY[key].unit,
+                                  paired=len(SPEC_BY_KEY[key].fields) > 1, **state)
+                             for key, state in normalized["overrides"].items()]
+        return summary
     summary: list[dict] = []
     for spec in manual_randomness_group_specs(normalized.get("target") or target):
         group = normalized["groups"].get(spec["key"], {})
@@ -1268,6 +1289,8 @@ def install_albumentations(
     """Install Albumentations on explicit user request."""
     if is_albumentations_available():
         return True, "Albumentations jest już zainstalowane."
+    if getattr(sys, 'frozen', False):
+        return False, 'Niekompletna instalacja: brak Albumentations. Rozpakuj ponownie cały pakiet ALPR Desktop.'
 
     cmd = build_albumentations_install_command()
     if callable(line_callback):
@@ -3725,6 +3748,12 @@ def _jitter_augmentation_profile(profile: AugmentationProfile, rng: random.Rando
     randomness_mode = normalize_augmentation_randomness_mode(getattr(base, "randomness_mode", "realistic"))
     if randomness_mode == "fixed":
         return base
+    if randomness_mode == "manual" and is_range_config(base.manual_randomness):
+        config = base.manual_randomness
+        # Preserve the exact legacy RNG sequence for all untouched fields.
+        legacy_base = replace(base, manual_randomness=config["legacy"])
+        legacy_sample = _jitter_augmentation_profile(legacy_base, rng)
+        return sample_explicit_ranges(base, legacy_sample, config, rng.getrandbits(64))
     effective_randomness_mode = "realistic" if randomness_mode == "manual" else randomness_mode
     rain_min, rain_max = _jitter_range_pair(
         base.rain_drop_size_min,
@@ -4701,6 +4730,165 @@ def _rain_drop_direction(profile: AugmentationProfile, average_drop_size: float)
     return wind_x / direction_norm, fall_y / direction_norm
 
 
+def _build_scene_rain_edge_gate(image, profile: AugmentationProfile):
+    """Show every collision edge, including those reached only by local wind."""
+    gate, _, _ = _rain_collision_geometry(image, _contour_detection_sensitivity(profile))
+    return np.where(gate > .05, gate, 0).astype("float32")
+
+
+def _rain_collision_geometry(image, sensitivity: float):
+    """Unoriented 2D edges; incidence is evaluated for each actual drop velocity."""
+    scene = image.astype("float32") / 255.0
+    luma = scene[:, :, 0] * .114 + scene[:, :, 1] * .587 + scene[:, :, 2] * .299
+    gx = cv2.Sobel(luma, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    gy = cv2.Sobel(luma, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    magnitude = np.maximum(np.sqrt(gx*gx + gy*gy), 1e-7)
+    scale = max(1e-6, float(np.quantile(magnitude, .992)))
+    threshold = .46 - .38 * sensitivity
+    gate = np.clip((np.clip(magnitude/scale, 0, 1)-threshold)/(1-threshold), 0, 1)
+    return gate, gx/magnitude, gy/magnitude
+
+
+def _rain_collision_geometry_cuda(torch, scene, sensitivity: float):
+    luma = (scene[:, :, 0]*.114 + scene[:, :, 1]*.587 + scene[:, :, 2]*.299) / 255.0
+    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=scene.device, dtype=scene.dtype)
+    source = torch.nn.functional.pad(luma[None, None], (1, 1, 1, 1), mode="replicate")
+    gx = torch.nn.functional.conv2d(source, kx[None, None])[0, 0]
+    gy = torch.nn.functional.conv2d(source, kx.t()[None, None])[0, 0]
+    magnitude = torch.sqrt(gx*gx + gy*gy).clamp_min(1e-7)
+    scale = torch.quantile(magnitude.reshape(-1), .992).clamp_min(1e-6)
+    threshold = .46 - .38 * sensitivity
+    gate = ((torch.clamp(magnitude/scale, 0, 1)-threshold)/(1-threshold)).clamp(0, 1)
+    return gate, gx/magnitude, gy/magnitude
+
+
+def _first_rain_contact(geometry, x, y, dx, dy, length):
+    """First contact along a drop segment, with the normal facing the incoming drop."""
+    gate, nx, ny = geometry
+    height, width = gate.shape
+    for step in range(int(math.ceil(length)) + 1):
+        distance = min(float(step), length)
+        px, py = int(round(x + dx*distance)), int(round(y + dy*distance))
+        if not (0 <= px < width and 0 <= py < height) or gate[py, px] <= .05:
+            continue
+        normal_x, normal_y = float(nx[py, px]), float(ny[py, px])
+        dot = normal_x*dx + normal_y*dy
+        # Grazing incidence weakens the splash, but must not make an edge permeable.
+        if abs(dot) <= 1e-6:
+            continue
+        if dot > 0:
+            normal_x, normal_y = -normal_x, -normal_y
+        return px, py, distance, normal_x, normal_y, min(1., abs(dot))
+    return None
+
+
+def _clip_rain_paths_at_first_contact(torch, px, py, valid, dx, dy, geometry):
+    """Vectorized first-hit visibility. No samples after the first hit survive."""
+    gate, nx, ny = geometry
+    h, w = gate.shape
+    sx, sy = px.clamp(0, w-1), py.clamp(0, h-1)
+    dot = nx[sy, sx]*dx[:, None] + ny[sy, sx]*dy[:, None]
+    contacts = valid & (gate[sy, sx] > .05) & (dot.abs() > 1e-6)
+    order = torch.arange(px.shape[1], device=px.device)[None, :]
+    first = torch.where(contacts, order, px.shape[1]).amin(dim=1)
+    hit = first < px.shape[1]
+    row = torch.arange(px.shape[0], device=px.device)
+    index = first.clamp_max(px.shape[1]-1)
+    hx, hy = sx[row, index], sy[row, index]
+    incidence = dot[row, index]
+    orientation = torch.where(incidence > 0, -1., 1.)
+    normal_x, normal_y = nx[hy, hx]*orientation, ny[hy, hx]*orientation
+    return valid & (order <= first[:, None]), hit, hx, hy, normal_x, normal_y, incidence.abs().clamp(0, 1)
+
+
+def _rain_alpha_parameters(strength, alpha, *, cuda=False):
+    """The same opacity transfer applies before and after a collision."""
+    if alpha <= 0:
+        return 0.0, 0.0
+    # Preserve the existing calibration of visible primary rain in saved profiles.
+    if cuda:
+        return (.10 + .70 * alpha) * (.58 + .42 * strength), .62
+    density_soften = max(0.0, min(1.0, (strength - .42) / .58))
+    return .10 + .40 * alpha + .10 * strength, min(.34, .018 + .30 * alpha * (1 - .26 * density_soften))
+
+
+def _rain_fragment_active(x, y, strength, branch):
+    """Strength changes fragment count, not the inherited opacity of a droplet."""
+    phase = ((x * 17 + y * 31) % 101) / 101.0
+    return (strength > .001) & (branch <= 3.0 * strength + phase)
+
+
+def _rain_splash_trajectory(nx, ny, incidence, size, radius, spread, time):
+    """Ballistic offsets in image coordinates (+Y is gravity), shared by NumPy/Torch."""
+    normal_length = (nx * nx + ny * ny + 1e-12) ** .5
+    nx, ny = nx / normal_length, ny / normal_length
+    reach = (2.0 + 18.0 * radius) * (.45 + .55 * size) * (.35 + .65 * incidence)
+    velocity_x = reach * (1.8 * nx - 1.25 * ny * spread)
+    velocity_y = reach * (1.8 * ny + 1.25 * nx * spread)
+    gravity = 3.6 * reach
+    offset_x = velocity_x * time
+    offset_y = velocity_y * time + .5 * gravity * time * time
+    # A fragment landing back on its contact plane cannot continue through it.
+    free_side = offset_x * nx + offset_y * ny >= -1e-5
+    return offset_x, offset_y, free_side
+
+
+def _rain_contact_splash(shape, contacts, radius, geometry=None, *, strength=1.0):
+    """Parabolic fragments, clipped at their next surface contact."""
+    h, w = shape
+    optical_depth = np.zeros(h * w, dtype="float32")
+    if not contacts:
+        return optical_depth.reshape(shape)
+    x, y, nx, ny, incidence, size, opacity = np.asarray(contacts, dtype="float32").T
+    droplet_depth = -np.log1p(-np.clip(opacity, 0, .999))
+    particle = np.arange(len(x), dtype="int64")[:, None]
+    time = np.linspace(0, 1, 97, dtype="float32")[None, :]
+    for branch, spread in enumerate((-1.0, 1.0, -.45, .45)):
+        ox, oy, free_side = _rain_splash_trajectory(
+            nx[:, None], ny[:, None], incidence[:, None], size[:, None], radius, spread, time,
+        )
+        px, py = np.rint(x[:, None] + ox).astype("int64"), np.rint(y[:, None] + oy).astype("int64")
+        inside = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+        valid = np.logical_and.accumulate(free_side, axis=1) & inside
+        valid &= _rain_fragment_active(x, y, strength, branch)[:, None]
+        if geometry is not None:
+            on_edge = geometry[0][py.clip(0, h - 1), px.clip(0, w - 1)] > .05
+            left_origin = np.logical_or.accumulate(inside & ~on_edge, axis=1)
+            contact = inside & on_edge & left_origin
+            valid &= (np.cumsum(contact, axis=1) - contact) == 0
+        # Count a particle once per pixel, but accumulate independent droplets.
+        occupied = np.unique((particle * (h * w) + py * w + px)[valid])
+        np.add.at(optical_depth, occupied % (h * w), droplet_depth[occupied // (h * w)])
+    optical_depth = cv2.GaussianBlur(optical_depth.reshape(shape), (3, 3), sigmaX=.45, sigmaY=.45)
+    return -np.expm1(-optical_depth)
+
+
+def _rain_contact_splash_cuda(torch, shape, hit, hx, hy, nx, ny, incidence, sizes, opacity, radius, geometry=None, *, strength=1.0):
+    h, w = shape
+    optical_depth = torch.zeros(h * w, device=hx.device, dtype=torch.float32)
+    hx, hy, nx, ny, incidence, sizes, opacity = [value[hit] for value in (hx, hy, nx, ny, incidence, sizes, opacity)]
+    droplet_depth = -torch.log1p(-opacity.clamp(0, .999))
+    particle = torch.arange(len(hx), device=hx.device)[:, None]
+    time = torch.linspace(0, 1, 97, device=hx.device, dtype=torch.float32)[None, :]
+    for branch, spread in enumerate((-1.0, 1.0, -.45, .45)):
+        ox, oy, free_side = _rain_splash_trajectory(
+            nx[:, None], ny[:, None], incidence[:, None], sizes[:, None], radius, spread, time,
+        )
+        px, py = torch.round(hx[:, None] + ox).long(), torch.round(hy[:, None] + oy).long()
+        inside = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+        valid = free_side.long().cumprod(dim=1).bool() & inside
+        valid &= _rain_fragment_active(hx, hy, strength, branch)[:, None]
+        if geometry is not None:
+            on_edge = geometry[0][py.clamp(0, h - 1), px.clamp(0, w - 1)] > .05
+            left_origin = (inside & ~on_edge).long().cumsum(dim=1) > 0
+            contact = (inside & on_edge & left_origin).long()
+            valid &= (contact.cumsum(dim=1) - contact) == 0
+        occupied = torch.unique((particle * (h * w) + py * w + px)[valid])
+        optical_depth.index_add_(0, occupied % (h * w), droplet_depth[occupied // (h * w)])
+    optical_depth = _torch_gaussian_blur_map(torch, optical_depth.view(h, w), .45)
+    return -torch.expm1(-optical_depth)
+
+
 def _build_rain_edge_response(image, step_x: float, step_y: float):
     if np is None or cv2 is None:
         return None
@@ -4761,6 +4949,8 @@ def build_rain_edge_debug_mask(image, profile: AugmentationProfile):
     profile = (profile or AugmentationProfile()).normalized()
     if np is None or cv2 is None:
         return None
+    if _profile_task_target(profile) == "plate":
+        return _build_scene_rain_edge_gate(image, profile)
     legacy_drop_size = max(0.0, min(1.0, float(profile.rain_drop_size if profile.rain_drop_size is not None else 0.35)))
     drop_size_min = max(0.0, min(1.0, float(getattr(profile, "rain_drop_size_min", legacy_drop_size) if getattr(profile, "rain_drop_size_min", None) is not None else legacy_drop_size)))
     drop_size_max = max(0.0, min(1.0, float(getattr(profile, "rain_drop_size_max", legacy_drop_size) if getattr(profile, "rain_drop_size_max", None) is not None else legacy_drop_size)))
@@ -6070,33 +6260,19 @@ def _apply_rain_effect(
             strength=strength,
             average_drop_size=average_drop_size,
         )
-        edge_response = None
-        edge_gate = None
+        collision_geometry = None
+        contacts = []
         if edge_mist_strength > 0.001:
-            stable_edge = _surface_float_mask(base_surface, "contour_curve", width, height)
-            if stable_edge is None:
-                stable_edge = _surface_float_mask(base_surface, "contour_edge", width, height)
-            stable_normal_x = _surface_float_mask(base_surface, "contour_profile_normal_x", width, height, signed=True)
-            stable_normal_y = _surface_float_mask(base_surface, "contour_profile_normal_y", width, height, signed=True)
-            if stable_normal_x is None or stable_normal_y is None:
-                stable_normal_x = _surface_float_mask(base_surface, "normal_x", width, height, signed=True)
-                stable_normal_y = _surface_float_mask(base_surface, "normal_y", width, height, signed=True)
-            if stable_edge is not None and stable_normal_x is not None and stable_normal_y is not None:
-                edge_alignment = np.abs((stable_normal_x * step_x) + (stable_normal_y * step_y))
-                local_gate = np.clip(stable_edge * (edge_alignment ** 2.35), 0.0, 1.0)
-                dot = (step_x * stable_normal_x) + (step_y * stable_normal_y)
-                reflect_x = step_x - 2.0 * dot * stable_normal_x
-                reflect_y = step_y - 2.0 * dot * stable_normal_y
-                reflect_norm = np.sqrt(reflect_x * reflect_x + reflect_y * reflect_y) + 1e-6
-                edge_response = {
-                    "gate": cv2.GaussianBlur(local_gate, (0, 0), sigmaX=0.55, sigmaY=0.55),
-                    "reflect_x": reflect_x / reflect_norm,
-                    "reflect_y": reflect_y / reflect_norm,
-                }
-            if edge_response is None:
-                edge_response = _build_rain_edge_response(image, step_x, step_y)
-            if edge_response:
-                edge_gate = edge_response.get("gate")
+            if _profile_task_target(profile) == "plate":
+                collision_geometry = (base_surface or {}).get("rain_collision_geometry")
+            else:
+                stable_edge = _surface_float_mask(base_surface, "contour_curve", width, height)
+                stable_nx = _surface_float_mask(base_surface, "contour_profile_normal_x", width, height, signed=True)
+                stable_ny = _surface_float_mask(base_surface, "contour_profile_normal_y", width, height, signed=True)
+                if stable_edge is not None and stable_nx is not None and stable_ny is not None:
+                    collision_geometry = (stable_edge, stable_nx, stable_ny)
+            if collision_geometry is None:
+                collision_geometry = _rain_collision_geometry(image, _contour_detection_sensitivity(profile))
         vortices = []
         if vortex_strength > 0.001 and width > 4 and height > 4:
             vortex_count = max(1, min(9, int(round(1 + 5 * vortex_strength + 2 * strength))))
@@ -6192,8 +6368,15 @@ def _apply_rain_effect(
                 local_step_y /= local_norm
             if vector_field_strength > 0.001:
                 local_length *= max(0.38, 1.0 + vector_field_strength * 0.24 * field_a)
-            x2 = int(round(x1 + local_step_x * local_length))
-            y2 = int(round(y1 + local_step_y * local_length))
+            contact = _first_rain_contact(
+                collision_geometry, x1, y1, local_step_x, local_step_y, local_length,
+            ) if collision_geometry is not None else None
+            if contact is not None:
+                x2, y2, local_length, normal_x, normal_y, incidence = contact
+                contacts.append((x2, y2, normal_x, normal_y, incidence, local_drop_size, drop_opacity))
+            else:
+                x2 = int(round(x1 + local_step_x * local_length))
+                y2 = int(round(y1 + local_step_y * local_length))
             cv2.line(overlay, (x1, y1), (x2, y2), color, local_thickness, lineType=cv2.LINE_AA)
             cv2.line(rain_mask, (x1, y1), (x2, y2), drop_opacity, max(1, local_thickness), lineType=cv2.LINE_AA)
             if gloss_mask is not None and _rng_float(rng, 0.0, 1.0) <= gloss_probability:
@@ -6232,9 +6415,9 @@ def _apply_rain_effect(
             lens_base = image
         if rain_mask is not None and rain_mask.size:
             opacity_surface = rain_mask
-            max_local_alpha = max(0.012, min(0.34, 0.018 + 0.30 * alpha * (1.0 - 0.26 * density_soften)))
+            opacity_gain, max_local_alpha = _rain_alpha_parameters(strength, alpha)
             local_alpha = np.clip(
-                opacity_surface * (0.10 + 0.40 * alpha + 0.10 * strength),
+                opacity_surface * opacity_gain,
                 0.0,
                 max_local_alpha,
             )
@@ -6252,113 +6435,20 @@ def _apply_rain_effect(
                 sigmaX=0.18 + 0.42 * average_drop_size,
                 sigmaY=0.18 + 0.36 * average_drop_size,
             )
-            gloss_mask = np.clip(gloss_mask * (0.72 + 0.58 * light_normal), 0.0, 1.0)
+            gloss_mask = np.clip(gloss_mask * (0.72 + 0.58 * light_normal) * float(alpha > 0), 0.0, 1.0)
             out = result.astype("float32")
             tint = np.array([245.0, 250.0, 255.0], dtype="float32")
             screen = out + (tint - out) * gloss_mask[:, :, None]
             out = out * (1.0 - gloss_mask[:, :, None] * 0.10) + screen * (gloss_mask[:, :, None] * 0.68)
             result = np.clip(out, 0, 255).astype("uint8")
-        if edge_gate is not None:
-            mist_scale = 1.0
-            mist_width = width
-            mist_height = height
-            mist_gate = edge_gate
-            reflect_x = edge_response.get("reflect_x") if edge_response else None
-            reflect_y = edge_response.get("reflect_y") if edge_response else None
-            if width * height > MAX_RAIN_EDGE_PIXELS:
-                mist_scale = math.sqrt(MAX_RAIN_EDGE_PIXELS / float(width * height))
-                mist_width = max(4, int(round(width * mist_scale)))
-                mist_height = max(4, int(round(height * mist_scale)))
-                mist_gate = cv2.resize(edge_gate, (mist_width, mist_height), interpolation=cv2.INTER_AREA)
-                if reflect_x is not None and reflect_y is not None:
-                    reflect_x = cv2.resize(reflect_x, (mist_width, mist_height), interpolation=cv2.INTER_LINEAR)
-                    reflect_y = cv2.resize(reflect_y, (mist_width, mist_height), interpolation=cv2.INTER_LINEAR)
-                    reflect_norm = np.sqrt(reflect_x * reflect_x + reflect_y * reflect_y) + 1e-6
-                    reflect_x = reflect_x / reflect_norm
-                    reflect_y = reflect_y / reflect_norm
-            impact_mask = np.clip(mist_gate * 0.28, 0.0, 1.0)
-            upstream_steps = max(2, int(round(3 + 11 * edge_mist_radius + 5 * strength)))
-            step_distance = 0.8 + 8.5 * edge_mist_radius + 2.2 * strength
-            for step_index in range(1, upstream_steps + 1):
-                decay = 1.0 - (step_index / float(upstream_steps + 1))
-                distance = step_index * step_distance * mist_scale
-                transform = np.float32(
-                    [
-                        [1, 0, float(-step_x) * distance],
-                        [0, 1, float(-step_y) * distance],
-                    ]
-                )
-                shifted = cv2.warpAffine(
-                    mist_gate,
-                    transform,
-                    (mist_width, mist_height),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0,
-                )
-                impact_mask = np.maximum(impact_mask, np.clip(shifted * decay, 0.0, 1.0))
-            if reflect_x is not None and reflect_y is not None:
-                reflection_mask = np.zeros_like(impact_mask)
-                direction_bins = 10
-                min_match = math.cos(math.pi / float(direction_bins))
-                reflect_steps = max(2, int(round(2 + 8 * edge_mist_radius + 4 * strength)))
-                reflect_distance = step_distance * (0.72 + 0.46 * strength + 0.38 * edge_mist_radius)
-                for bin_index in range(direction_bins):
-                    angle = (math.tau * float(bin_index)) / float(direction_bins)
-                    dir_x = math.cos(angle)
-                    dir_y = math.sin(angle)
-                    match = ((reflect_x * dir_x) + (reflect_y * dir_y) - min_match) / max(1e-6, 1.0 - min_match)
-                    bin_gate = np.clip(mist_gate * np.clip(match, 0.0, 1.0), 0.0, 1.0)
-                    if float(np.max(bin_gate) or 0.0) <= 0.002:
-                        continue
-                    for step_index in range(1, reflect_steps + 1):
-                        decay = 1.0 - (step_index / float(reflect_steps + 1))
-                        distance = step_index * reflect_distance * mist_scale
-                        transform = np.float32(
-                            [
-                                [1, 0, float(dir_x) * distance],
-                                [0, 1, float(dir_y) * distance],
-                            ]
-                        )
-                        shifted = cv2.warpAffine(
-                            bin_gate,
-                            transform,
-                            (mist_width, mist_height),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT,
-                            borderValue=0,
-                        )
-                        reflection_mask = np.maximum(
-                            reflection_mask,
-                            np.clip(shifted * decay, 0.0, 1.0),
-                        )
-                if reflection_mask.size:
-                    impact_mask = np.maximum(
-                        impact_mask,
-                        reflection_mask * (0.52 + 0.46 * strength + 0.28 * edge_mist_radius),
-                    )
-            mist_sigma = 0.9 + 10.0 * edge_mist_radius + 2.4 * strength
-            mist_mask = cv2.GaussianBlur(
-                impact_mask,
-                (0, 0),
-                sigmaX=max(0.45, mist_sigma * mist_scale),
-                sigmaY=max(0.45, mist_sigma * mist_scale * 0.72),
+        if contacts:
+            reflected = [contact[:-1] + (min(max_local_alpha, min(mask_cap, contact[-1] * mask_gain) * opacity_gain),) for contact in contacts]
+            splash_alpha = _rain_contact_splash(
+                (height, width), reflected, edge_mist_radius, collision_geometry, strength=edge_mist_strength,
             )
-            mist_mask = np.clip(mist_mask * edge_mist_strength * (0.82 + 1.38 * strength), 0.0, 0.88)
-            if mist_width != width or mist_height != height:
-                mist_mask = cv2.resize(mist_mask, (width, height), interpolation=cv2.INTER_LINEAR)
-            if mist_mask.size:
-                if width * height > MAX_RAIN_EDGE_PIXELS:
-                    mist_u8 = np.clip(mist_mask * 255.0, 0.0, 255.0).astype("uint8")
-                    tint_layer = np.empty_like(result)
-                    tint_layer[:, :] = (224, 235, 242)
-                    blended = cv2.addWeighted(result, 0.58, tint_layer, 0.42, 0)
-                    cv2.copyTo(blended, mist_u8, result)
-                else:
-                    out = result.astype("float32")
-                    mist_tint = np.array([224.0, 235.0, 242.0], dtype="float32")
-                    out = out * (1.0 - mist_mask[:, :, None] * 0.58) + mist_tint * (mist_mask[:, :, None] * 0.58)
-                    result = np.clip(out, 0, 255).astype("uint8")
+            # Independent droplets overlap at impact instead of erasing one another.
+            tint = np.array(color, dtype="float32")
+            result = np.clip(result * (1.0 - splash_alpha[:, :, None]) + tint * splash_alpha[:, :, None], 0, 255).astype("uint8")
         return (result, rain_mask) if return_mask else result
     except Exception:
         return (image, None) if return_mask else image
@@ -6720,7 +6810,6 @@ def _apply_traffic_headlight_effect(image, profile: AugmentationProfile, rng, di
         global_strength = _clamp01(_profile_float("traffic_headlight_strength", 0.0))
         count = max(0, min(6, int(float(getattr(profile, "traffic_headlight_count", 1) if getattr(profile, "traffic_headlight_count", None) is not None else 1))))
         rain_strength = _clamp01(_profile_float("rain_strength", 0.0))
-        edge_mist_strength = _clamp01(_profile_float("rain_edge_mist_strength", 0.0))
         tyndall_strength = _clamp01(_profile_float("tyndall_strength", 0.55))
         wet_mud_gloss = max(0.0, min(1.0, float(getattr(profile, "wet_mud_gloss_strength", 0.0) or 0.0)))
 
@@ -7208,7 +7297,8 @@ def _apply_traffic_headlight_effect(image, profile: AugmentationProfile, rng, di
             rim_light = np.clip(grad_abs * field * reflective_surface * (0.04 + 0.18 * normal_strength), 0.0, 0.34)
             out = out + light_color * rim_light[:, :, None]
 
-        medium_strength = max(rain_strength, edge_mist_strength * 0.72)
+        # Local ballistic splashes must not add a scene-wide contrast-reducing veil.
+        medium_strength = rain_strength
         tyndall_gain = medium_strength * strength * tyndall_strength
         if tyndall_gain > 0.001:
             min_dim = float(max(1, min(width, height)))
@@ -8516,6 +8606,42 @@ def _apply_plate_reflectance_effect(image, profile: AugmentationProfile, rng) ->
 
 def _apply_image_postprocess(image, profile: AugmentationProfile, rng=None, *, return_debug: bool = False) -> object:
     profile = (profile or AugmentationProfile()).normalized()
+
+    # Content-scope guard:
+    # target="plate" = MT / pełna scena,
+    # target="char"  = MZ / crop tablicy.
+    #
+    # Stary preset nie może spowodować, że cały samochód/scena zostanie
+    # potraktowany jak fizyczna powierzchnia tablicy.
+    if _profile_task_target(profile) == "plate":
+        profile = replace(
+            profile,
+            scene_plate_texture_enabled=False,
+            dark_relief_strength=0.0,
+            relief_bounce_depth=1,
+            relief_bounce_strength=0.0,
+            light_normal_strength=0.0,
+            wet_mud_gloss_strength=0.0,
+            water_film_strength=0.0,
+            water_film_lens_strength=0.0,
+            wet_reflection_strength=0.0,
+            plate_reflect_gradient_strength=0.0,
+            plate_reflect_glare_strength=0.0,
+            plate_reflect_curve_strength=0.0,
+            dirt_streak_strength=0.0,
+            dirt_flow_strength=0.0,
+            dirt_flow_points=0,
+            dirt_flow_stop_on_dark_contour=False,
+            overhang_shadow_strength=0.0,
+            # rain_edge_mist_strength jest dozwolone dla MT jako reakcja na
+            # krawędzie całej sceny; nie jest to geometria znaków tablicy.
+            tyndall_strength=0.0,
+            traffic_headlight_strength=0.0,
+            traffic_headlight_2_strength=0.0,
+            traffic_headlight_3_strength=0.0,
+            traffic_headlight_count=0,
+        ).normalized()
+
     rng = rng or random.Random(profile.seed)
     base_seed = int(rng.randint(1, 2_147_483_647))
 
@@ -8538,13 +8664,15 @@ def _apply_image_postprocess(image, profile: AugmentationProfile, rng=None, *, r
         or profile_float("traffic_headlight_strength") > 0.001
         or profile_float("traffic_headlight_2_strength") > 0.001
         or profile_float("traffic_headlight_3_strength") > 0.001
-        or profile_float("rain_edge_mist_strength") > 0.001
+        or (_profile_task_target(profile) != "plate" and profile_float("rain_edge_mist_strength") > 0.001)
         or profile_float("dirt_flow_strength") > 0.001
         or int(profile_float("dirt_flow_points", 0.0)) > 0
         or bool(getattr(profile, "dirt_flow_stop_on_dark_contour", False))
     )
     out = _apply_plate_horizontal_curve_effect(image, profile)
     stable_contour_surface = _build_stable_contour_geometry(out, profile) if needs_stable_contours else {}
+    if _profile_task_target(profile) == "plate" and profile_float("rain_strength") > 0.001 and profile_float("rain_edge_mist_strength") > 0.001:
+        stable_contour_surface["rain_collision_geometry"] = _rain_collision_geometry(out, _contour_detection_sensitivity(profile))
     needs_relief_mask = bool(
         float(getattr(profile, "dark_relief_strength", 0.0) or 0.0) > 0.001
         or float(getattr(profile, "wet_mud_gloss_strength", 0.0) or 0.0) > 0.001
@@ -8774,7 +8902,16 @@ def _build_transform(profile: AugmentationProfile, *, has_keypoints: bool):
     )
 
 
-def preview_augmentation_image(image_path: Path, profile: AugmentationProfile) -> tuple[bool, str, dict]:
+def preview_augmentation_image(image_path: Path, profile: AugmentationProfile, *, sample_seed: int | None = None,
+                               max_pixels: int | None = None, include_contours: bool = False) -> tuple[bool, str, dict]:
+    # Both the main modal and the series editor use the same global RNG seed helper.
+    with _PREVIEW_RENDER_LOCK:
+        return _preview_augmentation_image(image_path, profile, sample_seed=sample_seed, max_pixels=max_pixels,
+                                          include_contours=include_contours)
+
+
+def _preview_augmentation_image(image_path: Path, profile: AugmentationProfile, *, sample_seed: int | None = None,
+                                max_pixels: int | None = None, include_contours: bool = False) -> tuple[bool, str, dict]:
     """Return RGB original and augmented arrays for the modal preview."""
     if not CV2_AVAILABLE or cv2 is None:
         return False, "OpenCV jest niedostępny, więc podgląd augmentacji nie może zostać wykonany.", {}
@@ -8785,42 +8922,69 @@ def preview_augmentation_image(image_path: Path, profile: AugmentationProfile) -
     if not image_path.exists() or not image_path.is_file():
         return False, "Nie znaleziono obrazu do podglądu augmentacji.", {}
 
-    image = cv2.imread(str(image_path))
+    try:
+        image = cv2.imdecode(np.frombuffer(image_path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+    except Exception as exc:
+        return False, f"Nie udało się odczytać obrazu do podglądu augmentacji: {exc}", {}
     if image is None:
         return False, "Nie udało się odczytać obrazu do podglądu augmentacji.", {}
 
     profile = (profile or AugmentationProfile()).normalized()
+    if sample_seed is not None:
+        profile = _jitter_augmentation_profile(profile, random.Random(int(sample_seed)))
     pipeline_description = describe_augmentation_components(profile)
     preview_note = ""
     try:
         height, width = image.shape[:2]
         pixel_count = int(width) * int(height)
-        if pixel_count > MAX_AUGMENTATION_PREVIEW_PIXELS:
-            scale = math.sqrt(MAX_AUGMENTATION_PREVIEW_PIXELS / float(pixel_count))
+        preview_pixel_limit = int(MAX_AUGMENTATION_PREVIEW_PIXELS)
+        if max_pixels is not None:
+            preview_pixel_limit = min(preview_pixel_limit, max(16, int(max_pixels)))
+        if _profile_task_target(profile) == "plate":
+            preview_pixel_limit = min(preview_pixel_limit, 650_000)
+        if pixel_count > preview_pixel_limit:
+            scale = math.sqrt(preview_pixel_limit / float(pixel_count))
             resized_w = max(4, int(round(width * scale)))
             resized_h = max(4, int(round(height * scale)))
-            image = cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+            image = cv2.resize(
+                image,
+                (resized_w, resized_h),
+                interpolation=cv2.INTER_AREA,
+            )
             preview_note = f" Podgląd w skali {scale * 100.0:.0f}% chroni RAM."
     except Exception:
         preview_note = ""
     try:
         A = _load_albumentations()
         geometry_transform = A.Compose(_build_geometry_transforms(A, profile))
-        geometry_seed = _stable_preview_seed(image_path, profile)
+        geometry_seed = _stable_preview_seed(image_path, profile) if sample_seed is None else int(sample_seed)
         _seed_transform(geometry_transform, geometry_seed)
         augmented = geometry_transform(image=image)
         augmented_image = augmented.get("image", image)
         augmented_image = _apply_albumentations_image_effects(
             augmented_image,
             profile,
-            seed=geometry_seed,
+            seed=geometry_seed if sample_seed is None else (geometry_seed + 31337) % 2_147_483_647,
         )
-        augmented_image, debug_payload = _apply_image_postprocess(
-            augmented_image,
-            profile,
-            random.Random(geometry_seed),
-            return_debug=True,
-        )
+        post_seed = geometry_seed if sample_seed is None else (geometry_seed + 7919) % 2_147_483_647 or 1
+        if _mt_scene_cuda_fastpath_eligible(profile):
+            # Diagnostic only: compute scene contours after geometry, before
+            # weather adds new edges. Never blend this mask into saved samples.
+            scene_debug_mask = build_rain_edge_debug_mask(augmented_image, profile) if include_contours else None
+            augmented_image, preview_backend = _apply_mt_scene_postprocess_cuda(
+                augmented_image,
+                profile,
+                seed=post_seed,
+            )
+            debug_payload = {"rain_edge_debug_mask": scene_debug_mask}
+            preview_note += f" Backend: {preview_backend}."
+        else:
+            augmented_image, debug_payload = _apply_image_postprocess(
+                augmented_image,
+                profile,
+                random.Random(post_seed),
+                return_debug=True,
+            )
     except Exception as exc:
         return False, f"Nie udało się przygotować podglądu augmentacji: {exc}", {}
 
@@ -8836,6 +9000,7 @@ def preview_augmentation_image(image_path: Path, profile: AugmentationProfile) -
         "original_rgb": original_rgb,
         "augmented_rgb": augmented_rgb,
         "augmentation_pipeline": pipeline_description,
+        "sample_profile": asdict(profile),
         "rain_edge_debug_mask": debug_payload.get("rain_edge_debug_mask") if isinstance(debug_payload, dict) else None,
     }
 
@@ -9056,6 +9221,10 @@ def _format_augmentation_profile_report(payload: dict) -> str:
         ]
         if active_fields:
             lines.append(f"  Parametry: {', '.join(active_fields)}")
+    for item in manual.get("ranges", []):
+        state = f"±{item['delta']:g}{item.get('unit', '')}" if item.get("enabled") else "stała wartość bazowa"
+        paired = " (wspólne przesunięcie min–max)" if item.get("paired") else ""
+        lines.append(f"- {item.get('group', '')} / {item.get('label', item.get('key', ''))}: {state}{paired}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -9123,13 +9292,21 @@ def save_augmentation_preset(
     description: str = "",
     target: str | None = None,
     source_dataset_dir: Path | None = None,
+    destination: Path | None = None,
 ) -> Path:
+    """Save to an exact chosen path, or to the legacy named preset location."""
     profile = (profile or AugmentationProfile(task_target=target or "")).normalized()
     if target:
         profile = replace(profile, task_target=_normalize_task_target_value(target)).normalized()
-    presets_dir = get_augmentation_presets_dir(_profile_task_target(profile))
-    stem = _safe_preset_stem(name, fallback=f"aug_{_profile_task_target(profile)}")
-    path = presets_dir / f"{stem}.json"
+    if destination is None:
+        presets_dir = get_augmentation_presets_dir(_profile_task_target(profile))
+        stem = _safe_preset_stem(name, fallback=f"aug_{_profile_task_target(profile)}")
+        path = presets_dir / f"{stem}.json"
+    else:
+        # The native dialog confirms overwrites for this exact filename.
+        # Do not sanitize it or change its extension after that confirmation.
+        path = Path(destination)
+        stem = path.stem
     payload = build_augmentation_preset_payload(
         profile,
         name=name or stem,
@@ -9169,6 +9346,529 @@ def iter_augmentation_preset_files(target: str | None = None) -> list[Path]:
     return files
 
 
+def _profile_has_geometry_effect(profile: AugmentationProfile) -> bool:
+    try:
+        return bool(
+            abs(float(getattr(profile, "rotation_limit", 0.0) or 0.0)) > 0.001
+            or float(getattr(profile, "translate_limit", 0.0) or 0.0) > 0.00001
+            or float(getattr(profile, "scale_limit", 0.0) or 0.0) > 0.00001
+        )
+    except Exception:
+        return True
+
+
+def _mt_scene_cuda_fastpath_eligible(profile: AugmentationProfile) -> bool:
+    profile = (profile or AugmentationProfile()).normalized()
+    if _profile_task_target(profile) != "plate":
+        return False
+    blocked = (
+        "tyndall_strength",
+        "wet_reflection_strength",
+        "water_film_strength",
+        "water_film_lens_strength",
+        "dark_relief_strength",
+        "plate_reflect_gradient_strength",
+        "plate_reflect_glare_strength",
+        "plate_reflect_curve_strength",
+        "dirt_streak_strength",
+        "dirt_flow_strength",
+        "overhang_shadow_strength",
+        "traffic_headlight_strength",
+        "traffic_headlight_2_strength",
+        "traffic_headlight_3_strength",
+        "flare_strength",
+        "overexposure_strength",
+    )
+    for name in blocked:
+        try:
+            if abs(float(getattr(profile, name, 0.0) or 0.0)) > 0.001:
+                return False
+        except Exception:
+            return False
+    try:
+        return bool(is_cuda_available())
+    except Exception:
+        return False
+
+
+def _torch_gaussian_blur_map(torch, data, sigma: float):
+    sigma = float(max(0.0, sigma))
+    if sigma <= 0.01:
+        return data
+    h, w = int(data.shape[-2]), int(data.shape[-1])
+    max_radius = max(1, min(64, (min(h, w) - 1) // 2))
+    radius = max(1, min(max_radius, int(math.ceil(3.0 * sigma))))
+    coords = torch.arange(
+        -radius, radius + 1,
+        device=data.device,
+        dtype=torch.float32,
+    )
+    kernel = torch.exp(-(coords * coords) / max(1e-6, 2.0 * sigma * sigma))
+    kernel = kernel / torch.clamp(kernel.sum(), min=1e-8)
+    x = data[None, None, :, :]
+    pad_mode = "reflect" if min(h, w) > radius else "replicate"
+    x = torch.nn.functional.pad(x, (radius, radius, 0, 0), mode=pad_mode)
+    x = torch.nn.functional.conv2d(x, kernel.view(1, 1, 1, -1))
+    x = torch.nn.functional.pad(x, (0, 0, radius, radius), mode=pad_mode)
+    x = torch.nn.functional.conv2d(x, kernel.view(1, 1, -1, 1))
+    return x[0, 0]
+
+
+def _apply_mt_scene_night_cuda(image, profile: AugmentationProfile, torch):
+    strength = max(0.0, min(1.0, float(profile.night_strength or 0.0)))
+    light_strength = max(0.0, min(1.0, float(getattr(profile, "night_light_strength", 0.0) or 0.0)))
+    bloom_strength = max(0.0, min(1.0, float(getattr(profile, "night_bloom_strength", 0.0) or 0.0)))
+    iso_strength = max(0.0, min(1.0, float(getattr(profile, "night_iso_noise_strength", 0.0) or 0.0)))
+    if strength <= 0.001 and light_strength <= 0.001 and bloom_strength <= 0.001 and iso_strength <= 0.001:
+        return image
+
+    device = torch.device("cuda:0")
+    x = torch.from_numpy(image).to(device=device, dtype=torch.float32) / 255.0
+    h, w = int(x.shape[0]), int(x.shape[1])
+    night = float(math.pow(strength, 0.82))
+
+    luma = x[:, :, 0] * 0.114 + x[:, :, 1] * 0.587 + x[:, :, 2] * 0.299
+    channel_max = torch.max(x, dim=2).values
+    channel_min = torch.min(x, dim=2).values
+    chroma_mask = torch.clamp(
+        (channel_max - channel_min) / torch.clamp(channel_max, min=0.08),
+        0.0, 1.0,
+    )
+    chroma_mask = chroma_mask * chroma_mask * (3.0 - 2.0 * chroma_mask)
+    bright_mask = torch.clamp((luma - 0.42) / 0.46, 0.0, 1.0)
+    bright_mask = bright_mask * bright_mask * (3.0 - 2.0 * bright_mask)
+
+    warmth = max(0.0, min(1.0, float(getattr(profile, "night_light_warmth", 0.35) if getattr(profile, "night_light_warmth", None) is not None else 0.35)))
+    iso_strength = max(iso_strength, night * 0.24)
+
+    effective_night = torch.full_like(luma, night)
+    color_darken = chroma_mask * (1.0 - bright_mask * 0.35)
+    darken = torch.clamp(
+        0.34 * effective_night
+        + 0.52 * effective_night * bright_mask
+        + 0.30 * effective_night * color_darken,
+        0.0, 0.96,
+    )
+    x = x * (1.0 - darken[:, :, None])
+    gamma = 1.0 + 1.10 * effective_night
+    x = torch.pow(torch.clamp(x, 0.0, 1.0), gamma[:, :, None])
+
+    luma_after = torch.clamp(
+        x[:, :, 0] * 0.114 + x[:, :, 1] * 0.587 + x[:, :, 2] * 0.299,
+        0.0, 1.0,
+    )
+    cool_gray = torch.empty_like(x)
+    cool_gray[:, :, 0] = luma_after * 1.08 + 0.010 * effective_night
+    cool_gray[:, :, 1] = luma_after * 0.94 + 0.004 * effective_night
+    cool_gray[:, :, 2] = luma_after * 0.66
+    desaturate = torch.clamp(
+        0.34 * effective_night
+        + 0.44 * effective_night * chroma_mask
+        + 0.12 * effective_night * bright_mask,
+        0.0, 0.88,
+    )
+    x = x * (1.0 - desaturate[:, :, None]) + cool_gray * desaturate[:, :, None]
+
+    ambient = torch.tensor([0.020, 0.008, -0.050], device=device, dtype=torch.float32)
+    x = x + ambient * (
+        0.50 * effective_night[:, :, None]
+        + 0.34 * effective_night[:, :, None] * (1.0 - bright_mask[:, :, None])
+    )
+
+    cold = torch.tensor([1.12, 1.06, 0.96], device=device, dtype=torch.float32)
+    warm = torch.tensor([0.78, 1.02, 1.28], device=device, dtype=torch.float32)
+    bloom_source = torch.clamp(bright_mask * (0.36 + 0.36 * effective_night), 0.0, 1.0)
+    bloom_light_color = cold * (1.0 - warmth) + warm * warmth
+
+    if light_strength > 0.001:
+        ambient_color = bloom_light_color
+        ambient_response = max(strength, 0.36)
+        exposure_gain = light_strength * (0.055 + 0.245 * ambient_response)
+        tint_gain = light_strength * (0.10 + 0.22 * ambient_response)
+        floor_gain = light_strength * (0.010 + 0.040 * ambient_response)
+        x = torch.clamp(x * (1.0 + exposure_gain), 0.0, 1.0)
+        tinted = torch.clamp(x * ambient_color, 0.0, 1.0)
+        x = x * (1.0 - tint_gain) + tinted * tint_gain
+        x = x + (torch.clamp(ambient_color, 0.0, 1.0) - x) * floor_gain
+
+    if bloom_strength > 0.001 and h > 1 and w > 1:
+        src = luma[None, None, :, :]
+        kx = torch.tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+            device=device, dtype=torch.float32,
+        ).unsqueeze(0)
+        ky = torch.tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+            device=device, dtype=torch.float32,
+        ).unsqueeze(0)
+        padded = torch.nn.functional.pad(src, (1, 1, 1, 1), mode="replicate")
+        gx = torch.nn.functional.conv2d(padded, kx)[0, 0]
+        gy = torch.nn.functional.conv2d(padded, ky)[0, 0]
+        edge = torch.clamp(torch.abs(gx) + torch.abs(gy), 0.0, 1.0)
+        edge = _torch_gaussian_blur_map(torch, edge, 0.65)
+        source = torch.clamp(
+            bloom_source
+            + edge * (0.10 + 0.22 * bloom_strength + 0.16 * max(strength, light_strength)),
+            0.0, 1.0,
+        )
+        sigma_wide = max(1.2, min(w, h) * (0.010 + 0.036 * bloom_strength))
+        sigma_core = max(0.6, min(w, h) * (0.003 + 0.010 * bloom_strength))
+        bloom = (
+            _torch_gaussian_blur_map(torch, source, sigma_wide) * 0.72
+            + _torch_gaussian_blur_map(torch, source, sigma_core) * 0.28
+        )
+        bloom = torch.clamp(bloom, 0.0, 1.0)
+        percentile = torch.quantile(bloom.reshape(-1), 0.992)
+        if float(percentile.item()) > 0.0:
+            bloom = torch.clamp(bloom / percentile, 0.0, 1.0)
+        gain = bloom_strength * (
+            0.11 + 0.18 * strength + 0.16 * light_strength + 0.10 * max(0.0, 1.0 - strength)
+        )
+        x = x + bloom[:, :, None] * bloom_light_color * gain
+
+    if iso_strength > 0.001:
+        gen = torch.Generator(device=device)
+        gen.manual_seed(int(getattr(profile, "seed", 42) or 42) + 1931)
+        luma2 = torch.clamp(
+            x[:, :, 0] * 0.114 + x[:, :, 1] * 0.587 + x[:, :, 2] * 0.299,
+            0.0, 1.0,
+        )
+        noise_scale = (0.010 + 0.065 * iso_strength) * (0.45 + 0.90 * (1.0 - luma2))
+        mono = torch.randn(luma2.shape, generator=gen, device=device, dtype=torch.float32) * noise_scale
+        chroma = torch.randn(x.shape, generator=gen, device=device, dtype=torch.float32) * (noise_scale[:, :, None] * 0.45)
+        x = x + mono[:, :, None] + chroma
+
+    return torch.clamp(x * 255.0, 0.0, 255.0).to(dtype=torch.uint8).cpu().numpy()
+
+
+def _apply_mt_scene_coarse_noise_cuda(image, profile: AugmentationProfile, torch, seed: int):
+    strength = max(0.0, min(0.08, float(getattr(profile, "noise_strength", 0.0) or 0.0)))
+    if strength <= 0.0:
+        return image
+    device = torch.device("cuda:0")
+    x = torch.from_numpy(image).to(device=device, dtype=torch.float32)
+    h, w = int(x.shape[0]), int(x.shape[1])
+    grain = max(1, int(getattr(profile, "noise_grain_size", 1) or 1))
+    nh = max(1, (h + grain - 1) // grain)
+    nw = max(1, (w + grain - 1) // grain)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed) & 0x7FFFFFFF)
+    std = max(1.0, strength * 255.0)
+    noise = torch.randn((1, 1, nh, nw), generator=gen, device=device, dtype=torch.float32) * std
+    if nh != h or nw != w:
+        noise = torch.nn.functional.interpolate(noise, size=(h, w), mode="nearest")
+    noise = noise[0, 0, :, :, None]
+    x = torch.clamp(x + noise, 0.0, 255.0)
+    return x.to(dtype=torch.uint8).cpu().numpy()
+
+
+def _apply_mt_scene_rain_cuda(
+    image,
+    profile: AugmentationProfile,
+    torch,
+    *,
+    seed: int,
+    collision_source=None,
+):
+    """Deszcz pełnej sceny MT rasteryzowany na CUDA/Torch."""
+    strength = max(0.0, min(1.0, float(getattr(profile, "rain_strength", 0.0) or 0.0)))
+    if strength <= 0.001:
+        return image
+
+    alpha = max(0.0, min(1.0, float(getattr(profile, "rain_alpha", 0.22) or 0.0)))
+    size_min = max(
+        0.0,
+        min(
+            1.0,
+            float(
+                getattr(
+                    profile,
+                    "rain_drop_size_min",
+                    getattr(profile, "rain_drop_size", 0.07),
+                )
+                or 0.0
+            ),
+        ),
+    )
+    size_max = max(
+        0.0,
+        min(
+            1.0,
+            float(
+                getattr(
+                    profile,
+                    "rain_drop_size_max",
+                    getattr(profile, "rain_drop_size", 0.07),
+                )
+                or 0.0
+            ),
+        ),
+    )
+    if size_min > size_max:
+        size_min, size_max = size_max, size_min
+
+    vector_strength = max(
+        0.0,
+        min(1.0, float(getattr(profile, "rain_vector_field_strength", 0.0) or 0.0)),
+    )
+    vortex_strength = max(
+        0.0,
+        min(1.0, float(getattr(profile, "rain_vortex_strength", 0.0) or 0.0)),
+    )
+    lens_strength = max(
+        0.0,
+        min(1.0, float(getattr(profile, "rain_lens_strength", 0.0) or 0.0)),
+    )
+
+    device = torch.device("cuda:0")
+    x = torch.from_numpy(image).to(device=device, dtype=torch.float32)
+    # Keep the pre-lens scene. Subsequent passes rebind x, so no clone is needed.
+    scene_base = x
+    h, w = int(x.shape[0]), int(x.shape[1])
+    if h < 4 or w < 4:
+        return image
+
+    edge_strength_setting = max(0.0, min(1.0, float(getattr(profile, "rain_edge_mist_strength", 0.0) or 0.0)))
+    edge_radius_setting = max(0.0, min(1.0, float(getattr(profile, "rain_edge_mist_radius", .45) or 0.0)))
+    collision_geometry = None
+    if edge_strength_setting > .001:
+        # Match the diagnostic overlay and CPU: weather/noise is not geometry.
+        edge_scene = scene_base if collision_source is None else torch.from_numpy(collision_source).to(
+            device=device, dtype=torch.float32,
+        )
+        collision_geometry = _rain_collision_geometry_cuda(
+            torch, edge_scene, _contour_detection_sensitivity(profile),
+        )
+    contact_data = None
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed) & 0x7FFFFFFF)
+
+    pixel_count = h * w
+    density_load = 18.0 + 380.0 * strength + 1500.0 * (strength ** 1.55)
+    count = int(max(8, (pixel_count / 90000.0) * density_load))
+    count = max(8, min(32000, count))
+
+    ax = torch.randint(0, w, (count,), generator=gen, device=device)
+    ay = torch.randint(0, h, (count,), generator=gen, device=device)
+
+    sizes = size_min + (size_max - size_min) * torch.rand(
+        (count,),
+        generator=gen,
+        device=device,
+    )
+
+    average_drop_size = float((size_min + size_max) * 0.5)
+    wind_strength = max(
+        0.0,
+        min(
+            1.0,
+            float(
+                getattr(profile, "dirt_flow_wind_strength", 0.0)
+                if getattr(profile, "dirt_flow_wind_strength", None) is not None
+                else 0.0
+            ),
+        ),
+    )
+    # Używamy dokładnie tej samej konwencji kąta/siły co stary CPU renderer.
+    # Dzięki temu panel "Wiatr XY" ma identyczną semantykę niezależnie od backendu.
+    base_dx, base_dy = _rain_drop_direction(profile, average_drop_size)
+
+    lengths = (
+        2.0
+        + 8.0 * sizes
+        + 8.0 * strength
+        + 7.0 * sizes * strength
+        + 6.0 * wind_strength
+    )
+    max_steps = max(2, min(34, int(torch.ceil(lengths.max()).item()) + 1))
+
+    nx = ax.to(torch.float32) / max(1.0, float(w - 1))
+    ny = ay.to(torch.float32) / max(1.0, float(h - 1))
+    dx = torch.full(
+        (count,),
+        float(base_dx),
+        device=device,
+        dtype=torch.float32,
+    )
+    dy = torch.full(
+        (count,),
+        float(base_dy),
+        device=device,
+        dtype=torch.float32,
+    )
+
+    if vector_strength > 0.001:
+        field = (
+            torch.sin((nx * 3.1 + ny * 1.7) * (2.0 * math.pi)) * 0.68
+            + torch.cos((nx * 1.2 - ny * 2.6) * (2.0 * math.pi)) * 0.32
+        )
+        dx = dx + field * vector_strength * 0.95
+        dy = dy + torch.cos(
+            (nx * 1.6 + ny * 2.1) * (2.0 * math.pi)
+        ) * vector_strength * 0.12
+
+    if vortex_strength > 0.001:
+        for cx, cy, sign in (
+            (0.24, 0.35, 1.0),
+            (0.72, 0.48, -1.0),
+            (0.50, 0.78, 1.0),
+        ):
+            rx = nx - cx
+            ry = ny - cy
+            dist2 = rx * rx + ry * ry
+            falloff = torch.exp(-dist2 * 8.0) * vortex_strength
+            dx = dx + (-ry) * falloff * sign * 1.8
+            dy = dy + rx * falloff * sign * 0.55
+
+    norm = torch.sqrt(dx * dx + dy * dy).clamp_min(1e-6)
+    dx = dx / norm
+    dy = dy / norm
+
+    steps = torch.arange(max_steps, device=device, dtype=torch.float32)[None, :]
+    active = steps <= torch.clamp(lengths[:, None], min=1.0)
+    px = torch.round(ax[:, None].to(torch.float32) + dx[:, None] * steps).to(torch.int64)
+    py = torch.round(ay[:, None].to(torch.float32) + dy[:, None] * steps).to(torch.int64)
+
+    valid = active & (px >= 0) & (px < w) & (py >= 0) & (py < h)
+    if collision_geometry is not None:
+        # First contact ends the primary streak, including when local wind/vortices bend its direction.
+        valid, *contact_data = _clip_rain_paths_at_first_contact(
+            torch, px, py, valid, dx, dy, collision_geometry,
+        )
+    flat_idx = (py * w + px)[valid]
+    per_drop = (0.16 + 0.24 * sizes + 0.12 * strength).clamp(0.08, 0.48)
+    values = per_drop[:, None].expand(-1, max_steps)[valid]
+
+    rain = torch.zeros((h * w,), device=device, dtype=torch.float32)
+    rain.index_add_(0, flat_idx, values)
+    rain = rain.view(h, w).clamp(0.0, 1.0)
+
+    avg_size = float((size_min + size_max) * 0.5)
+    kernel = 1
+    if avg_size > 0.18:
+        kernel = 3
+    if avg_size > 0.58:
+        kernel = 5
+    if kernel > 1:
+        rain = torch.nn.functional.max_pool2d(
+            rain[None, None, :, :],
+            kernel_size=kernel,
+            stride=1,
+            padding=kernel // 2,
+        )[0, 0]
+
+    rain = _torch_gaussian_blur_map(
+        torch,
+        rain,
+        0.30 + 0.55 * avg_size,
+    ).clamp(0.0, 1.0)
+
+    if lens_strength > 0.001:
+        src = rain[None, None, :, :]
+        kx = torch.tensor(
+            [[[-1.0, 0.0, 1.0],
+              [-2.0, 0.0, 2.0],
+              [-1.0, 0.0, 1.0]]],
+            device=device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        ky = torch.tensor(
+            [[[-1.0, -2.0, -1.0],
+              [0.0, 0.0, 0.0],
+              [1.0, 2.0, 1.0]]],
+            device=device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        padded = torch.nn.functional.pad(src, (1, 1, 1, 1), mode="replicate")
+        gx = torch.nn.functional.conv2d(padded, kx)[0, 0]
+        gy = torch.nn.functional.conv2d(padded, ky)[0, 0]
+        scale = torch.quantile(
+            (torch.abs(gx) + torch.abs(gy)).reshape(-1),
+            0.992,
+        ).clamp_min(1e-6)
+        gx = torch.clamp(gx / scale, -1.0, 1.0)
+        gy = torch.clamp(gy / scale, -1.0, 1.0)
+
+        max_shift = 0.6 + 4.2 * lens_strength * (0.45 + avg_size)
+        xs = torch.linspace(-1.0, 1.0, w, device=device)
+        ys = torch.linspace(-1.0, 1.0, h, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        grid = torch.stack(
+            (
+                grid_x + gx * max_shift * (2.0 / max(1.0, float(w - 1))),
+                grid_y + gy * max_shift * (2.0 / max(1.0, float(h - 1))),
+            ),
+            dim=-1,
+        )[None, :, :, :]
+        chw = x.permute(2, 0, 1)[None, :, :, :]
+        x = torch.nn.functional.grid_sample(
+            chw,
+            grid,
+            mode="bilinear",
+            padding_mode="reflection",
+            align_corners=True,
+        )[0].permute(1, 2, 0)
+
+    # Reakcja kropli na krawędzie całej sceny.
+    opacity_gain, opacity_cap = _rain_alpha_parameters(strength, alpha, cuda=True)
+    edge_splash = None
+    if contact_data is not None:
+        edge_splash = _rain_contact_splash_cuda(
+            torch, (h, w), *contact_data, sizes, (per_drop * opacity_gain).clamp(0, opacity_cap),
+            edge_radius_setting, collision_geometry, strength=edge_strength_setting,
+        )
+
+    local_alpha = torch.clamp(
+        rain * opacity_gain,
+        0.0,
+        opacity_cap,
+    )
+    rain_color = torch.tensor(
+        [
+            165.0 + 25.0 * strength,
+            172.0 + 26.0 * strength,
+            184.0 + 28.0 * strength,
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    x = x * (1.0 - local_alpha[:, :, None]) + rain_color * local_alpha[:, :, None]
+
+    if edge_splash is not None:
+        x = x * (1.0 - edge_splash[:, :, None]) + rain_color * edge_splash[:, :, None]
+
+    return (
+        torch.clamp(x, 0.0, 255.0)
+        .to(dtype=torch.uint8)
+        .cpu()
+        .numpy()
+    )
+
+
+def _apply_mt_scene_postprocess_cuda(image, profile: AugmentationProfile, *, seed: int):
+    if not _mt_scene_cuda_fastpath_eligible(profile):
+        return _apply_image_postprocess(image, profile, random.Random(seed)), "CPU/OpenCV/NumPy"
+    torch = get_torch_module()
+    if torch is None or not torch.cuda.is_available():
+        return _apply_image_postprocess(image, profile, random.Random(seed)), "CPU/OpenCV/NumPy"
+    try:
+        out = _apply_mt_scene_night_cuda(image, profile, torch)
+        out = _apply_mt_scene_coarse_noise_cuda(out, profile, torch, seed)
+        out = _apply_mt_scene_rain_cuda(
+            out,
+            profile,
+            torch,
+            seed=seed + 17011,
+            collision_source=image,
+        )
+        return out, "CUDA/Torch scene fastpath"
+    except Exception as exc:
+        logger.debug(f"CUDA scene fastpath fallback CPU: {exc}")
+        return _apply_image_postprocess(image, profile, random.Random(seed)), "CPU/OpenCV/NumPy (fallback)"
+
+
+
 def augment_yolo_dataset_train_split(
     dataset_dir: Path,
     profile: AugmentationProfile,
@@ -9197,7 +9897,19 @@ def augment_yolo_dataset_train_split(
         "completion_ok": False,
         "completion_status": "PENDING",
         "stop_reason": "",
+        "execution_backend": "CPU/OpenCV/NumPy",
+        "gpu_acceleration": False,
+        "cuda_scene_fastpath_generated": 0,
+        "opencv_threads": 0,
     }
+
+    try:
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        cv_threads = max(1, min(4, cpu_count))
+        cv2.setNumThreads(cv_threads)
+        stats["opencv_threads"] = int(cv2.getNumThreads())
+    except Exception:
+        stats["opencv_threads"] = 0
 
     if not profile.enabled or profile.extra_count <= 0:
         stats["completion_ok"] = True
@@ -9299,14 +10011,22 @@ def augment_yolo_dataset_train_split(
         )
 
         try:
-            transform = _build_transform(sample_profile, has_keypoints=has_keypoints)
-            _seed_transform(transform, sample_seed)
-            augmented = transform(
-                image=image,
-                bboxes=bboxes,
-                class_labels=class_labels,
-                keypoints=keypoints if has_keypoints else [],
-            )
+            if _profile_has_geometry_effect(sample_profile):
+                transform = _build_transform(sample_profile, has_keypoints=has_keypoints)
+                _seed_transform(transform, sample_seed)
+                augmented = transform(
+                    image=image,
+                    bboxes=bboxes,
+                    class_labels=class_labels,
+                    keypoints=keypoints if has_keypoints else [],
+                )
+            else:
+                augmented = {
+                    "image": image,
+                    "bboxes": bboxes,
+                    "class_labels": class_labels,
+                    "keypoints": keypoints if has_keypoints else [],
+                }
         except Exception as exc:
             logger.debug(f"Augmentacja pominięta dla {image_path.name}: {exc}")
             stats["skipped"] += 1
@@ -9342,11 +10062,20 @@ def augment_yolo_dataset_train_split(
             sample_profile,
             seed=(sample_seed + 31337) % 2_147_483_647,
         )
-        augmented_image = _apply_image_postprocess(
+        post_seed = (sample_seed + 7919) % 2_147_483_647 or 1
+        augmented_image, backend_used = _apply_mt_scene_postprocess_cuda(
             augmented_image,
             sample_profile,
-            random.Random((sample_seed + 7919) % 2_147_483_647 or 1),
+            seed=post_seed,
         )
+        if backend_used.startswith("CUDA/"):
+            stats["cuda_scene_fastpath_generated"] = int(
+                stats.get("cuda_scene_fastpath_generated", 0) or 0
+            ) + 1
+            stats["gpu_acceleration"] = True
+            stats["execution_backend"] = "CUDA/Torch scene fastpath + CPU I/O/labels"
+        elif not bool(stats.get("gpu_acceleration")):
+            stats["execution_backend"] = backend_used
         if not cv2.imwrite(str(out_img), augmented_image):
             stats["skipped"] += 1
             continue

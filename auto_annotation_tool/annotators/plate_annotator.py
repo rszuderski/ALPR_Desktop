@@ -11,10 +11,13 @@ import numpy as np
 from ..config import CONFIG, logger, YOLO_AVAILABLE, get_yolo_class, CV2_AVAILABLE, cv2
 from ..data_models import Detection, ImageAnnotation, AnnotationStatus
 from ..quality_metrics import compute_plate_polygon_fit_metrics
+from ..pose_geometry import attach_pose_geometry
+from ..rectification.quad_geometry import canonicalize_polygon
 from ..utils import get_image_size, cleanup_gpu_memory
 from ..rectification import PlateRectifier
 from ..ocr import PlateOCR
 from .base import BaseAnnotator
+from .plate_model_contract import plate_class_ids, plate_result_indices
 
 
 class PlateAnnotator(BaseAnnotator):
@@ -68,6 +71,7 @@ class PlateAnnotator(BaseAnnotator):
             # Załaduj YOLO
             logger.info(f"Ładowanie modelu tablic: {self.model_path}")
             self.model = YoloClass(str(self.model_path))
+            plate_class_ids(getattr(self.model, "names", None))
             
             # Sprawdź, czy model zwraca keypointy.
             if hasattr(self.model, 'model') and hasattr(self.model.model, 'kpt_shape'):
@@ -214,7 +218,7 @@ class PlateAnnotator(BaseAnnotator):
                 status_message="Przetwarzanie przerwane"
             )
         
-        width, height = get_image_size(image_path)
+        width, height = 0, 0
         
         annotation = ImageAnnotation(
             filename=image_path.name,
@@ -236,6 +240,8 @@ class PlateAnnotator(BaseAnnotator):
                 annotation.status_message = self._describe_image_read_error(image_path)
                 return annotation
             yolo_source = str(image_path) if image is True else image
+            width, height = self._model_input_size(image_path, image)
+            annotation.width, annotation.height = width, height
             
             results = self.model(
                 yolo_source,
@@ -250,6 +256,7 @@ class PlateAnnotator(BaseAnnotator):
                 return annotation
             
             result = results[0]
+            plate_indices = plate_result_indices(result, self.model)
             boxes = result.boxes.xyxy.cpu().numpy()
             confs = result.boxes.conf.cpu().numpy()
             
@@ -258,36 +265,23 @@ class PlateAnnotator(BaseAnnotator):
                 keypoints = result.keypoints.data.cpu().numpy()
             
             for i, (box, conf) in enumerate(zip(boxes, confs)):
+                if i not in plate_indices:
+                    continue
                 x1, y1, x2, y2 = map(float, box)
                 
-                polygon = None
-                kpts_list = None
+                raw_pose = keypoints[i] if keypoints is not None and i < len(keypoints) else None
+                kpts_list = self._normalize_keypoints(raw_pose) if raw_pose is not None else None
                 ocr_text = None
                 ocr_conf = 0.0
                 ocr_attrs = {}
                 
-                # Zbuduj poligon z keypointów, jeśli model je zwraca.
-                if keypoints is not None and i < len(keypoints):
-                    kpts = keypoints[i]
-                    kpts_list = self._normalize_keypoints(kpts)
-                    
-                    if len(kpts_list) >= 4:
-                        corners = [(float(kpts_list[j][0]), float(kpts_list[j][1])) for j in range(4)]
-                        
-                        # Odrzuć punkty poza granicami obrazu.
-                        valid = all(0 <= p[0] <= width and 0 <= p[1] <= height for p in corners)
-                        
-                        if valid:
-                            polygon = self._sort_corners_clockwise(corners)
-                
-                # W razie braku keypointów użyj prostokąta z bboxa.
-                if polygon is None:
-                    polygon = [
-                        (x1, y1), (x2, y1), (x2, y2), (x1, y2)
-                    ]
+                detection = Detection(label="plate", confidence=float(conf),
+                                      bbox=(x1, y1, x2, y2), keypoints=kpts_list)
+                attach_pose_geometry(detection, raw_pose, image_size=(width, height))
+                polygon = detection.polygon
                 
                 # Wytnij tablicę i uruchom OCR.
-                if self.enable_ocr and self.ocr_engine and self.ocr_engine.is_loaded:
+                if polygon and self.enable_ocr and self.ocr_engine and self.ocr_engine.is_loaded:
                     plate_region = self._extract_plate_region(image, polygon)
                     
                     if plate_region is not None:
@@ -296,16 +290,9 @@ class PlateAnnotator(BaseAnnotator):
                         if ocr_text:
                             logger.debug(f"OCR: {ocr_text} (conf: {ocr_conf:.2f})")
                 
-                detection = Detection(
-                    label="plate",
-                    confidence=float(conf),
-                    bbox=(x1, y1, x2, y2),
-                    keypoints=kpts_list,
-                    polygon=polygon,
-                    text=ocr_text,
-                    text_confidence=ocr_conf,
-                    attributes=ocr_attrs
-                )
+                detection.text = ocr_text
+                detection.text_confidence = ocr_conf
+                detection.attributes.update(ocr_attrs)
                 try:
                     fit_metrics = compute_plate_polygon_fit_metrics(
                         float(conf),
@@ -313,6 +300,7 @@ class PlateAnnotator(BaseAnnotator):
                         (x1, y1, x2, y2),
                         keypoints=kpts_list,
                         image_size=(width, height),
+                        raw_polygon=[p[:2] for p in (detection.raw_pose_keypoints or [])],
                     )
                     detection.attributes.update({
                         "fit_score": f"{float(fit_metrics.get('fit_score', 0.0) or 0.0):.3f}",
@@ -321,6 +309,8 @@ class PlateAnnotator(BaseAnnotator):
                         "fit_shape_score": f"{float(fit_metrics.get('shape_score', 0.0) or 0.0):.3f}",
                         "fit_bbox_score": f"{float(fit_metrics.get('bbox_alignment_score', 0.0) or 0.0):.3f}",
                         "fit_size_score": f"{float(fit_metrics.get('size_score', 0.0) or 0.0):.3f}",
+                        "fit_input_geometry_status": fit_metrics["input_geometry_status"],
+                        "fit_display_geometry_status": fit_metrics["display_geometry_status"],
                     })
                 except Exception:
                     pass
@@ -353,22 +343,6 @@ class PlateAnnotator(BaseAnnotator):
             return annotation
     
     def _sort_corners_clockwise(self, corners: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Sortuje 4 rogi: TL, TR, BR, BL."""
-        if len(corners) != 4:
-            return corners
-        
-        cx = sum(p[0] for p in corners) / 4
-        cy = sum(p[1] for p in corners) / 4
-        
-        top = [p for p in corners if p[1] < cy]
-        bottom = [p for p in corners if p[1] >= cy]
-        
-        if len(top) != 2 or len(bottom) != 2:
-            sorted_by_y = sorted(corners, key=lambda p: p[1])
-            top = sorted(sorted_by_y[:2], key=lambda p: p[0])
-            bottom = sorted(sorted_by_y[2:], key=lambda p: p[0], reverse=True)
-        else:
-            top = sorted(top, key=lambda p: p[0])
-            bottom = sorted(bottom, key=lambda p: p[0], reverse=True)
-        
-        return [top[0], top[1], bottom[0], bottom[1]]
+        """Display cycle only: this does not certify raw Pose corner identity."""
+        result = canonicalize_polygon(corners, anchor_index=0)
+        return result.polygon if result.polygon is not None else list(corners)

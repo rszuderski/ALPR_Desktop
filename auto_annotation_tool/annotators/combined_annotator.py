@@ -10,8 +10,11 @@ from typing import List, Optional, Tuple
 from ..config import CONFIG, CV2_AVAILABLE, YOLO_AVAILABLE, cv2, get_yolo_class, logger
 from ..data_models import AnnotationStatus, Detection, ImageAnnotation
 from ..quality_metrics import compute_plate_polygon_fit_metrics
+from ..pose_geometry import attach_pose_geometry
+from ..rectification.quad_geometry import canonicalize_polygon
 from ..utils import cleanup_gpu_memory, get_image_size
 from .base import BaseAnnotator
+from .plate_model_contract import plate_class_ids, plate_result_indices
 
 
 class CombinedAnnotator(BaseAnnotator):
@@ -71,6 +74,7 @@ class CombinedAnnotator(BaseAnnotator):
 
             logger.info(f"Ladowanie modelu tablic: {self.plate_model_path}")
             self.plate_model = YoloClass(str(self.plate_model_path))
+            plate_class_ids(getattr(self.plate_model, "names", None))
             if hasattr(self.plate_model, "model") and hasattr(self.plate_model.model, "kpt_shape"):
                 self.is_plate_pose_model = True
                 logger.info("Model tablic: POSE")
@@ -91,7 +95,7 @@ class CombinedAnnotator(BaseAnnotator):
         cleanup_gpu_memory()
 
     def process_image(self, image_path: Path) -> ImageAnnotation:
-        width, height = get_image_size(image_path)
+        width, height = 0, 0
 
         annotation = ImageAnnotation(
             filename=image_path.name,
@@ -108,6 +112,8 @@ class CombinedAnnotator(BaseAnnotator):
                 )
 
             yolo_source = str(image_path) if image_source is True else image_source
+            width, height = self._model_input_size(image_path, image_source)
+            annotation.width, annotation.height = width, height
             image = None if image_source is True else image_source
 
             vehicles = self._detect_vehicles(yolo_source)
@@ -242,6 +248,7 @@ class CombinedAnnotator(BaseAnnotator):
             return plates
 
         result = results[0]
+        plate_indices = plate_result_indices(result, self.plate_model)
         boxes = result.boxes.xyxy.cpu().numpy()
         confs = result.boxes.conf.cpu().numpy()
 
@@ -250,17 +257,19 @@ class CombinedAnnotator(BaseAnnotator):
             keypoints = result.keypoints.data.cpu().numpy()
 
         for i, (box, conf) in enumerate(zip(boxes, confs)):
+            if i not in plate_indices:
+                continue
             x1, y1, x2, y2 = map(float, box)
             x1 += float(offset_x)
             y1 += float(offset_y)
             x2 += float(offset_x)
             y2 += float(offset_y)
 
-            polygon = None
+            raw_pose = keypoints[i] if keypoints is not None and i < len(keypoints) else None
             kpts_list = None
 
-            if keypoints is not None and i < len(keypoints):
-                raw_kpts = self._normalize_keypoints(keypoints[i])
+            if raw_pose is not None:
+                raw_kpts = self._normalize_keypoints(raw_pose)
                 if raw_kpts:
                     translated_kpts = []
                     for kp_x, kp_y, kp_conf in raw_kpts:
@@ -272,22 +281,15 @@ class CombinedAnnotator(BaseAnnotator):
                             )
                         )
                     kpts_list = translated_kpts
-                    if len(kpts_list) >= 4:
-                        corners = [(float(kpts_list[j][0]), float(kpts_list[j][1])) for j in range(4)]
-                        valid = all(0 <= p[0] <= width and 0 <= p[1] <= height for p in corners)
-                        if valid:
-                            polygon = self._sort_corners_clockwise(corners)
-
-            if polygon is None:
-                polygon = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
 
             detection = Detection(
                 label="plate",
                 confidence=float(conf),
                 bbox=(x1, y1, x2, y2),
                 keypoints=kpts_list,
-                polygon=polygon,
             )
+            attach_pose_geometry(detection, raw_pose, image_size=(width, height), offset=(offset_x, offset_y))
+            polygon = detection.polygon
             try:
                 fit_metrics = compute_plate_polygon_fit_metrics(
                     float(conf),
@@ -295,6 +297,7 @@ class CombinedAnnotator(BaseAnnotator):
                     (x1, y1, x2, y2),
                     keypoints=kpts_list,
                     image_size=(width, height),
+                    raw_polygon=[p[:2] for p in (detection.raw_pose_keypoints or [])],
                 )
                 detection.attributes.update(
                     {
@@ -304,6 +307,8 @@ class CombinedAnnotator(BaseAnnotator):
                         "fit_shape_score": f"{float(fit_metrics.get('shape_score', 0.0) or 0.0):.3f}",
                         "fit_bbox_score": f"{float(fit_metrics.get('bbox_alignment_score', 0.0) or 0.0):.3f}",
                         "fit_size_score": f"{float(fit_metrics.get('size_score', 0.0) or 0.0):.3f}",
+                        "fit_input_geometry_status": fit_metrics["input_geometry_status"],
+                        "fit_display_geometry_status": fit_metrics["display_geometry_status"],
                     }
                 )
             except Exception:
@@ -463,21 +468,6 @@ class CombinedAnnotator(BaseAnnotator):
 
     @staticmethod
     def _sort_corners_clockwise(corners: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        if len(corners) != 4:
-            return corners
-
-        cx = sum(p[0] for p in corners) / 4
-        cy = sum(p[1] for p in corners) / 4
-
-        top = [p for p in corners if p[1] < cy]
-        bottom = [p for p in corners if p[1] >= cy]
-
-        if len(top) != 2 or len(bottom) != 2:
-            sorted_by_y = sorted(corners, key=lambda p: p[1])
-            top = sorted(sorted_by_y[:2], key=lambda p: p[0])
-            bottom = sorted(sorted_by_y[2:], key=lambda p: p[0], reverse=True)
-        else:
-            top = sorted(top, key=lambda p: p[0])
-            bottom = sorted(bottom, key=lambda p: p[0], reverse=True)
-
-        return [top[0], top[1], bottom[0], bottom[1]]
+        """Display cycle only, preserving the first source vertex."""
+        result = canonicalize_polygon(corners, anchor_index=0)
+        return result.polygon if result.polygon is not None else list(corners)

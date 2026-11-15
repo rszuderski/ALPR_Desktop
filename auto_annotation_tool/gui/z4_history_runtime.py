@@ -150,6 +150,8 @@ def _get_latest_campaign_resumable_run_id(self) -> str:
     return ""
 
 def _is_history_run_resume_allowed(self, run) -> bool:
+    if not _history_run_matches_active_storage(self, run):
+        return False
     if not self._is_history_run_resumable(run):
         return False
     if not self._does_history_run_match_active_campaign_target(run):
@@ -228,26 +230,117 @@ def _open_path(self, path: Path):
     except Exception as e:
         messagebox.showinfo("Info", f"Nie mogę otworzyć: {path}\n\n{e}")
 
-def _selected_run(self):
-    sel = self.tree.selection()
-    if not sel:
-        return None
+def _get_visible_training_history_sources(self):
+    """UI catalog = global histories + archived/project histories."""
+    active = self.history
+    if CAMPAIGN.get_active_project_name():
+        return [(self.get_campaign_training_target(), active)]
+
+    sources = []
+    seen_dirs = set()
+
+    def _add(target, directory):
+        try:
+            directory = Path(directory)
+            key = str(directory.resolve()).lower()
+        except Exception:
+            return
+        if key in seen_dirs or not directory.exists():
+            return
+        seen_dirs.add(key)
+        try:
+            source = active if Path(active.history_dir).resolve() == directory.resolve() else TrainingHistory(
+                history_dir=directory, reconcile_on_load=False
+            )
+        except Exception:
+            return
+        sources.append((target, source))
+
+    for target in ("plate", "char", "vehicle"):
+        try:
+            _add(target, Path(CONFIG.get_training_runs_dir(target)))
+        except Exception:
+            pass
 
     try:
-        self._reload_history_snapshot_from_disk()
+        projects_root = Path(CONFIG.DIR_9_PROJECTS)
+        if projects_root.exists():
+            for project_root in sorted(
+                (path for path in projects_root.iterdir() if path.is_dir()),
+                key=lambda path: path.name.lower(),
+            ):
+                _add("", project_root / "5_training_runs")
     except Exception:
         pass
 
-    item_id = str(sel[0] or "").strip()
-    if not item_id:
+    return sources
+
+
+def _history_row_ref(self, item_id):
+    refs = getattr(self, "_history_row_refs", None)
+    if isinstance(refs, dict):
+        return refs.get(str(item_id))
+    # Compatibility with pre-catalog views; never resolve a namespaced ID here.
+    if str(item_id).startswith(("char:", "plate:", "vehicle:")):
         return None
+    run = self.history.get_run(str(item_id))
+    return {"run": run, "history": self.history, "target": ""} if run is not None else None
 
-    run = self.history.get_run(item_id)
-    if run is not None:
-        return run
 
-    # Fallback dla starszych wpisów / ewentualnych niespójności.
-    for db_key, run_obj in self.history.runs.items():
-        if str(db_key or "").strip() == item_id:
-            return run_obj
-    return None
+def _history_row_id_for_run(self, run, *, history=None):
+    refs = getattr(self, "_history_row_refs", None)
+    if not isinstance(refs, dict):
+        return str(getattr(run, "id", "") or "")
+    candidates = []
+    for iid, ref in refs.items():
+        candidate = ref["run"]
+        if candidate is run:
+            return iid
+        if str(candidate.id) != str(run.id):
+            continue
+        if history is not None and Path(ref["history"].history_dir).resolve() != Path(history.history_dir).resolve():
+            continue
+        if history is None and str(getattr(candidate, "output_dir", "")) != str(getattr(run, "output_dir", "")):
+            continue
+        candidates.append(iid)
+    return candidates[0] if len(candidates) == 1 else ""
+
+
+def _history_run_matches_active_storage(self, run):
+    if CAMPAIGN.get_active_project_name():
+        return True
+    if run is None:
+        return False
+    refs = getattr(self, "_history_row_refs", None)
+    if isinstance(refs, dict):
+        iid = _history_row_id_for_run(self, run)
+        if not iid:
+            return False
+        source = refs[iid]["history"]
+        return Path(source.history_dir).resolve() == Path(self.history.history_dir).resolve()
+    # Before a history table exists, keep the existing target contract.
+    try:
+        target = self._infer_history_run_target(run)
+        active_target = self._get_selected_training_target()
+        if target in {"plate", "char", "vehicle"} and active_target in {"plate", "char", "vehicle"}:
+            return target == active_target
+    except Exception:
+        pass
+    return True
+
+
+def _ensure_history_run_storage_for_action(self, run):
+    if _history_run_matches_active_storage(self, run):
+        return True
+    iid = _history_row_id_for_run(self, run)
+    refs = getattr(self, "_history_row_refs", {})
+    target = refs.get(iid, {}).get("target", "") if isinstance(refs, dict) else ""
+    label = self._format_history_run_target_label(target)
+    messagebox.showwarning("Przełącz tor treningu", f"Ten run należy do toru {label}. Przełącz Z4 na ten tor przed wznowieniem lub dotrenowaniem.")
+    return False
+
+
+def _selected_run(self):
+    selected = self.tree.selection()
+    ref = _history_row_ref(self, selected[0]) if selected else None
+    return ref["run"] if ref else None

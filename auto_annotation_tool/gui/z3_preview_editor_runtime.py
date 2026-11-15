@@ -10,6 +10,8 @@ from pathlib import Path
 from tkinter import messagebox
 
 from ..config import logger
+from .z3_gt_box_policy import can_add_character_box
+from .z3_preview_grip_geometry import CORNER_HANDLE_ORDER, EDGE_HANDLE_ORDER, get_corner_handle_centers, get_edge_handle_rects
 
 
 def _get_preview_selected_char_record(self):
@@ -38,6 +40,41 @@ def _is_preview_char_record_selected(self, record, *, fallback_index: int | None
     except Exception:
         return False
 
+def _preview_inherited_z2_number(self) -> str:
+    data = self._get_preview_active_data(create=False)
+    if not isinstance(data, dict):
+        return ""
+    attrs = data.get("plate_attributes")
+    attrs = attrs if isinstance(attrs, dict) else {}
+    source = str(
+        data.get("ground_truth_source")
+        or attrs.get("ground_truth_source")
+        or ""
+    ).strip().lower()
+    if source != "manual_z2":
+        return ""
+    try:
+        return str(self._get_preview_ground_truth_text(data) or "").strip()
+    except Exception:
+        return str(
+            data.get("ground_truth_text")
+            or attrs.get("ground_truth_text")
+            or ""
+        ).strip()
+
+
+def _with_preview_inherited_z2_notice(self, message: str) -> str:
+    number = _preview_inherited_z2_number(self)
+    if not number:
+        return str(message or "")
+    return (
+        f"{str(message or '').strip()} "
+        f"Numer zapisany wcześniej w Z2: {number}. "
+        "Edycja boxów i znaków nie zmienia tego numeru. "
+        "Po korekcie naciśnij O. Jeśli numer z Z2 jest błędny, użyj „Zmień numer”."
+    ).strip()
+
+
 def _preview_char_add_requested(self) -> bool:
     return bool(
         getattr(self, "_preview_char_add_state", None) is not None
@@ -55,6 +92,10 @@ def _find_preview_char_record_index(chars, target_record) -> int | None:
     return None
 
 def _select_hovered_preview_char_box(self, event=None):
+    if not self._prepare_active_preview_review():
+        return "break"
+    if event is not None and isinstance(getattr(event, "x", None), (int, float)):
+        self._preview_char_hover_index = self._find_preview_character_box_hit(event.x, event.y)
     hover_idx = getattr(self, "_preview_char_hover_index", None)
     if hover_idx is None:
         selected_idx, _selected_rec = self._get_preview_selected_char_record()
@@ -88,6 +129,8 @@ def _select_hovered_preview_char_box(self, event=None):
     )
 
 def _cycle_preview_character_selection(self, step: int, *, activate_label: bool = False):
+    if not self._prepare_active_preview_review():
+        return "break"
     chars = self._get_preview_active_character_records(create=False)
     if not isinstance(chars, list) or not chars:
         self._update_preview_edit_status("Brak boxów znaków do przełączenia.", tone="warning")
@@ -220,7 +263,10 @@ def _get_preview_char_move_handle_radius(self) -> float:
     return max(11.0, min(20.0, 9.0 + (scale * 0.24)))
 
 def _find_preview_character_box_hit(self, canvas_x: float, canvas_y: float):
-    chars = self._get_preview_active_character_records(create=False)
+    data = self._get_preview_active_data(create=False)
+    chars, layer = self._get_preview_box_records(data)
+    if layer == "FINAL":
+        chars = self._get_preview_active_character_records(create=False)
     hits = []
     for idx in range(len(chars) - 1, -1, -1):
         bbox = self._char_record_bbox(chars[idx])
@@ -247,15 +293,15 @@ def _find_preview_character_handle_hit(self, canvas_x: float, canvas_y: float):
 
     cx1, cy1 = self._preview_image_to_canvas_point(bbox[0], bbox[1])
     cx2, cy2 = self._preview_image_to_canvas_point(bbox[2], bbox[3])
-    radius = self._get_preview_char_handle_radius()
-    handles = {
-        "nw": (cx1, cy1),
-        "ne": (cx2, cy1),
-        "sw": (cx1, cy2),
-        "se": (cx2, cy2),
-    }
+    radius = float(self._get_preview_char_handle_radius())
+    for handle_name, rect in get_edge_handle_rects(cx1, cy1, cx2, cy2, radius).items():
+        if rect[0] <= float(canvas_x) <= rect[2] and rect[1] <= float(canvas_y) <= rect[3]:
+            return idx, handle_name
+    handles = get_corner_handle_centers(cx1, cy1, cx2, cy2, radius)
+
     best_hit = None
-    for handle_name, (hx, hy) in handles.items():
+    for handle_name in CORNER_HANDLE_ORDER:
+        hx, hy = handles[handle_name]
         dx = float(canvas_x) - float(hx)
         dy = float(canvas_y) - float(hy)
         dist_sq = (dx * dx) + (dy * dy)
@@ -293,9 +339,9 @@ def _find_preview_character_grip_hit(self, canvas_x: float, canvas_y: float):
         char_idx, handle_name = corner_hit
         return {
             "index": int(char_idx),
-            "kind": "corner",
+            "kind": "edge" if handle_name in EDGE_HANDLE_ORDER else "corner",
             "handle": str(handle_name),
-            "key": f"corner:{handle_name}",
+            "key": f"edge:{handle_name}" if handle_name in EDGE_HANDLE_ORDER else f"corner:{handle_name}",
         }
 
     move_hit = self._find_preview_character_move_handle_hit(canvas_x, canvas_y)
@@ -501,7 +547,10 @@ def _toggle_preview_char_edit_mode(self, event=None):
     self._set_preview_char_editor_modes(
         edit=(not bool(getattr(self, "_preview_char_edit_mode", False))),
         add=False,
-        message="Tryb korekty boxów znaków działa na wyniku końcowym.",
+        message=_with_preview_inherited_z2_notice(
+            self,
+            "Tryb korekty boxów znaków działa na wyniku końcowym.",
+        ),
     )
     return "break"
 
@@ -510,10 +559,15 @@ def _toggle_preview_char_add_mode(self, event=None):
         self._set_preview_box_info("Najpierw wybierz tablicę z listy.", "warning")
         return "break"
     self._ensure_preview_final_box_mode(render_preview=False)
+    if not bool(getattr(self, "_preview_char_add_mode", False)) and not can_add_character_box(self, self._get_preview_active_data(create=False)):
+        return "break"
     self._set_preview_char_editor_modes(
         edit=False,
         add=(not bool(getattr(self, "_preview_char_add_mode", False))),
-        message="Narysuj nowy box na znaku w podglądzie tablicy.",
+        message=_with_preview_inherited_z2_notice(
+            self,
+            "Narysuj nowy box na znaku w podglądzie tablicy.",
+        ),
     )
     return "break"
 
@@ -539,7 +593,11 @@ def _toggle_preview_char_label_mode(self, event=None):
             self._preview_char_hover_label_index = int(target_idx)
             self._preview_char_label_active_index = int(target_idx)
         self._update_preview_edit_status(
-            "Tryb wpisywania znaków aktywny. Kliknij box LPM albo użyj strzałek lewo/prawo, a potem wpisz znak z klawiatury.",
+            _with_preview_inherited_z2_notice(
+                self,
+                "Tryb wpisywania znaków aktywny. Kliknij box LPM albo użyj strzałek lewo/prawo, "
+                "a potem wpisz znak z klawiatury.",
+            ),
             tone="info",
         )
     else:
@@ -573,7 +631,11 @@ def _edit_selected_preview_char_symbol(self, event=None):
         return "break"
     self._activate_preview_char_label_input(
         idx,
-        status_message="Pole znaku jest aktywne tymczasowo. Wpisz 0-9 lub A-Z, aby nadpisać etykietę, albo Esc aby wyjść.",
+        status_message=_with_preview_inherited_z2_notice(
+            self,
+            "Pole znaku jest aktywne tymczasowo. Wpisz 0-9 lub A-Z, aby nadpisać etykietę, "
+            "albo Esc aby wyjść.",
+        ),
     )
     return "break"
 

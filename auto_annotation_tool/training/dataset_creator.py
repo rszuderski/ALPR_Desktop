@@ -11,10 +11,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..config import CONFIG, logger
 from ..utils import get_image_files
+from ..rectification.quad_geometry import validated_pose_label_points, pose_label_identity_confirmation, format_pose_label
 
 
 @dataclass
@@ -24,54 +25,18 @@ class PlateAnnotation:
     image_width: int
     image_height: int
     points: List[Tuple[float, float]]
+    attributes: Dict[str, str] = field(default_factory=dict)
     
-    def to_yolo_pose(self) -> Optional[str]:
+    def to_yolo_pose(self) -> str:
         """Konwertuje do formatu YOLO Pose."""
-        if len(self.points) != 4:
-            return None
-        
-        # Bbox z punktów
-        xs = [p[0] for p in self.points]
-        ys = [p[1] for p in self.points]
-        
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        
-        # Normalizacja
-        x_center = ((x_min + x_max) / 2) / self.image_width
-        y_center = ((y_min + y_max) / 2) / self.image_height
-        width = (x_max - x_min) / self.image_width
-        height = (y_max - y_min) / self.image_height
-        
-        # Keypoints (posortowane)
         sorted_points = self._sort_clockwise()
         
-        keypoints = []
-        for px, py in sorted_points:
-            kp_x = px / self.image_width
-            kp_y = py / self.image_height
-            keypoints.extend([kp_x, kp_y])
-        
-        values = [0, x_center, y_center, width, height] + keypoints
-        return " ".join([f"{v:.6f}" if isinstance(v, float) else str(v) for v in values])
+        return format_pose_label(sorted_points, (self.image_width, self.image_height))
     
     def _sort_clockwise(self) -> List[Tuple[float, float]]:
-        """Sortuje punkty: TL, TR, BR, BL."""
-        if len(self.points) != 4:
-            return self.points
-        
-        cx = sum(p[0] for p in self.points) / 4
-        cy = sum(p[1] for p in self.points) / 4
-        
-        top = sorted([p for p in self.points if p[1] < cy], key=lambda p: p[0])
-        bottom = sorted([p for p in self.points if p[1] >= cy], key=lambda p: p[0], reverse=True)
-        
-        if len(top) != 2:
-            sorted_by_y = sorted(self.points, key=lambda p: p[1])
-            top = sorted(sorted_by_y[:2], key=lambda p: p[0])
-            bottom = sorted(sorted_by_y[2:], key=lambda p: p[0], reverse=True)
-        
-        return [top[0], top[1], bottom[0], bottom[1]]
+        """Zachowuje zatwierdzone indeksy; nie sortuje położenia na ekranie."""
+        return validated_pose_label_points(self.points, (self.image_width, self.image_height),
+                                           corner_identity_confirmed=pose_label_identity_confirmation(self.attributes))
 
 
 class DatasetCreator:
@@ -109,6 +74,7 @@ class DatasetCreator:
     
     def __init__(self):
         self.annotations: List[PlateAnnotation] = []
+        self._pose_parse_errors: list[str] = []
         self.xml_image_names: set[str] = set()
         self.annotated_image_names: set[str] = set()
 
@@ -197,6 +163,7 @@ class DatasetCreator:
         }
         
         self.annotations = []
+        self._pose_parse_errors = []
         self.xml_image_names = set()
         self.annotated_image_names = set()
         
@@ -221,6 +188,8 @@ class DatasetCreator:
                 img_height = int(image.get('height', 0))
                 
                 if not img_name or not img_width or not img_height:
+                    if any(poly.get('label', '').lower() in CONFIG.PLATE_LABELS for poly in image.findall('polygon')):
+                        stats["errors"].append(f"{img_name}: nieprawidłowe wymiary obrazu dla Pose")
                     continue
 
                 if allowed_lookup is not None and img_name.strip().lower() not in allowed_lookup:
@@ -239,22 +208,25 @@ class DatasetCreator:
                     points_str = poly.get('points', '')
                     if not points_str:
                         stats["skipped"] += 1
+                        stats["errors"].append(f"{img_name}: KEYPOINTS_MISSING")
                         continue
                     
                     try:
                         points = []
                         for p in points_str.split(';'):
-                            if ',' in p:
-                                x, y = p.strip().split(',')
-                                points.append((float(x), float(y)))
+                            x, y = p.strip().split(',')
+                            points.append((float(x), float(y)))
                         
                         if len(points) == 4:
-                            self.annotations.append(PlateAnnotation(
+                            annotation = PlateAnnotation(
                                 image_name=img_name,
                                 image_width=img_width,
                                 image_height=img_height,
-                                points=points
-                            ))
+                                points=points,
+                                attributes={a.get('name', ''): a.text or '' for a in poly.findall('attribute')},
+                            )
+                            annotation.to_yolo_pose()  # Validate before accepting this source.
+                            self.annotations.append(annotation)
                             self.annotated_image_names.add(img_name)
                             stats["plates"] += 1
                         else:
@@ -265,6 +237,9 @@ class DatasetCreator:
                         stats["skipped"] += 1
                         stats["errors"].append(f"{img_name}: {e}")
             
+            self._pose_parse_errors = list(stats["errors"])
+            if self._pose_parse_errors:
+                return False, "Nieprawidłowe etykiety Pose: " + self._pose_parse_errors[0], stats
             if stats["plates"] == 0:
                 return False, "Nie znaleziono tablic z 4 punktami", stats
 
@@ -296,6 +271,11 @@ class DatasetCreator:
         """
         if not self.annotations:
             return False, "Brak anotacji - najpierw sparsuj XML", {}
+        if self._pose_parse_errors:
+            raise ValueError("Nie można wyeksportować części etykiet: " + self._pose_parse_errors[0])
+
+        # Fail before directories or images are written; never drop one bad plate.
+        prepared_labels = {id(ann): ann.to_yolo_pose() for ann in self.annotations}
         
         split_ratios = split_ratios or {"train": 0.8, "val": 0.2}
         
@@ -314,24 +294,18 @@ class DatasetCreator:
                 images_data[ann.image_name] = []
             images_data[ann.image_name].append(ann)
         
-        # Przygotuj podział
-        image_names = list(images_data.keys())
-        
-        import random
-        random.seed(42)
-        random.shuffle(image_names)
-        
+        from .scene_split import assign_scene_splits, check_new_split_destination, save_scene_assignment
+        image_names = list(images_data)
         n_total = len(image_names)
-        split_counts = self._allocate_split_counts(n_total, split_ratios)
-        if not split_counts:
-            return False, "Do treningu YOLO Pose potrzebne sa co najmniej 2 oznaczone obrazy, aby wypelnic train i val.", stats
-
-        splits = {}
-        offset = 0
-        for split_name in split_counts.keys():
-            split_count = int(split_counts.get(split_name, 0) or 0)
-            splits[split_name] = set(image_names[offset:offset + split_count])
-            offset += split_count
+        try:
+            check_new_split_destination(images_dir, output_dir)
+            if split_ratios.get("train", 0) <= 0 or split_ratios.get("val", 0) <= 0:
+                raise ValueError("YOLO Pose wymaga niepustych splitów train i val.")
+            grouped, assignment = assign_scene_splits(
+                [{"name": name, "image": Path(images_dir) / name} for name in image_names], split_ratios)
+        except (OSError, ValueError) as exc:
+            return False, str(exc), stats
+        splits = {split: {item["name"] for item in items} for split, items in grouped.items()}
         
         # Utwórz foldery
         output_dir = Path(output_dir)
@@ -369,7 +343,7 @@ class DatasetCreator:
             
             lines = []
             for ann in images_data[img_name]:
-                line = ann.to_yolo_pose()
+                line = prepared_labels[id(ann)]
                 if line:
                     lines.append(line)
             
@@ -381,6 +355,7 @@ class DatasetCreator:
         
         # Utwórz data.yaml
         self._create_data_yaml(output_dir)
+        save_scene_assignment(output_dir, assignment)
         
         return True, f"Utworzono dataset: {stats['total']} obrazów", stats
     

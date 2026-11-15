@@ -8,7 +8,11 @@ from tkinter import ttk
 
 from ..config import logger
 from .canvas_progress_overlay import CanvasProgressOverlay
+from .z3_badge_legend import CharacterBadgeLegend
+from .z3_threshold_percent import create_percent_spinbox, format_percent, percent_label
 from .z3_detection_guard_dialog import prompt_pz2_detection_guard_options
+from .z3_pz2_material_append import open_pz2_add_material
+from .z3_pz2_material_export import open_pz2_export_material
 from .z3_detection_runtime import (
     confirm_last_detection_result,
     refresh_detection_review_controls,
@@ -186,7 +190,7 @@ def build_detection_tab(
     self.detect_left_panel = left_panel
     self.detect_right_panel = right_panel
     split.add(left_panel, minsize=560, stretch="always")
-    split.add(right_panel, minsize=300, stretch="never")
+    split.add(right_panel, minsize=280, width=300, stretch="never")
 
     left_panel.grid_rowconfigure(0, weight=0)
     left_panel.grid_rowconfigure(1, weight=1)
@@ -199,16 +203,16 @@ def build_detection_tab(
     self.detect_left_title_lbl = SectionHeaderLabel(
         self.detect_left_header,
         self.app,
-        text="PZ2. Wykrywanie znaków i analiza",
+        text="Sprawdzanie znaków",
     )
     self.detect_left_title_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
     self.detect_left_intro_lbl = tk.Label(
         self.detect_left_header,
         text=(
-            "Pracujesz na cropach tablic przygotowanych w PZ1. "
-            "Po lewej wybierasz tablicę, a na canvasie rysujesz i poprawiasz boxy znaków. "
-            "Status perfect program nada automatycznie, gdy zapisane znaki będą zgodne z nazwą pliku źródłowego."
+            "Pracujesz na wyodrębnionych tablicach. "
+            "Po lewej wybierasz tablicę, a na obrazie rysujesz i poprawiasz ramki znaków. "
+            "Program sprawdza poprawność techniczną, ale dopiero Twoje zatwierdzenie pozwala użyć tablicy w zbiorze danych."
         ),
         anchor="w",
         justify=tk.LEFT,
@@ -230,95 +234,10 @@ def build_detection_tab(
     )
     self.detect_left_header.grid_remove()
 
-    old_splash_overlay = getattr(self, "campaign_detect_splash_overlay", None)
-    old_splash_card = getattr(self, "campaign_detect_splash_card", None)
-    old_splash_title_lbl = getattr(self, "campaign_detect_splash_title_lbl", None)
-    old_splash_body_lbl = getattr(self, "campaign_detect_splash_body_lbl", None)
-    old_splash_progress = getattr(self, "campaign_detect_splash_progress", None)
-    old_splash_return_btn = getattr(self, "campaign_detect_splash_return_btn", None)
-    old_splash_surface = getattr(self, "_campaign_detect_splash_surface", None)
-    keep_existing_splash = False
-    try:
-        keep_existing_splash = bool(
-            getattr(self, "_campaign_detect_splash_visible", False)
-            and old_splash_overlay is not None
-            and old_splash_overlay.winfo_exists()
-        )
-    except Exception:
-        keep_existing_splash = False
-    try:
-        if old_splash_overlay is not None and old_splash_overlay.winfo_exists() and not keep_existing_splash:
-            old_splash_overlay.destroy()
-    except Exception:
-        pass
-
-    self.campaign_detect_splash_overlay = tk.Frame(
-        content_frame,
-        bd=0,
-        highlightthickness=0,
+    from .z3_extraction_tab_ui import _ensure_campaign_detect_splash_widgets
+    _ensure_campaign_detect_splash_widgets(
+        self, return_text="Wróć do E3", return_command=self._return_to_wizard_for_step3_rework,
     )
-    self._campaign_detect_splash_surface = content_frame
-    self.campaign_detect_splash_card = tk.Frame(
-        self.campaign_detect_splash_overlay,
-        bd=0,
-        highlightthickness=1,
-        padx=22,
-        pady=20,
-    )
-    self.campaign_detect_splash_card.place(relx=0.5, rely=0.34, anchor="n")
-    self.campaign_detect_splash_card.grid_columnconfigure(0, weight=1, minsize=560)
-
-    self.campaign_detect_splash_title_lbl = tk.Label(
-        self.campaign_detect_splash_card,
-        text="Przygotowuję wyodrębnione tablice dla Z3",
-        anchor="w",
-        justify=tk.LEFT,
-        font=("Segoe UI Semibold", 13),
-        bd=0,
-        highlightthickness=0,
-    )
-    self.campaign_detect_splash_title_lbl.grid(row=0, column=0, sticky="ew")
-
-    self.campaign_detect_splash_body_lbl = tk.Label(
-        self.campaign_detect_splash_card,
-        text="To automatyczny krok pośredni przed pracą nad znakami.",
-        anchor="w",
-        justify=tk.LEFT,
-        wraplength=560,
-        bd=0,
-        highlightthickness=0,
-    )
-    self.campaign_detect_splash_body_lbl.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-
-    self.campaign_detect_splash_progress = ttk.Progressbar(
-        self.campaign_detect_splash_card,
-        mode="determinate",
-        maximum=100.0,
-    )
-    self.campaign_detect_splash_progress.grid(row=2, column=0, sticky="ew", pady=(14, 0))
-
-    self.campaign_detect_splash_return_btn = ttk.Button(
-        self.campaign_detect_splash_card,
-        text="Wróć do E3",
-        command=self._return_to_wizard_for_step3_rework,
-    )
-    self.campaign_detect_splash_return_btn.grid(row=3, column=0, sticky="w", pady=(14, 0))
-    self.campaign_detect_splash_return_btn.grid_remove()
-    self.campaign_detect_splash_overlay.place_forget()
-    if keep_existing_splash:
-        new_splash_overlay = self.campaign_detect_splash_overlay
-        try:
-            if new_splash_overlay is not None and new_splash_overlay.winfo_exists():
-                new_splash_overlay.destroy()
-        except Exception:
-            pass
-        self.campaign_detect_splash_overlay = old_splash_overlay
-        self.campaign_detect_splash_card = old_splash_card
-        self.campaign_detect_splash_title_lbl = old_splash_title_lbl
-        self.campaign_detect_splash_body_lbl = old_splash_body_lbl
-        self.campaign_detect_splash_progress = old_splash_progress
-        self.campaign_detect_splash_return_btn = old_splash_return_btn
-        self._campaign_detect_splash_surface = old_splash_surface
     _mark_build_phase("shell")
 
     preview_panel_bg = palette.get("panel", "#252526")
@@ -361,7 +280,7 @@ def build_detection_tab(
 
     self.preview_canvas_host = tk.Frame(
         preview_lf,
-        bg=palette.get("field", preview_panel_bg),
+        bg="#1e1e1e",
         bd=0,
         highlightthickness=0,
     )
@@ -376,13 +295,15 @@ def build_detection_tab(
 
     self.preview_canvas = tk.Canvas(
         self.preview_canvas_host,
-        bg=palette.get("field", preview_panel_bg),
+        bg="#1e1e1e",
         bd=0,
         relief=tk.FLAT,
         highlightthickness=0,
         takefocus=1,
     )
     self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+    self.preview_badge_legend = CharacterBadgeLegend(self.preview_canvas_host, self)
+    self.preview_badge_legend.grid(row=1, column=0, sticky="ew")
     self.preview_canvas.bind("<Configure>", self._on_preview_canvas_configure)
     self.preview_canvas.bind("<Map>", self._on_preview_canvas_configure, add="+")
     self.preview_canvas.bind("<Enter>", self._on_preview_canvas_enter, add="+")
@@ -422,16 +343,15 @@ def build_detection_tab(
     self.preview_title_lbl = SectionHeaderLabel(
         self.preview_tools,
         self.app,
-        text="Podgląd tablicy i boxów znaków",
+        text="Podgląd tablicy i ramek znaków",
     )
     self.preview_title_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
     self.preview_intro_lbl = tk.Label(
         self.preview_tools,
         text=(
-            "Pracujesz na cropach tablic przygotowanych w PZ1. "
-            "Wybierz metodę OCR/YOLO, uruchom detekcję, popraw boxy znaków na canvasie "
-            "i oznacz poprawne tablice jako perfect przed przejściem do PZ3."
+            "Wybierz sposób wykrywania, uruchom analizę i popraw ramki oraz znaki na obrazie. "
+            "Po sprawdzeniu zatwierdź tablicę, aby mogła trafić do zbioru danych."
         ),
         anchor="w",
         justify=tk.LEFT,
@@ -487,7 +407,7 @@ def build_detection_tab(
 
     self.preview_shortcuts_lbl = tk.Label(
         self.preview_tools,
-        text="Skróty: Q/E przełącza poprzednią/następną tablicę na liście, D uzbraja rysowanie nowego boxa, S zaznacza lub odznacza hoverowany box, PPM usuwa zaznaczony box, Alt+W włącza tryb wpisywania znaków, LPM albo strzałki lewo/prawo wybierają pole, 0-9/A-Z wpisuje znak, Esc wychodzi z wpisywania, Enter przełącza pełny ekran, Ctrl+Z/Y cofa i ponawia.",
+        text="Skróty: Q/E przełącza poprzednią/następną tablicę, D uzbraja rysowanie nowego boxa, S zaznacza lub odznacza hoverowany box, N oznacza tablicę jako nieczytelną/wykluczoną, O zatwierdza jako OK, PPM usuwa zaznaczony box, Alt+W włącza tryb wpisywania znaków, LPM albo strzałki lewo/prawo wybierają pole, 0-9/A-Z wpisuje znak, Esc wychodzi z wpisywania, Enter przełącza pełny ekran, Ctrl+Z/Y cofa i ponawia.",
         anchor="w",
         justify=tk.LEFT,
         wraplength=780,
@@ -885,48 +805,6 @@ def build_detection_tab(
         "label": layout_label,
         "status": layout_status,
     }
-    plate_status_row = tk.Frame(self.preview_overlay_dock_body, bd=0, highlightthickness=1, cursor="arrow")
-    plate_status_icon = tk.Label(
-        plate_status_row,
-        text="ST",
-        width=2,
-        anchor="center",
-        justify=tk.CENTER,
-        font=("Segoe UI", 8, "bold"),
-        bd=0,
-        highlightthickness=0,
-        cursor="arrow",
-    )
-    plate_status_label = tk.Label(
-        plate_status_row,
-        text="Ocena tablicy",
-        anchor="w",
-        justify=tk.LEFT,
-        font=("Segoe UI", 8, "bold"),
-        bd=0,
-        highlightthickness=0,
-        cursor="arrow",
-    )
-    plate_status_value = tk.Label(
-        plate_status_row,
-        text="KOREKTA",
-        anchor="center",
-        justify=tk.CENTER,
-        font=("Segoe UI", 7, "bold"),
-        bd=0,
-        highlightthickness=0,
-        padx=5,
-        pady=1,
-        cursor="arrow",
-    )
-    plate_status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=4)
-    plate_status_value.pack(side=tk.RIGHT, padx=(6, 4), pady=4)
-    self._preview_overlay_dock_tool_rows["plate_status"] = {
-        "row": plate_status_row,
-        "icon": plate_status_icon,
-        "label": plate_status_label,
-        "status": plate_status_value,
-    }
     export_condition_row = tk.Frame(self.preview_overlay_dock_body, bd=0, highlightthickness=1, cursor="arrow")
     export_condition_icon = tk.Label(
         export_condition_row,
@@ -1191,15 +1069,22 @@ def build_detection_tab(
     self.preview_list_header_lbl = SectionHeaderLabel(
         list_lf,
         self.app,
-        text="PZ2. Wykrywanie znaków i analiza",
+        text="Sprawdzanie znaków",
     )
     self.preview_list_header_lbl.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
     self.preview_list_intro_lbl = tk.Label(
         list_lf,
         text=(
-            "PZ2 przygotowuje anotacje znaków na wyodrębnionych tablicach: poprawiasz ramki, wpisujesz znaki "
-            "i doprowadzasz tablice do statusu perfect. Gdy zbiór PZ2 jest sensowny, przejdź do PZ3 i utwórz źródłowy dataset znaków."
+            "1. Wybierz tablicę z listy i kliknij „Sprawdź i popraw”, jeśli wynik nie jest jeszcze otwarty do korekty.\n"
+            "2. Popraw boxy znaków. Aby wpisać lub poprawić znaki, użyj Alt+W, wybierz aktywny box "
+            "i wpisuj 0-9/A-Z.\n"
+            "3. Jeśli widzisz „Numer z Z2: …”, jest to numer zapisany wcześniej. Edycja boxów i znaków "
+            "nie zmienia go automatycznie — odczyt powinien się z nim zgadzać.\n"
+            "4. Jeśli numeru jeszcze nie ma, po sprawdzeniu całej tablicy naciśnij O. Program zapisze "
+            "aktualny odczyt jako numer tablicy i nada status OK.\n"
+            "5. Jeśli zapisany numer z Z2 jest błędny, użyj „Zmień numer”.\n"
+            "6. Po przygotowaniu wymaganej liczby tablic wybierz „Krok 2: dataset PZ3”."
         ),
         anchor="w",
         justify=tk.LEFT,
@@ -1244,7 +1129,7 @@ def build_detection_tab(
     self.plates_legend_scope_header_lbl.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=(0, 1))
     self.plates_legend_total_header_lbl = tk.Label(self.plates_legend_frame, text="Raz.", bd=0, highlightthickness=0)
     self.plates_legend_total_header_lbl.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=(0, 1))
-    self.plates_legend_perfect_header_lbl = tk.Label(self.plates_legend_frame, text="Perf.", bd=0, highlightthickness=0)
+    self.plates_legend_perfect_header_lbl = tk.Label(self.plates_legend_frame, text="OK", bd=0, highlightthickness=0)
     self.plates_legend_perfect_header_lbl.grid(row=0, column=2, sticky="w", padx=(0, 4), pady=(0, 1))
     self.plates_legend_manual_header_lbl = tk.Label(self.plates_legend_frame, text="Man.", bd=0, highlightthickness=0)
     self.plates_legend_manual_header_lbl.grid(row=0, column=3, sticky="w", padx=(0, 4), pady=(0, 1))
@@ -1270,7 +1155,7 @@ def build_detection_tab(
     self.plates_legend_tab_hybrid_lbl = tk.Label(self.plates_legend_frame, text="0", bd=0, highlightthickness=0)
     self.plates_legend_tab_hybrid_lbl.grid(row=1, column=6, sticky="w")
 
-    self.plates_legend_box_title_lbl = tk.Label(self.plates_legend_frame, text="Boxy", bd=0, highlightthickness=0)
+    self.plates_legend_box_title_lbl = tk.Label(self.plates_legend_frame, text="Ramki", bd=0, highlightthickness=0)
     self.plates_legend_box_title_lbl.grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(1, 0))
     self.plates_legend_box_total_lbl = tk.Label(self.plates_legend_frame, text="0", bd=0, highlightthickness=0)
     self.plates_legend_box_total_lbl.grid(row=2, column=1, sticky="w", padx=(0, 4), pady=(1, 0))
@@ -1292,14 +1177,41 @@ def build_detection_tab(
     self.preview_import_focus_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
     self.preview_import_focus_frame.grid_columnconfigure(1, weight=1)
 
+    self.preview_add_material_btn = ttk.Button(
+        self.preview_import_focus_frame,
+        text="Dodaj tablice lub zdjęcia…",
+        command=lambda: open_pz2_add_material(self),
+        style="WorkflowCard.TButton",
+    )
+    self.preview_add_material_btn.grid(row=0, column=0, columnspan=2, sticky="ew")
+    self.preview_add_material_btn.configure(padding=(5, 2))
+
+    self.preview_export_material_btn = ttk.Button(
+        self.preview_import_focus_frame,
+        text="Eksportuj wycięcia tablic…",
+        command=lambda: open_pz2_export_material(self),
+        style="WorkflowCard.TButton",
+    )
+    self.preview_export_material_btn.grid(
+        row=1,
+        column=0,
+        columnspan=2,
+        sticky="ew",
+        pady=(4, 0),
+    )
+    self.preview_export_material_btn.configure(padding=(5, 2))
+
+
+
     self.preview_import_focus_btn = ttk.Button(
         self.preview_import_focus_frame,
-        text="Pokaż tylko zaimportowane",
+        text="Pokaż tylko dodane",
         command=self._toggle_preview_import_focus,
         style="WorkflowCard.TButton",
         state=tk.DISABLED,
     )
-    self.preview_import_focus_btn.grid(row=0, column=0, sticky="w")
+    self.preview_import_focus_btn.grid(row=2, column=0, sticky="w", pady=(3, 0))
+    self.preview_import_focus_btn.configure(padding=(5, 2))
 
     self.preview_import_focus_hint_lbl = tk.Label(
         self.preview_import_focus_frame,
@@ -1310,7 +1222,7 @@ def build_detection_tab(
         bd=0,
         highlightthickness=0,
     )
-    self.preview_import_focus_hint_lbl.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+    self.preview_import_focus_hint_lbl.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
     self._set_inline_status_label_state(
         self.preview_import_focus_hint_lbl,
         text="",
@@ -1333,49 +1245,25 @@ def build_detection_tab(
     self.preview_sort_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
     self.preview_sort_bar.grid_columnconfigure(0, weight=1)
 
-    self.preview_sort_title_lbl = tk.Label(
-        self.preview_sort_bar,
-        text="Sortowanie:",
-        anchor="w",
-        bd=0,
-        highlightthickness=0,
-        padx=0,
-        font=("Segoe UI", 8),
-    )
-    self.preview_sort_title_lbl.grid(row=0, column=0, sticky="w", padx=(0, 2), pady=(0, 2))
-
-    self.preview_sort_buttons_frame = tk.Frame(self.preview_sort_bar, bd=0, highlightthickness=0)
-    self.preview_sort_buttons_frame.grid(row=1, column=0, sticky="ew")
-    buttons_per_row = 4
-    for button_column in range(buttons_per_row):
-        self.preview_sort_buttons_frame.grid_columnconfigure(button_column, weight=1)
-
+    self.preview_sort_title_lbl = None
+    self.preview_sort_buttons_frame = None
     self.preview_sort_buttons = {}
-    for idx, (mode_key, mode_label) in enumerate(PREVIEW_SORT_OPTIONS):
-        btn_row = idx // buttons_per_row
-        btn_column = idx % buttons_per_row
-        btn = tk.Button(
-            self.preview_sort_buttons_frame,
-            text=mode_label,
-            font=("Segoe UI", 8),
-            padx=6,
-            pady=1,
-            bd=0,
-            relief=tk.FLAT,
-            cursor="hand2",
-            takefocus=0,
-            command=lambda target_key=mode_key: self._on_preview_sort_mode_change(target_key),
-        )
-        btn.grid(
-            row=btn_row,
-            column=btn_column,
-            sticky="ew",
-            padx=(0, 4) if btn_column < (buttons_per_row - 1) else 0,
-            pady=(0, 4) if btn_row == 0 else 0,
-        )
-        btn.bind("<Enter>", lambda _event, target_key=mode_key: self._set_preview_sort_hover(target_key, True))
-        btn.bind("<Leave>", lambda _event, target_key=mode_key: self._set_preview_sort_hover(target_key, False))
-        self.preview_sort_buttons[mode_key] = btn
+
+    self.preview_sort_cta = tk.Button(
+        self.preview_sort_bar,
+        text="Sortowanie: Domyślne  ▾",
+        anchor="w",
+        justify=tk.LEFT,
+        font=("Segoe UI", 8),
+        padx=8,
+        pady=3,
+        bd=0,
+        relief=tk.FLAT,
+        cursor="hand2",
+        takefocus=0,
+        command=self._open_preview_sort_modal,
+    )
+    self.preview_sort_cta.grid(row=0, column=0, sticky="ew")
 
     self.preview_layout_filter_title_lbl = None
     self.preview_layout_filter_buttons_frame = None
@@ -1385,7 +1273,7 @@ def build_detection_tab(
     self.plates_listbox = tk.Listbox(
         self.preview_list_host,
         font=("Consolas", 10),
-        selectmode=tk.BROWSE,
+        selectmode=tk.EXTENDED,
         exportselection=False,
         activestyle="none",
         cursor="arrow",
@@ -1397,10 +1285,13 @@ def build_detection_tab(
 
     self.plates_listbox.config(yscrollcommand=scroll.set)
     self.plates_listbox.bind("<Button-1>", self._on_preview_list_mouse_primary, add=False)
+    self.plates_listbox.bind("<Button-3>", self._on_preview_list_context_menu, add=False)
+    self.plates_listbox.bind("<Control-a>", self._select_all_preview_plates, add=False)
+    self.plates_listbox.bind("<Control-A>", self._select_all_preview_plates, add=False)
     self.plates_listbox.bind("<B1-Motion>", lambda _event: "break", add=False)
     self.plates_listbox.bind(
         "<<ListboxSelect>>",
-        lambda _event: (self._schedule_preview_select_render(delay_ms=1), "break")[1],
+        lambda _event: (self._schedule_preview_select_render(delay_ms=1), "break")[-1],
     )
     self.plates_listbox.bind("<Up>", lambda _event: self._handle_preview_list_arrow_nav(-1), add=False)
     self.plates_listbox.bind("<Down>", lambda _event: self._handle_preview_list_arrow_nav(1), add=False)
@@ -1418,6 +1309,27 @@ def build_detection_tab(
     self.plates_listbox.bind("<KeyPress-Q>", _handle_preview_list_qe_nav, add=False)
     self.plates_listbox.bind("<KeyPress-e>", _handle_preview_list_qe_nav, add=False)
     self.plates_listbox.bind("<KeyPress-E>", _handle_preview_list_qe_nav, add=False)
+
+    def _handle_preview_list_status_action(event):
+        # Resolve the row under keyboard focus synchronously to avoid a race
+        # with the delayed <<ListboxSelect>> preview render.
+        try:
+            selected = [int(i) for i in self.plates_listbox.curselection()]
+            active_row = int(self.plates_listbox.index(tk.ACTIVE))
+            row_index = active_row if active_row in selected else (selected[0] if selected else active_row)
+            ids = list(getattr(self, "_listbox_pid_by_index", []) or [])
+            if 0 <= row_index < len(ids):
+                self._preview_active_pid = str(ids[row_index])
+        except Exception:
+            pass
+
+        result = self._on_preview_canvas_keypress(event)
+        return result or "break"
+
+    self.plates_listbox.bind("<KeyPress-n>", _handle_preview_list_status_action, add=False)
+    self.plates_listbox.bind("<KeyPress-N>", _handle_preview_list_status_action, add=False)
+    self.plates_listbox.bind("<KeyPress-o>", _handle_preview_list_status_action, add=False)
+    self.plates_listbox.bind("<KeyPress-O>", _handle_preview_list_status_action, add=False)
     self.plates_listbox.bind("<Escape>", self._on_preview_escape_shortcut, add=False)
     self.plates_listbox.bind("<MouseWheel>", self._on_plates_listbox_mousewheel, add="+")
     self.plates_listbox.bind("<Button-4>", self._on_plates_listbox_mousewheel, add="+")
@@ -1482,7 +1394,7 @@ def build_detection_tab(
     except Exception:
         pass
     try:
-        right_panel.configure(width=368)
+        right_panel.configure(width=300)
     except Exception:
         pass
 
@@ -1797,7 +1709,7 @@ def build_detection_tab(
 
     self.hybrid_rescue_info_lbl = ttk.Label(
         self.hybrid_rescue_frame,
-        text="Gdy normalny próg confidence zostawi mniej znaków niż wynika z napisu tablicy, system może zrobić kontrolny przebieg do 0.10. Wynik przechodzi tylko wtedy, gdy poprawia dopasowanie.",
+        text="Gdy normalny próg confidence zostawi mniej znaków niż wynika z napisu tablicy, system może zrobić kontrolny przebieg do 10%. Wynik przechodzi tylko wtedy, gdy poprawia dopasowanie.",
         style="PanelMuted.TLabel",
         wraplength=320,
         justify=tk.LEFT,
@@ -1977,7 +1889,7 @@ def build_detection_tab(
 
         label = tk.Label(
             row,
-            text=label_text,
+            text=percent_label(label_text),
             anchor="w",
             justify=tk.LEFT,
             bd=0,
@@ -1991,18 +1903,16 @@ def build_detection_tab(
 
         value_lbl = tk.Label(
             row,
-            width=6,
+            width=9,
             anchor="e",
             bd=0,
             highlightthickness=0,
         )
         value_lbl.pack(side=tk.RIGHT)
 
-        fmt = "{:." + str(int(digits)) + "f}"
-
         def refresh_value(*_args):
             try:
-                value_lbl.config(text=fmt.format(float(variable.get())))
+                value_lbl.config(text=format_percent(variable.get(), suffix=True))
             except Exception:
                 value_lbl.config(text=str(variable.get()))
 
@@ -2093,21 +2003,21 @@ def build_detection_tab(
     self.yolo_conf_row = make_detection_param_row(self.yolo_tuning_lf)
     self.yolo_conf_lbl = tk.Label(
         self.yolo_conf_row,
-        text="Confidence YB:",
+        text="Confidence YB [%]:",
         anchor="w",
         justify=tk.LEFT,
         bd=0,
         highlightthickness=0,
     )
     self.yolo_conf_lbl.pack(side=tk.LEFT)
-    self.yolo_conf_spin = ttk.Spinbox(
+    self.yolo_conf_spin = create_percent_spinbox(
         self.yolo_conf_row,
+        variable=self.yolo_box_conf_var,
         from_=0.00001,
         to=1.0,
         increment=0.05,
-        textvariable=self.yolo_box_conf_var,
         width=9,
-        format="%.5f",
+        command=self._on_yolo_option_var_write,
     )
     self.yolo_conf_spin.pack(side=tk.RIGHT, padx=(6, 0))
     self._register_detection_param_row(self.yolo_conf_row, labels=[self.yolo_conf_lbl])
@@ -2115,21 +2025,21 @@ def build_detection_tab(
     self.yolo_symbol_conf_row = make_detection_param_row(self.yolo_tuning_lf)
     self.yolo_symbol_conf_lbl = tk.Label(
         self.yolo_symbol_conf_row,
-        text="Confidence YS:",
+        text="Confidence YS [%]:",
         anchor="w",
         justify=tk.LEFT,
         bd=0,
         highlightthickness=0,
     )
     self.yolo_symbol_conf_lbl.pack(side=tk.LEFT)
-    self.yolo_symbol_conf_spin = ttk.Spinbox(
+    self.yolo_symbol_conf_spin = create_percent_spinbox(
         self.yolo_symbol_conf_row,
+        variable=self.yolo_symbol_conf_var,
         from_=0.00001,
         to=1.0,
         increment=0.05,
-        textvariable=self.yolo_symbol_conf_var,
         width=9,
-        format="%.5f",
+        command=self._on_yolo_option_var_write,
     )
     self.yolo_symbol_conf_spin.pack(side=tk.RIGHT, padx=(6, 0))
     self._register_detection_param_row(self.yolo_symbol_conf_row, labels=[self.yolo_symbol_conf_lbl])
@@ -2145,21 +2055,21 @@ def build_detection_tab(
     self.yolo_iou_row = make_detection_param_row(self.yolo_tuning_lf)
     self.yolo_iou_lbl = tk.Label(
         self.yolo_iou_row,
-        text="NMS IoU:",
+        text="NMS IoU [%]:",
         anchor="w",
         justify=tk.LEFT,
         bd=0,
         highlightthickness=0,
     )
     self.yolo_iou_lbl.pack(side=tk.LEFT)
-    self.yolo_iou_spin = ttk.Spinbox(
+    self.yolo_iou_spin = create_percent_spinbox(
         self.yolo_iou_row,
+        variable=self.yolo_iou_var,
         from_=0.01,
         to=0.99,
         increment=0.05,
-        textvariable=self.yolo_iou_var,
         width=9,
-        format="%.5f",
+        command=self._on_yolo_option_var_write,
     )
     self.yolo_iou_spin.pack(side=tk.RIGHT, padx=(6, 0))
     self._register_detection_param_row(self.yolo_iou_row, labels=[self.yolo_iou_lbl])
@@ -2175,21 +2085,21 @@ def build_detection_tab(
     self.yolo_overlap_row = make_detection_param_row(self.yolo_tuning_lf)
     self.yolo_overlap_lbl = tk.Label(
         self.yolo_overlap_row,
-        text="Nakładanie boxów:",
+        text="Nakładanie boxów [%]:",
         anchor="w",
         justify=tk.LEFT,
         bd=0,
         highlightthickness=0,
     )
     self.yolo_overlap_lbl.pack(side=tk.LEFT)
-    self.yolo_overlap_spin = ttk.Spinbox(
+    self.yolo_overlap_spin = create_percent_spinbox(
         self.yolo_overlap_row,
+        variable=self.yolo_overlap_var,
         from_=0.0,
         to=1.0,
         increment=0.05,
-        textvariable=self.yolo_overlap_var,
         width=9,
-        format="%.5f",
+        command=self._on_yolo_option_var_write,
     )
     self.yolo_overlap_spin.pack(side=tk.RIGHT, padx=(6, 0))
     self._register_detection_param_row(self.yolo_overlap_row, labels=[self.yolo_overlap_lbl])
@@ -2464,6 +2374,39 @@ def build_detection_tab(
     preview_status_lf.grid_columnconfigure(0, weight=1)
     self.preview_status_lf = preview_status_lf
 
+    def _sync_preview_status_panel_wrap(event=None):
+        try:
+            width = int(
+                getattr(event, "width", 0)
+                or preview_status_lf.winfo_width()
+                or 0
+            )
+        except Exception:
+            width = 0
+        wrap = max(170, width - 34) if width > 0 else 250
+        for attr_name in (
+            "preview_load_note_lbl",
+            "preview_layout_summary_lbl",
+            "preview_repair_progress_title_lbl",
+            "preview_repair_progress_status_lbl",
+            "preview_fusion_info_lbl",
+            "preview_box_mode_info_lbl",
+        ):
+            widget = getattr(self, attr_name, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(wraplength=wrap)
+            except Exception:
+                pass
+
+    self._sync_preview_status_panel_wrap = _sync_preview_status_panel_wrap
+    preview_status_lf.bind(
+        "<Configure>",
+        _sync_preview_status_panel_wrap,
+        add="+",
+    )
+
     self.preview_status_title_lbl = SectionHeaderLabel(
         preview_status_lf,
         self.app,
@@ -2498,7 +2441,7 @@ def build_detection_tab(
 
     self.preview_perfect_title_lbl = tk.Label(
         self.preview_counts_frame,
-        text="Perfect",
+        text="Zatwierdzone",
         anchor="w",
         justify=tk.LEFT,
         bd=0,
@@ -2508,7 +2451,7 @@ def build_detection_tab(
     self.preview_perfect_title_lbl.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 1))
     self.preview_error_title_lbl = tk.Label(
         self.preview_counts_frame,
-        text="Do poprawy",
+        text="Pozostałe",
         anchor="w",
         justify=tk.LEFT,
         bd=0,
@@ -2557,6 +2500,19 @@ def build_detection_tab(
         padx=0,
     )
     self.preview_unknown_count_lbl.grid(row=1, column=2, sticky="w")
+    self.preview_approved_char_count_lbl = tk.Label(
+        self.preview_counts_frame, text="Zatwierdzone ramki znaków: 0",
+        anchor="w", bd=0, highlightthickness=0,
+    )
+    self.preview_approved_char_count_lbl.grid(row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
+    from .z3_plate_gt_runtime import edit_active_plate_ground_truth
+    plate_gt_row = ttk.Frame(self.preview_counts_frame)
+    plate_gt_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+    self.preview_plate_gt_label = ttk.Label(plate_gt_row, text="Zapisany numer: brak", font=("Segoe UI", 10, "bold"))
+    self.preview_plate_gt_label.pack(anchor="w")
+    self.preview_plate_gt_button = ttk.Button(plate_gt_row, text="Ustaw numer ręcznie", style="WorkflowCard.TButton",
+                                              command=lambda: edit_active_plate_ground_truth(self))
+    self.preview_plate_gt_button.pack(anchor="w", pady=(3, 0))
     self.preview_total_count_lbl = self.preview_unknown_count_lbl
     self._apply_preview_info_stats_style()
 
@@ -2748,10 +2704,13 @@ def build_detection_tab(
     self.detect_nav_row.grid_columnconfigure(1, weight=1)
     self.detect_nav_row.grid_columnconfigure(2, weight=0)
 
-    detection_action_button_padding = (10, 13)
+    # Dolny pasek PZ2 ma być kompaktowy: pionowy padding 13 px
+    # niepotrzebnie zabierał miejsce canvasowi i przy niektórych DPI
+    # pogarszał czytelność etykiet CTA.
+    detection_action_button_padding = (9, 4)
 
     self.detect_actions_row = ttk.Frame(footer_nav)
-    self.detect_actions_row.grid(row=0, column=0, sticky="ew", pady=(4, 4))
+    self.detect_actions_row.grid(row=0, column=0, sticky="ew", pady=(2, 2))
     self.detect_actions_row.grid_rowconfigure(0, weight=0)
     self.detect_actions_row.grid_columnconfigure(0, weight=0)
     self.detect_actions_row.grid_columnconfigure(1, weight=1)
@@ -2770,7 +2729,7 @@ def build_detection_tab(
     self.btn_return_to_graph_pz2_frame.grid(row=0, column=0, sticky="sw")
     self.btn_return_to_graph_pz2 = ttk.Button(
         self.btn_return_to_graph_pz2_frame,
-        text="Zapisz PZ2 i wróć do grafu",
+        text="Zapisz PZ2 i wróć do pracy T05",
         command=self._return_to_wizard_from_step3_pz2,
         style="WorkflowCard.TButton",
     )
@@ -2790,13 +2749,13 @@ def build_detection_tab(
 
     self.btn_run_detection = ttk.Button(
         self.btn_run_detection_pulse_frame,
-        text="Uruchom detekcję",
+        text="Uruchom wykrywanie",
         command=self._run_detection_stage,
         style="Accent.TButton"
     )
     self.btn_run_detection.pack(fill=tk.X)
     self.btn_run_detection.configure(
-        text="Uruchom detekcję",
+        text="Uruchom wykrywanie",
         padding=detection_action_button_padding,
         width=34,
     )
@@ -2829,8 +2788,71 @@ def build_detection_tab(
         style="WorkflowCard.TButton",
     )
     self.btn_undo_detection_result.pack(side=tk.LEFT)
-    self.btn_undo_detection_result.configure(padding=detection_action_button_padding, width=16, state=tk.DISABLED)
+    self.btn_undo_detection_result.configure(
+        padding=detection_action_button_padding,
+        width=16,
+        state=tk.DISABLED,
+    )
+    self.btn_start_review_from_raw = ttk.Button(
+        self.detection_review_actions_frame,
+        text="Sprawdź i popraw",
+        command=self._open_or_restore_review,
+        style="WorkflowCard.TButton",
+    )
+    self.btn_start_review_from_raw.pack(side=tk.LEFT, padx=(5, 0))
+    self.btn_start_review_from_raw.configure(
+        padding=detection_action_button_padding, width=18, state=tk.DISABLED
+    )
+
+    self.btn_confirm_review_gold = ttk.Button(
+        self.detection_review_actions_frame,
+        text="Zatwierdź tablicę",
+        command=self._confirm_review_gold,
+        style="WorkflowCard.TButton",
+    )
+    self.btn_confirm_review_gold.pack(side=tk.LEFT, padx=(5, 0))
+    self.btn_confirm_review_gold.configure(
+        padding=detection_action_button_padding, width=18, state=tk.DISABLED
+    )
+
     self.btn_confirm_detection_result = None
+
+    self.gt_assist_actions_frame = ttk.Frame(
+        self.btn_run_detection_frame,
+    )
+    self.gt_assist_actions_frame.pack(
+        side=tk.LEFT,
+        anchor=tk.CENTER,
+        padx=(8, 0),
+    )
+
+    # GT assistance is part of editing, not a separate accept/reject action.
+    self.btn_gt_assist_apply = None
+    self.btn_gt_assist_reject = None
+
+    self.gt_assist_status_lbl = tk.Label(
+        self.gt_assist_actions_frame,
+        text="Asysta GT: aktywna podczas korekty",
+        anchor="w",
+        justify="left",
+        font=("Segoe UI", 8),
+        bd=0,
+        highlightthickness=0,
+    )
+    self.gt_assist_status_lbl.pack(
+        side=tk.LEFT,
+        padx=(7, 0),
+    )
+    self.gt_assist_status_lbl._inline_status_font = (
+        "Segoe UI",
+        8,
+    )
+    self._set_inline_status_label_state(
+        self.gt_assist_status_lbl,
+        text="Asysta GT: aktywna podczas korekty",
+        tone="muted",
+        emphasis=False,
+    )
 
     self.detect_run_status_frame = ttk.Frame(self.detect_actions_row)
     self.detect_run_status_frame.grid_rowconfigure(0, weight=0)
@@ -2878,7 +2900,7 @@ def build_detection_tab(
         emphasis=False,
     )
 
-    refiner_guard_text = "Refiner perfect: niedostępny w pipeline OCR. Poprawki boxów wymagają modelu YOLO."
+    refiner_guard_text = "Automatyczna korekta ramek jest niedostępna przy samym odczycie tekstu. Do poprawiania geometrii potrzebny jest model wykrywający znaki."
     self.detect_refiner_guard_lbl = tk.Label(
         self.detect_run_status_frame,
         text=refiner_guard_text,
@@ -2913,6 +2935,7 @@ def build_detection_tab(
     self._refresh_last_detection_status_label()
     self._refresh_detection_refiner_guard_label()
     self._refresh_detection_review_controls()
+    self._refresh_gt_assist_controls()
 
     self.test_progress_row = tk.Frame(
         self.detect_run_status_frame,

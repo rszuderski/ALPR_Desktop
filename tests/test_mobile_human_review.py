@@ -17,6 +17,8 @@ from auto_annotation_tool.ranking.mobile_package_experiments import (
     iter_full_attempt_rows, read_mobile_sample_image, score_mobile_report,
 )
 
+from auto_annotation_tool.ranking.mobile_verification_policy import visual_decision
+
 
 def make_bundle(path, *, samples=None, attempts=None, annotations=None, image_size=(280, 80), image_text="", state="COMPLETED", evidence_images=None):
     samples = samples if samples is not None else [dict(capture_id="c1", subject_key="s/sg-1/entity-1", prediction="WI1234A", attempt_id="a1")]
@@ -127,7 +129,7 @@ def test_autosave_reopen_sha_binding_and_original_immutable(tmp_path):
     key = next(iter(session.subjects))
     session.set_subject(key, ground_truth="WI1234A")
     assert load(path, tmp_path).review.review_revision == 1
-    session.annotate("attempt", "a1", plate_visibility="visible", is_plate=True)
+    session.annotate("attempt", "a1", **visual_decision("accurate"))
     session.annotate_invocation("a1", visible_plate_count="one")
     session.complete()
     reopened = load(path, tmp_path)
@@ -196,6 +198,9 @@ def test_mt_miss_invisible_uncertain_cancelled_and_false_detection(tmp_path):
     session.annotate_invocation("no_plate", visible_plate_count="none")
     session.annotate_invocation("uncertain", visible_plate_count="uncertain")
     session.annotate("attempt", "false", is_plate=False)
+    # Positive MT decisions need a visual outline judgment, not only is_plate.
+    session.annotate("attempt", "hit", **visual_decision("accurate"))
+    session.annotate("attempt", "invalid", **visual_decision("imprecise"))
     s = session.statistics()["summary"]
     assert s["evaluable_mt_attempts"] == 4
     assert s["mt_valid_localizations"] == 1
@@ -373,6 +378,11 @@ def test_pending_attempts_visible_in_subject_progress(tmp_path):
     stats = session.statistics()
     assert stats["subjects"][0]["pending_decisions"] == 1
     session.annotate_invocation("a1", visible_plate_count="one")
+    stats = session.statistics()
+    assert stats["subjects"][0]["pending_decisions"] == 1
+    with pytest.raises(ValueError, match="Brak weryfikacji wskazania MT"):
+        session.complete()
+    session.annotate("attempt", "a1", **visual_decision("accurate"))
     stats = session.statistics()
     assert stats["subjects"][0]["pending_decisions"] == 0
     assert stats["summary"]["reviewed_subjects"] == 1

@@ -90,8 +90,8 @@ class BaseAnnotator(ABC):
 
         if CV2_AVAILABLE and cv2 is not None:
             try:
-                image = cv2.imread(str(image_path))
-                return image if image is not None else None
+                from ..image_orientation import read_oriented_bgr
+                return read_oriented_bgr(image_path)
             except Exception:
                 return None
 
@@ -105,6 +105,11 @@ class BaseAnnotator(ABC):
                 return None
 
         return True
+
+    @staticmethod
+    def _model_input_size(image_path, image_source):
+        from ..image_orientation import model_input_size
+        return model_input_size(image_source, image_path)
     
     def _normalize_keypoints(self, raw_keypoints) -> list[tuple[float, float, float]]:
         """
