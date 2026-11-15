@@ -22,7 +22,7 @@ def widgets(window):
     for w in window.winfo_children():yield w;yield from widgets(w)
 
 def choose_button(app):
-    return next(w for w in widgets(app.window) if w.winfo_class()=='TButton' and w.cget('text') in ('Wczytaj przygotowany','Wybierz zestaw…'))
+    return next(w for w in widgets(app.window) if w.winfo_class()=='TButton' and w.cget('text') in ('Wczytaj przygotowany','Wybierz zestaw…','Zapisane pokazy…'))
 
 def pump(root,condition,seconds=15):
     deadline=time.monotonic()+seconds
@@ -139,8 +139,7 @@ def test_t4_desktop_and_real_wrapper_reopen_last_successful_f2(gui,monkeypatch):
     def create(legacy,args,parent=None):
         app=original(legacy,args,parent=gui.root);app.window.withdraw();created.append(app);return app
     monkeypatch.setattr(tv,'make_app',create);monkeypatch.setattr(tk.Misc,'mainloop',lambda self,*a,**kw:None)
-    wrapper=r'F6_FINAL_POKAZ_20261112.py';monkeypatch.setattr(sys,'argv',[wrapper])
-    runpy.run_path(wrapper,run_name='__main__');gui.extra.extend(created)
+    tv.main(tv.accepted_arguments());gui.extra.extend(created)
     assert desktop.prepared==created[0].prepared==F2
     assert desktop.manifest['layout']==created[0].manifest['layout'] and not gui.errors
     evidence('T4',dict(status='PASS_NATIVE_PANELS',desktop=str(desktop.prepared),wrapper=str(created[0].prepared),no_tv=True))

@@ -627,16 +627,26 @@ class ReportBundleReader:
             return True
         # A truncated ZIP lacks its central directory. Do not mistake the
         # entire archive size for a JSON size, or read binary data as text.
-        # The bounded header probe also preserves legacy UTF-8 JSON reports
-        # named .alprsession. Actual PK archives never fall through to JSON.
+        # Older exports are JSON objects/arrays even with .alprsession suffix.
+        # Recognize only a text opening; the normal JSON reader retains its size
+        # cap and syntax checks. A PK signature can never fall through to JSON.
         with path.open("rb") as stream:
-            prefix = stream.read(4096)
-        signature = prefix[:4]
-        json_prefix = prefix.removeprefix(b'\xef\xbb\xbf').lstrip(b' \t\r\n')
-        legacy_json_header = json_prefix.startswith((b'{', b'[')) or (bool(prefix) and not json_prefix)
-        if signature in (
-            b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08",
-        ) or (path.suffix.lower() in (".alprsession", ".zip") and not legacy_json_header):
+            signature = stream.read(4)
+            stream.seek(0)
+            opening = stream.read(3)
+            if opening != b"\xef\xbb\xbf":
+                stream.seek(0)
+            first = b""
+            remaining = 32 * 1024 * 1024 + 1
+            while remaining > 0:
+                chunk = stream.read(min(65536, remaining))
+                remaining -= len(chunk)
+                opening = chunk.lstrip(b" \r\n\t")
+                if opening or not chunk:
+                    first = opening[:1]
+                    break
+        looks_json = first in (b"{", b"[")
+        if (path.suffix.lower() in (".alprsession", ".zip") and not looks_json) or signature.startswith(b"PK"):
             raise ValueError(
                 "Import integralności: archiwum ZIP jest niekompletne lub uszkodzone. "
                 "Nie można odczytać katalogu ZIP. "

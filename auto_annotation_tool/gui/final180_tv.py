@@ -24,6 +24,7 @@ from ..ranking import final180_reference as reference
 from ..ranking import final180_markers as markers
 from ..ranking import photo_reference as photo
 from ..gt_pack import _atomic_write_json
+from .photo_material_ui import MaterialPresentationActions
 
 from alpr_runtime import workspace_root
 LEGACY_DEFAULT=Path(__file__).with_name('f5a_tv_core.py')
@@ -444,14 +445,14 @@ class FinalResultsWindow:
 
 
 def make_app(legacy, args, parent=None):
-    class FinalApp(legacy.TvApp):
+    class FinalApp(MaterialPresentationActions, legacy.TvApp):
         def __init__(self):
             self.tk,self.ttk=tk,ttk
             # The main Desktop has already fixed its process DPI policy. Only
             # standalone startup may configure it, before creating any Tk root.
             if parent is None and tk._default_root is None:monitor_dpi.enable_windows_dpi_awareness()
-            self.window=tk.Toplevel(parent) if parent is not None else tk.Tk();self.window.title('FINAL — pokaz i ocena klatki źródłowej')
-            self.window.geometry('1000x540');self.window.minsize(850,480)
+            self.window=tk.Toplevel(parent) if parent is not None else tk.Tk();self.window.title('Pokaz fotografii i ocena klatki źródłowej')
+            self.window.geometry('1240x780');self.window.minsize(960,620)
             self.monitors=[];self.monitor_names=[];self._selected_device=None;self._monitor_error=''
             self._refreshing_monitors=False;self._last_monitor_probe=0;self._viewer_geometry=None;self._opening_viewer=False
             self._post_roll_hold=False
@@ -460,6 +461,7 @@ def make_app(legacy, args, parent=None):
             self.current_index=0;self.pending_id=None;self.stage=None;self.transition_end=0;self.closed=False
             self.audit_result=None;self.prepared=None;self.manifest=None;self.material=None
             self.gt_preflight=None;self.result_windows=[];self.analysis_reference=None
+            self.source_material=None;self.recursive_photographs=tk.BooleanVar(value=False)
             self._loading=False;self._pending_start=False;self._generation=0
             self._selection_generation=0;self._selection_loading=False;self._selection_error=''
             self.calibration_preview=None
@@ -467,18 +469,18 @@ def make_app(legacy, args, parent=None):
             self.paths={k:tk.StringVar(value=str(getattr(args,k) or '')) for k in ('xml','positives','negatives','output')}
             self.dwell=tk.StringVar(value=str(args.dwell));self.negative_confirmed=tk.BooleanVar(value=args.negatives_declared)
             self._locked_dwell=args.dwell
-            self.status=tk.StringVar(value='Kontrola materiału przed przygotowaniem. GO wymaga odbioru A12/TV i kontraktu Androida.')
+            self.status=tk.StringVar(value='Wybierz katalog fotografii lub otwórz zapisany pokaz. Dane referencyjne są opcjonalne.')
             self.clock=tk.StringVar(value='')
             self.plan=tk.StringVar(value='Plan zostanie odczytany z zamrożonego manifestu.')
             self.reference_info=tk.StringVar(value='Materiał: nie wybrano fotografii | GT: nieprzypisane')
-            self.set_info=tk.StringVar(value='Wybrany zestaw: brak');self.selected_folder=tk.StringVar(value='Wskaż istniejący folder prepared_*.')
+            self.set_info=tk.StringVar(value='Wybrany zestaw: brak');self.selected_folder=tk.StringVar(value='Wybierz katalog ze zdjęciami lub otwórz zapisany pokaz.')
             self.advanced_visible=tk.BooleanVar(value=False)
             self.ignore_reference=tk.BooleanVar(value=False)
             self.unreadable_ids=set(args.unreadable_ids)
             self.unreadable_xml_sha=getattr(args,'unreadable_xml_sha',None)
             def changed(*_):
-                self.audit_result=None
                 if not self._loading and self.mode not in ACTIVE_MODES:
+                    self.audit_result=None;self.source_material=None
                     self.close_calibration();self._selection_generation+=1;self._selection_loading=False;self._selection_error=''
                     self.prepared=None;self.manifest=None;self.material=None;self.gt_preflight=None
                     self.set_info.set('Wybrany zestaw: brak — nowe materiały');self.selected_folder.set('Zaawansowane: przygotowanie nowego zestawu.')
@@ -494,52 +496,17 @@ def make_app(legacy, args, parent=None):
             self.ignore_reference.trace_add('write',lambda *_:None if self._loading else self.refresh_plan())
 
         def _build_final(self):
-            box=ttk.Frame(self.window,padding=15);box.pack(fill='both',expand=True);box.columnconfigure(0,weight=1)
-            header=ttk.Frame(box);header.grid(row=0,column=0,sticky='ew',pady=(0,10))
-            self.choose_set_btn=ttk.Button(header,text='Wybierz zestaw…',command=self.open_prepared);self.choose_set_btn.pack(side='left',padx=(0,16))
-            ttk.Label(header,textvariable=self.set_info,font=('Segoe UI',14,'bold')).pack(side='left')
-            ttk.Label(box,textvariable=self.reference_info,font=('Segoe UI',11),wraplength=940).grid(row=1,column=0,sticky='w')
-            ttk.Label(box,textvariable=self.selected_folder,wraplength=940).grid(row=2,column=0,sticky='w',pady=(4,16))
-            controls=ttk.Frame(box);controls.grid(row=3,column=0,sticky='ew')
-            ttk.Label(controls,text='Wybierz TV').pack(side='left')
-            self.monitor_combo=ttk.Combobox(controls,textvariable=self.screen_choice,values=self.monitor_names,state='readonly',width=46,postcommand=self.refresh_monitors)
-            self.monitor_combo.pack(side='left',padx=6)
-            ttk.Label(controls,text='Czas [s]:').pack(side='left')
-            self.dwell_entry=ttk.Entry(controls,textvariable=self.dwell,width=10);self.dwell_entry.pack(side='left',padx=6)
-            actions=ttk.Frame(box);actions.grid(row=4,column=0,sticky='ew',pady=16)
-            self.calibration_btn=ttk.Button(actions,text='Plansza kalibracyjna',command=self.toggle_calibration,state='disabled');self.calibration_btn.pack(side='left',padx=(0,10))
-            self.start_btn=ttk.Button(actions,text='START',command=self.begin_countdown,state='disabled');self.start_btn.pack(side='left',padx=3)
-            self.stop_btn=ttk.Button(actions,text='STOP',command=self.abort,state='disabled');self.stop_btn.pack(side='left',padx=3)
-            self.import_btn=ttk.Button(actions,text='Importuj i oceń Androida…',command=self.import_android);self.import_btn.pack(side='left',padx=(18,0))
-            self.manual_run_btn=ttk.Button(actions,text='Wskaż ręcznie',command=self.choose_manual_run)
-            self._unmatched_archive=None
-            ttk.Label(box,textvariable=self.status,wraplength=940).grid(row=5,column=0,sticky='ew',pady=6)
-            ttk.Label(box,textvariable=self.clock,font=('Segoe UI',11,'bold')).grid(row=6,column=0,sticky='w')
-            ttk.Label(box,textvariable=self.plan,wraplength=940).grid(row=7,column=0,sticky='w',pady=(4,12))
-            self.advanced_btn=ttk.Button(box,text='▸ Zaawansowane / Przygotuj nowy zestaw',command=self.toggle_advanced);self.advanced_btn.grid(row=8,column=0,sticky='w')
-            self.advanced=ttk.Frame(box);self.advanced.grid(row=9,column=0,sticky='nsew',pady=8);self.advanced.columnconfigure(1,weight=1);box.rowconfigure(9,weight=1)
-            for row,(key,title) in enumerate((('xml','GT XML (opcjonalnie)'),('positives','Fotografie'),('negatives','Jawne negatywy (opcjonalnie)'),('output','Folder bazowy nowych zestawów i raportów'))):
-                ttk.Label(self.advanced,text=title).grid(row=row,column=0,sticky='w',padx=4,pady=4)
-                ttk.Entry(self.advanced,textvariable=self.paths[key]).grid(row=row,column=1,sticky='ew')
-                ttk.Button(self.advanced,text='Wybierz…',command=lambda k=key:self.browse(k)).grid(row=row,column=2,padx=4)
-            ttk.Label(self.advanced,text='Folder bazowy służy do zapisu. Gotowy zestaw otwiera przycisk „Wybierz zestaw”.').grid(row=4,column=0,columnspan=3,sticky='w')
-            ttk.Checkbutton(self.advanced,text='Katalog negatywów: moja deklaracja NO_PLATES',variable=self.negative_confirmed).grid(row=5,column=0,columnspan=2,sticky='w',pady=5)
-            ttk.Checkbutton(self.advanced,text='Nowy plan bez przypiętego GT',variable=self.ignore_reference).grid(row=5,column=2,sticky='e')
-            extra=ttk.Frame(self.advanced);extra.grid(row=6,column=0,columnspan=3,sticky='ew',pady=8)
-            for text,command in (('1. Kontrola materiału',self.check),('2. Przygotuj / zamroź F3',self.prepare),('Wznów segment…',self.resume),('Oś czasu / CSV…',self.show_timeline)):
-                ttk.Button(extra,text=text,command=command).pack(side='left',padx=3)
-            self.details=tk.Text(self.advanced,wrap='word',height=7);self.details.grid(row=7,column=0,columnspan=3,sticky='nsew',pady=6);self.advanced.rowconfigure(7,weight=1)
-            ttk.Label(self.advanced,text='Czas: 0,000000001–3600 s; czas pokazu nie gwarantuje zakończenia inferencji.',wraplength=940).grid(row=8,column=0,columnspan=3,sticky='w')
-            self.advanced.grid_remove()
+            from .photo_presentation_layout import build
+            build(self)
 
         def toggle_advanced(self):
+            if self.mode in ACTIVE_MODES or self._post_roll_hold:return
             visible=not self.advanced_visible.get();self.advanced_visible.set(visible)
             if visible:
-                self._compact_geometry=self.window.geometry();self.advanced.grid()
-                self.window.geometry(f"{max(1000,self.window.winfo_width())}x{min(900,self.window.winfo_screenheight()-80)}")
+                self.material_body.grid_remove();self.advanced.grid()
             else:
-                self.advanced.grid_remove();self.window.geometry(self._compact_geometry)
-            self.advanced_btn.configure(text=('▾' if visible else '▸')+' Zaawansowane / Przygotuj nowy zestaw')
+                self.advanced.grid_remove();self.material_body.grid()
+            self.advanced_btn.configure(text='Wróć do pokazu' if visible else 'Zaawansowane')
 
         def dwell_changed(self,*_):
             if self._loading:return
@@ -559,7 +526,7 @@ def make_app(legacy, args, parent=None):
             self.calibration_btn.configure(state='normal' if self.prepared and self.mode not in ACTIVE_MODES else 'disabled')
             try:seconds=reference.parse_dwell(self.dwell.get())
             except ValueError as exc:
-                self.plan.set(str(exc));self.start_btn.configure(state='disabled');return
+                self.plan.set(str(exc));self.friendly_plan.set(str(exc));self.start_btn.configure(state='disabled');return
             count=len(self.manifest['exposures']) if self.manifest else len((self.audit_result or {}).get('images',[]))
             times=reference.plan_times(count,seconds,countdown_seconds=self.manifest['countdown_seconds'] if self.manifest else 5,
                 transition_seconds=self.manifest['transition_seconds'] if self.manifest else .5)
@@ -571,13 +538,17 @@ def make_app(legacy, args, parent=None):
                 if self.manifest:geometry=f"Plan: {self.manifest['layout']['width']}×{self.manifest['layout']['height']} · {self.manifest['layout'].get('layout_version','F6v1')}; {monitor_dpi.monitor_description(monitor)}.\n"
             except ValueError as exc:geometry_ok=False;geometry=str(exc)+'\n'
             self.plan.set(geometry+f"{count} fotografii × {seconds:g} s; zdjęcia: {times['planned_photo_seconds']:g} s ({reference.format_seconds(times['planned_photo_seconds'])}); plan: {times['planned_total_seconds']:g} s ({reference.format_seconds(times['planned_total_seconds'])})."+note)
-            enabled=self.prepared and reference.display_ready(self.manifest) and self.mode not in ACTIVE_MODES and not self._post_roll_hold
+            self.friendly_plan.set(f"{count} zdjęć · łączny czas {reference.format_seconds(times['planned_total_seconds'])}\nZ odliczaniem i przerwami." if count else 'Wybierz fotografie, aby obliczyć czas.')
+            enabled=(bool(self.source_material) or (self.prepared and reference.display_ready(self.manifest))) and self.mode not in ACTIVE_MODES and not self._post_roll_hold
             if enabled and self.gt_preflight and self.gt_preflight['mode']=='invalid':enabled=self.ignore_reference.get()
             selection_ok=not self._selection_loading and not self._selection_error
             self.start_btn.configure(state='normal' if enabled and geometry_ok and selection_ok else 'disabled')
             self.calibration_btn.configure(state='normal' if self.calibration_preview is not None or (self.prepared and geometry_ok and selection_ok and self.mode not in ACTIVE_MODES and not self._post_roll_hold) else 'disabled')
             self.choose_set_btn.configure(state='disabled' if self.mode in ACTIVE_MODES or self._post_roll_hold else 'normal')
+            self.choose_material_btn.configure(state='disabled' if self.mode in ACTIVE_MODES or self._post_roll_hold or self._selection_loading else 'normal')
+            self.reference_menu_btn.configure(state='normal' if self.source_material is not None and self.mode=='IDLE' and not self._post_roll_hold else 'disabled')
             self.import_btn.configure(state='disabled' if self.mode in ACTIVE_MODES or self._selection_loading else 'normal')
+            self.sync_presentation_ui(geometry_ok=geometry_ok,selection_ok=selection_ok)
 
         def _current_monitor(self):
             for m in self.monitors:
@@ -669,7 +640,7 @@ def make_app(legacy, args, parent=None):
             if self.calibration_preview is None:return
             previous=self.calibration_preview['previous']
             self.calibration_preview=None;self._dispose_viewer();self.mode=previous['mode']
-            self.calibration_btn.configure(text='Plansza kalibracyjna')
+            self.calibration_btn.configure(text='Sprawdź kadr na ekranie')
             self.status.set(previous['status']);self.clock.set(previous['clock'])
             self.refresh_plan()
 
@@ -742,6 +713,8 @@ def make_app(legacy, args, parent=None):
 
         def prepare(self,*,start_after=False):
             if self.mode in ACTIVE_MODES or self._selection_loading:return
+            if self.source_material is not None and self.prepared is None:
+                return self.prepare_material(start_after=start_after)
             self.close_calibration()
             if not self.prepared and not self.audit_result:self.status.set('Najpierw wykonaj kontrolę materiału.');return
             try:
@@ -803,6 +776,13 @@ def make_app(legacy, args, parent=None):
             self.show_details(notes[gt['mode']]+'\n\n'+f"Kompletne: {gt['counts']['GT_COMPLETE']} · niepełne: {gt['counts']['GT_INCOMPLETE']} · bez GT: {gt['counts']['GT_MISSING']} · konflikt: {gt['counts']['GT_CONFLICT']}\n"
                 +(f"Tablice w kompletnym podzbiorze GT: {gt['complete_gt_plates']} · jawne negatywy: {gt['negative_images']} · pełne teksty: {gt['full_text']} · nieczytelne: {gt['unreadable']}\n" if gt['mode'] not in ('none','invalid') else 'Liczba tablic GT: N/A. Nie stwierdzono automatycznie braku tablic.\n')
                 +f"Źródło GT: {gt['reference_path'] or 'nieprzypisane'}\nSHA GT: {(gt['reference_sha256'] or 'N/A')[:16]}\n{gt['error']}\n\nA12/TV: {manifest['acceptance']['a12_tv']} — niezależne od gotowości materiału i GT.")
+            from ..ranking.photo_material import material_for_presentation
+            self.source_material=material_for_presentation(path)
+            if self.source_material:
+                self.recursive_photographs.set(self.source_material.data['recursive'])
+                self.set_info.set(self.source_material.root.name)
+                self.selected_folder.set(str(self.source_material.root))
+                self.refresh_material_reference()
             self.refresh_plan()
             return True
 
@@ -835,6 +815,8 @@ def make_app(legacy, args, parent=None):
             if self.mode in ACTIVE_MODES or self._opening_viewer:return
             if self._post_roll_hold:self.status.set('Zakończ nagrywanie na telefonie i naciśnij STOP przed kolejnym pokazem.');return
             if self._selection_loading or self._selection_error:self.status.set(self._selection_error or 'Trwa sprawdzanie wybranego zestawu.');return
+            if not resume and self.prepared is None and self.source_material is not None:
+                return self.prepare_material(start_after=True)
             reuse_preview=bool(not resume and self.calibration_preview and self.manifest['layout'].get('layout_version') in markers.EDGE_LAYOUTS)
             if not reuse_preview:self.close_calibration()
             try:
@@ -847,7 +829,7 @@ def make_app(legacy, args, parent=None):
                 if not resume and seconds!=self.manifest['dwell_seconds']:
                     self.prepare(start_after=True);return
                 self.manifest,self.material,_=reference.load(self.prepared,strict_reference=False)
-                self.gt_preflight=reference.reference_preflight(self.prepared)
+                self.gt_preflight=reference.reference_preflight(self.prepared,reference_path=self.analysis_reference)
                 if self.gt_preflight['mode']=='invalid':raise ValueError('Niezgodne GT. Wybierz jawnie nowy plan bez GT albo wskaż poprawne przygotowanie.')
                 if not reference.display_ready(self.manifest):raise ValueError('NO_GO: nierozstrzygnięte wyjątki referencji.')
                 self.monitor=self._select_monitor()
@@ -855,7 +837,7 @@ def make_app(legacy, args, parent=None):
                 # No new research run until the actual HWND/Canvas raster is proven.
                 if reuse_preview and self.calibration_preview and self.viewer is not None:
                     previous=self.calibration_preview['previous'];self.calibration_preview=None;self.mode=previous['mode']
-                    self.calibration_btn.configure(text='Plansza kalibracyjna');self.viewer.bind('<Escape>',lambda _:self.abort());self.viewer.protocol('WM_DELETE_WINDOW',self.abort)
+                    self.calibration_btn.configure(text='Sprawdź kadr na ekranie');self.viewer.bind('<Escape>',lambda _:self.abort());self.viewer.protocol('WM_DELETE_WINDOW',self.abort)
                     if self._viewer_geometry is not None:monitor_dpi.final_window_geometry(self.viewer,self.canvas,self.monitor)
                 else:self._dispose_viewer();self._make_viewer(self.monitor)
                 self.run=PresentationRun(self.prepared,self.manifest,resume=resume)
@@ -870,7 +852,7 @@ def make_app(legacy, args, parent=None):
                 self.run.plan_origin_ns=origin
                 self.last_countdown=self.manifest['countdown_seconds']
                 self.count_end=origin+int(self.manifest['countdown_seconds']*1e9)
-                self.start_btn.configure(state='disabled');self.stop_btn.configure(state='normal');self._tick()
+                self.start_btn.configure(state='disabled');self.stop_btn.configure(state='normal');self.sync_presentation_ui();self._tick()
             except Exception as exc:self.abort();self.status.set(str(exc))
 
         def _tick(self):
@@ -895,7 +877,7 @@ def make_app(legacy, args, parent=None):
                         self.mode='COMPLETED';self.dwell_entry.configure(state='normal');self.refresh_plan()
                         total=len(self.manifest['exposures'])
                         self.status.set(f'Pokaz zakończony {total}/{total}. '+('Zatrzymaj pomiar na telefonie; możesz zamknąć planszę T.' if hold else 'Dziennik zapisany.'))
-                        self.stop_btn.configure(text='Zamknij planszę T' if hold else 'STOP',state='normal' if hold else 'disabled');self.cache.close();self.cache=None
+                        self.stop_btn.configure(text='Zamknij planszę' if hold else 'Zatrzymaj',state='normal' if hold else 'disabled');self.cache.close();self.cache=None
                         self.clock.set('Zakończono wszystkie fotografie. Czasy PC w osi czasu.');return
                     self.mode='TRANSITION'
                     next_e=self.manifest['exposures'][self.run.next_index]
@@ -998,6 +980,8 @@ def make_app(legacy, args, parent=None):
             self.manual_run_btn.pack_forget();self._unmatched_archive=None
             from ..ranking.final180_mobile import analyze_import,locate_run
             scopes=[DEFAULT_EXPERIMENT,Path(self.paths['output'].get())]
+            from ..ranking.photo_material import storage_root,material_for_presentation,reference_for_presentation
+            scopes.extend(p for p in storage_root().glob('material-*/presentations') if p.is_dir())
             if self.prepared:scopes.append(self.prepared.parent)
             scopes.extend(p for p in (Path(__file__).resolve().parents[2]/'output').glob('*/technical_plans') if p.is_dir())
             self.status.set('Sprawdzam klatki źródłowe, dwa QR, ArUco i dziennik pokazu…')
@@ -1005,7 +989,15 @@ def make_app(legacy, args, parent=None):
                 match=locate_run(archive,scopes) if run is None else None
                 if match is not None and match['status']!='PASS':return dict(match=match)
                 selected=run or match['run_path']
-                return dict(path=analyze_import(archive,selected,reference_path=reference_path,run_match=match),run=selected)
+                chosen_reference=reference_path
+                if chosen_reference is None:
+                    run_file=Path(selected);run_file=run_file/'run.json' if run_file.is_dir() else run_file
+                    prepared=Path(photo.read_json(run_file)['prepared_path'])
+                    material=material_for_presentation(prepared)
+                    if material is not None:
+                        chosen_reference=(material.default_output if material.reference_status()['state']=='invalid'
+                            else reference_for_presentation(material,prepared))
+                return dict(path=analyze_import(archive,selected,reference_path=chosen_reference,run_match=match),run=selected)
             def done(result):
                 if 'path' not in result:
                     self._unmatched_archive=archive;self.manual_run_btn.pack(side='left',padx=8)
@@ -1015,6 +1007,9 @@ def make_app(legacy, args, parent=None):
                 self.status.set('Wyniki pokazu i ocena GT: '+str(path))
                 panel=FinalResultsWindow(self.window,path,on_reference=lambda chosen=None:self.import_android(archive=archive,run=selected,reference_path=chosen) if chosen else self.edit_analysis_gt(path,archive,selected),on_manual=getattr(self,'manual_review_callback',None))
                 self.result_windows.append(panel)
+                from ..ranking.photo_material import note_predictions_exposed
+                material=material_for_presentation(panel.report['prepared_path'])
+                if material is not None:note_predictions_exposed(material,result_path=path)
             self.background(work,done)
 
         def choose_manual_run(self):
@@ -1041,14 +1036,17 @@ def make_app(legacy, args, parent=None):
             return editor
 
         def _close(self):
-            self.abort();self.closed=True;self.workers.shutdown(wait=False,cancel_futures=True);self.window.destroy()
+            self.abort();self.closed=True;self.material_preview.dispose();self.workers.shutdown(wait=False,cancel_futures=True);self.window.destroy()
     return FinalApp()
 
 
 def accepted_arguments(overrides=None):
     """Shared defaults for the existing launcher and Desktop action."""
+    evidence=Path(__file__).resolve().parents[2]/'output/F6_FINAL180_DESKTOP_20261112_001'
     from ..config import SESSION
+    default_pointer=evidence.parent/'F6_OPERATOR_DWELL_20261112_001/prepared_path.txt'
     prepared=SESSION.get('final_presentation','prepared_path','') if SESSION else ''
+    if not prepared and default_pointer.is_file():prepared=default_pointer.read_text('utf-8').strip()
     # A missing saved preparation must be reported, not silently replaced.
     overrides=list(overrides or [])
     if any(s in ('--positives','--xml') or s.startswith(('--positives=','--xml=')) for s in overrides):prepared=''
@@ -1056,6 +1054,7 @@ def accepted_arguments(overrides=None):
     if prepared:arguments.extend(['--prepared',prepared])
     # A preparation is authoritative. Do not inject unrelated historical XML or
     # negative folders into a new generic material selection.
+    if prepared and (evidence/'accepted_unreadable_declaration.json').is_file():arguments.extend(['--unreadable-declaration',str(evidence/'accepted_unreadable_declaration.json')])
     if not any(s=='--prepared' or s.startswith('--prepared=') for s in overrides):
         arguments.extend(['--dwell',str(preferred_dwell())])
     return arguments+overrides

@@ -19,6 +19,8 @@ def no_gt(tmp_path,n=3):
 def native_f2_archive(tmp_path,manifest,run):
     from auto_annotation_tool.ranking.mobile_human_review import MobileReviewSession
     from test_final180_timeline import FIXTURES,mutate_fixture
+    if not (FIXTURES/'r0-positive.alprsession').is_file():
+        pytest.skip('Producer fixture not supplied; set ALPR_TEST_DATA_DIR.')
     image,_=mk.render(None,manifest['layout'],mk.payload(manifest,run.manifest_sha,run.state['run_id'],'e0001','P'))
     s=MobileReviewSession.open(FIXTURES/'r0-positive.alprsession',sidecar_path=tmp_path/'fixture.absent.json')
     record=s.tv_bbox_evidence['rows'][0]['source_image'];old=record['sha256'];buf=io.BytesIO()
@@ -225,7 +227,7 @@ def test_native_tk_browser_import_report_no_gt_and_optional_existing_editor(tmp_
         assert 'GT nieprzypisane' in app.details.get('1.0','end') and not(d/'reference.json').exists()
         app._make_viewer=lambda monitor:pytest.fail('Import must not create a presentation window')
         bundle=read_mobile_report_bundle(archive);browser.current_report=bundle.report;browser.current_bundle=bundle;browser._sync_final_action()
-        assert 'Wyniki pokazu' in browser.science_panel.review_action_button.cget('text')
+        assert browser.science_panel.review_action_button.cget('text') == 'Weryfikuj wyniki →'
         # Native CTA, common real analyzer, actual producer fixture + F2 pixels.
         browser.science_panel.review_action_button.invoke()
         deadline=time.monotonic()+45

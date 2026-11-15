@@ -1702,11 +1702,13 @@ class MobileReportBrowser:
             if app is not None and app.window.winfo_exists():app.window.lift();return
             self._final_presentation=open_from_desktop(self.window)
         except Exception as exc:
-            messagebox.showerror('FINAL', str(exc), parent=self.window)
+            messagebox.showerror('Pokaz fotografii', str(exc), parent=self.window)
 
     def open_photo_reference(self):
-        from .z4_photo_reference import open_photo_reference
-        panel = open_photo_reference(self.window)
+        from .photo_material_ui import open_material_editor
+        app=getattr(self,'_final_presentation',None)
+        material=getattr(app,'source_material',None) if app is not None and not getattr(app,'closed',True) else None
+        panel = open_material_editor(self.window,material,on_close=app.refresh_material_reference if material is not None else None)
         if panel is not None:
             self._photo_reference_windows = [p for p in getattr(self, '_photo_reference_windows', ()) if not p._closed] + [panel]
         return panel
@@ -1727,12 +1729,12 @@ class MobileReportBrowser:
         final=authentic_final_bundle(getattr(self,'current_bundle',None))
         panel=getattr(self,'science_panel',None)
         if panel is not None and hasattr(panel,'review_action_button'):
-            panel.review_action_button.configure(text='Wyniki pokazu i ocena GT →' if final else 'Przejdź do weryfikacji próbek  →')
+            panel.review_action_button.configure(text='Weryfikuj wyniki →')
             if final:
                 panel.progress_var.set('FINAL: automatyczne powiązanie i ocena, bez ręcznych zatwierdzeń fotografii.')
                 panel.progress_info_var.set('Wskaż run PC. Brak GT lub brak dowodów pozostanie jawnym N/A.')
         if hasattr(self,'sample_review_link'):
-            self.sample_review_link.configure(text='Wyniki pokazu i ocena GT →' if final else 'Przejdź do weryfikacji zdjęć →')
+            self.sample_review_link.configure(text='Weryfikuj wyniki →')
 
     def _build(self) -> None:
         root = tk.Frame(self.window, bg=self.bg, padx=12, pady=10)
@@ -1758,10 +1760,16 @@ class MobileReportBrowser:
         self.btn_link_archive = ttk.Button(header, text="Podłącz archiwum",
                   command=self.link_source_archive, state="disabled")
         self.btn_link_archive.grid(row=0, column=2, rowspan=2, sticky="e", padx=(8, 0))
-        ttk.Button(header, text='GT fotografii', command=self.open_photo_reference).grid(
-            row=0, column=3, rowspan=2, sticky='e', padx=(8, 0))
-        ttk.Button(header, text='FINAL · pokaz i analiza', command=self.open_final_presentation).grid(
-            row=0, column=4, rowspan=2, sticky='e', padx=(8, 0))
+        materials = ttk.LabelFrame(header, text='Materiały i pokazy', padding=(6, 3))
+        materials.grid(row=0,column=3,rowspan=2,sticky='e',padx=(8,0))
+        self.material_gt_button=ttk.Menubutton(materials,text='Fotografie i oznaczenia ▾')
+        self.material_gt_button.pack(side='left',padx=(0,6))
+        material_menu=tk.Menu(self.material_gt_button,tearoff=False);self.material_gt_button.configure(menu=material_menu)
+        material_menu.add_command(label='Wybierz materiał / otwórz edytor',command=self.open_photo_reference)
+        from .photo_material_ui import open_recent_editor,open_material_editor
+        material_menu.add_command(label='Wybierz inny katalog fotografii…',command=lambda:open_material_editor(self.window))
+        material_menu.add_command(label='Wznów ostatnią sesję GT',command=lambda:open_recent_editor(self.window))
+        ttk.Button(materials, text='Pokaz fotografii', command=self.open_final_presentation).pack(side='left')
         self.btn_link_archive.grid_remove()
 
         workspace = tk.PanedWindow(root, orient=tk.HORIZONTAL, bg=self.bg, bd=0, relief=tk.FLAT,

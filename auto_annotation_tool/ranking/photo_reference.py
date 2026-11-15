@@ -31,6 +31,7 @@ GEOMETRY_REASONS = {
     'UNDETERMINED': 'Nie można ustalić pełnego obrysu',
 }
 PROTOCOL = 'MANUAL_SOURCE_PHOTOGRAPH_NO_PREDICTIONS_V1'
+ASSISTED_PROTOCOL = 'MANUAL_SOURCE_PHOTOGRAPH_ASSISTED_V1'
 OUTPUT_FOLDER = '04_GT_FOTOGRAFII_Z4'
 
 
@@ -399,19 +400,30 @@ class PhotoReference:
         if state['objects']:return 'Wymaga uzupełnienia'
         return 'W trakcie' if key in self.data['reviews'] else 'Do oznaczenia'
 
+    def _refresh_annotation_context(self):
+        context = getattr(self.material, 'annotation_context', None)
+        if callable(context) and context().get('predictions_exposed') and not self.predictions_exposed:
+            self.predictions_exposed = True
+            self.annotation_protocol = ASSISTED_PROTOCOL
+
     def _save(self, changed, key, action):
         if getattr(self.material, 'readonly', False):
             raise ValueError('Zamrożona referencja jest tylko do odczytu; przygotuj nową wersję manifestu.')
         self.material.verify(key)
+        self._refresh_annotation_context()
+        changed['predictions_exposed'] = self.predictions_exposed
+        changed['annotation_protocol'] = self.annotation_protocol
         self._validate(changed)
         with _write_lock(self.path.with_suffix('.write.lock')):
             current=digest(self.path) if self.path.exists() else None
             if current != self._disk_sha:
                 raise ValueError('Oceny zmieniły się w innym oknie. Otwórz referencję ponownie; niezapisane zmiany pozostają w tym oknie.')
-            if current and self.data['schema']!=changed['schema']:
+            context_changed = (self.data['predictions_exposed'] != changed['predictions_exposed'] or
+                               self.data['annotation_protocol'] != changed['annotation_protocol'])
+            if current and (self.data['schema']!=changed['schema'] or context_changed):
                 # Same lock and exact pre-migration bytes. A failed backup blocks
                 # the save. Never overwrite a previously created backup.
-                target=changed['schema'].rsplit('.',1)[-1]
+                target='context' if context_changed else changed['schema'].rsplit('.',1)[-1]
                 backup=self.path.with_name(f'{self.path.stem}.pre-{target}-{current}.json')
                 original=self.path.read_bytes()
                 if hashlib.sha256(original).hexdigest()!=current:
@@ -425,12 +437,13 @@ class PhotoReference:
             changed['revision']=self.data['revision']+1
             changed['last_image_id']=key
             changed['events'].append(dict(at=datetime.now(timezone.utc).isoformat(),action=action,
-                image_id=key,revision=changed['revision'],predictions_exposed=False))
+                image_id=key,revision=changed['revision'],predictions_exposed=self.predictions_exposed))
             _atomic_write_json(self.path,changed)
             self._disk_sha=digest(self.path)
             self.data=changed
 
     def _change(self, key, action, change):
+        self._refresh_annotation_context()
         state=self.state(key);result=change(state)
         self._validate_state(key,state)
         if state==self.state(key):return result
@@ -441,7 +454,7 @@ class PhotoReference:
             changed['schema']=SCHEMA_V2
         review=changed['reviews'].setdefault(key,dict(versions={'initial':dict(state=blank())},timeline=['initial'],cursor=0))
         vid='version-'+uuid.uuid4().hex
-        review['versions'][vid]=dict(state=state,action=action,annotation_protocol=PROTOCOL,predictions_exposed=False)
+        review['versions'][vid]=dict(state=state,action=action,annotation_protocol=self.annotation_protocol,predictions_exposed=self.predictions_exposed)
         review['timeline']=review['timeline'][:review['cursor']+1]+[vid]
         review['cursor']+=1
         self._save(changed,key,action)

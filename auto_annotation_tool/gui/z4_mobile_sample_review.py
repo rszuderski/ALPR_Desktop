@@ -592,7 +592,7 @@ class MobileSampleReviewWindow:
         self.review_border = _review_color_mix(self.bg, self.fg, 0.19)
         self.window = tk.Toplevel(browser.window)
         self.window._aat_skip_window_recovery = True
-        self.window.title("Weryfikacja próbek z telefonu")
+        self.window.title("Weryfikacja wyników telefonu")
         width = min(1680, self.window.winfo_screenwidth() - 60)
         height = min(960, self.window.winfo_screenheight() - 85)
         self.window.geometry(f"{width}x{height}+25+25")
@@ -691,6 +691,8 @@ class MobileSampleReviewWindow:
                                 self.session_label.configure(wraplength=max(1, e.width)))
         self.progress_label = self._label(header, font=("Segoe UI", 14, "bold"))
         self.progress_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self._label(header, 'Weryfikacja wyników telefonu · sprawdź wskazania telefonu i popraw błędy.',
+                    font=('Segoe UI',9)).grid(row=2,column=0,columnspan=2,sticky='w')
         actions = tk.Frame(header, bg=self.bg)
         actions.grid(row=0, column=1, sticky="e")
         export_button = self._button(actions, "Eksport wyników", self.export, row=0, column=0)

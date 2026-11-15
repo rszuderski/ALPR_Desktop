@@ -77,12 +77,12 @@ def utc():
     return datetime.now(timezone.utc).isoformat()
 
 
-def files(root):
+def files(root, *, recursive=True):
     # Reuse the existing safe walk for supported formats; add no traversal of links.
     root = Path(root).resolve(strict=True)
     result = []
     for base, directories, names in os.walk(root, followlinks=False):
-        directories[:] = sorted(d for d in directories if not Path(base, d).is_symlink() and not Path(base, d).is_junction())
+        directories[:] = sorted(d for d in directories if not Path(base, d).is_symlink() and not Path(base, d).is_junction()) if recursive else []
         for name in sorted(names):
             path = Path(base, name)
             if path.suffix.lower() in EXTENSIONS and not path.is_symlink():
@@ -350,6 +350,15 @@ def _open_reference(directory,doc,material,override=None):
         # model results. Never downgrade an already exposed source to blind GT.
         candidate=photo.read_json(path)
         if not isinstance(candidate,dict):raise ValueError('REFERENCE_OBJECT_REQUIRED')
+        binding=candidate.get('presentation_binding',{})
+        if override is not None and doc.get('material_binding') and binding:
+            if (binding.get('material_id')!=doc['material_binding'].get('material_id') or
+                    binding.get('manifest_sha256')!=photo.digest(Path(directory)/'manifest.json')):
+                raise ValueError('MATERIAL_REFERENCE_BINDING_MISMATCH')
+            if candidate.get('annotation_protocol') not in (photo.PROTOCOL,photo.ASSISTED_PROTOCOL,REFERENCE_PROTOCOL):
+                raise ValueError('MATERIAL_REFERENCE_PROTOCOL_UNSUPPORTED')
+            from copy import copy
+            material=copy(material);material.annotation_protocol=candidate['annotation_protocol']
         if override is not None and candidate.get('predictions_exposed') is True and material.predictions_exposed is False:
             from copy import copy
             material=copy(material);material.predictions_exposed=True
@@ -468,14 +477,15 @@ def working_reference(directory,target,*,source_reference=None,predictions_expos
     return photo.PhotoReference(material,target)
 
 
-def freeze_photographs(source,root,*,screen,dwell_seconds=DEFAULT_DWELL_SECONDS,technical=False,additional_source=None,configuration=None,layout_version=None):
+def freeze_photographs(source,root,*,screen,dwell_seconds=DEFAULT_DWELL_SECONDS,technical=False,additional_source=None,configuration=None,layout_version=None,source_material=None):
     """Presentation without XML or reference.json; absence is metadata, never GT."""
     from . import final180_markers as markers
+    if source_material is not None and additional_source is not None:raise ValueError('MATERIAL_REQUIRES_ONE_EXPLICIT_SNAPSHOT')
     if not str(source).strip():raise ValueError('PHOTO_DIRECTORY_REQUIRED')
     source=Path(source).resolve(strict=True);sources=[source]+([Path(additional_source).resolve(strict=True)] if additional_source else [])
     paths=[];seen=set()
     for root_index,source_root in enumerate(sources):
-        for path in files(source_root):
+        for path in ([source_material.verify(key) for key in source_material.order] if source_material is not None else files(source_root)):
             if path in seen:continue
             seen.add(path);relative=path.relative_to(source_root).as_posix()
             paths.append((path,(str(root_index)+'/' if len(sources)>1 else '')+relative))
@@ -485,6 +495,7 @@ def freeze_photographs(source,root,*,screen,dwell_seconds=DEFAULT_DWELL_SECONDS,
     target.mkdir(parents=True,exist_ok=False);(target/'images').mkdir();images={};exposures=[]
     for i,(path,relative) in enumerate(paths,1):
         before=photo.stamp(path);sha=photo.digest(path);key='img-sha256-'+sha+'-'+fingerprint(relative)[:12]
+        if source_material is not None and key!=source_material.order[i-1]:raise ValueError('MATERIAL_IMAGE_IDENTITY_CHANGED')
         with Image.open(path) as image:raw=list(image.size);orientation=int(image.getexif().get(274,1));w,h=ImageOps.exif_transpose(image).size
         dest=target/'images'/f'{i:04d}{path.suffix.lower()}';shutil.copy2(path,dest)
         if photo.stamp(path)!=before or photo.digest(dest)!=sha:raise ValueError('SOURCE_CHANGED_DURING_FREEZE')
